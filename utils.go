@@ -150,7 +150,7 @@ func PrettyPrintHistory(kernel *Kernel) {
 		}
 		b.WriteString(fmt.Sprintf("%s\n", message))
 	}
-	fmt.Fprintf(os.Stdout, b.String())
+	fmt.Fprint(os.Stdout, b.String())
 }
 
 func ApplyDefaults(cfg any) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
 	"charm.land/fantasy"
 )
 
@@ -20,7 +21,7 @@ func NewGlobTool(a Agent, desc string) *ToolDef {
 		if err != nil {
 			return fantasy.ToolResponse{Type: "text", Content: string(out) + "\nError: " + err.Error()}, nil
 		}
-		
+
 		lines := strings.Split(string(out), "\n")
 		var filtered []string
 		for _, l := range lines {
@@ -28,7 +29,7 @@ func NewGlobTool(a Agent, desc string) *ToolDef {
 				filtered = append(filtered, l)
 			}
 		}
-		
+
 		content := fmt.Sprintf("<matches>\n%s\n</matches>", strings.Join(filtered, "\n"))
 		return fantasy.ToolResponse{Type: "text", Content: content}, nil
 	})

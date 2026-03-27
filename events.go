@@ -5,7 +5,7 @@ import "encoding/json"
 type EventKind string
 
 const (
-	EventTraceLog           EventKind = "TraceLog"           // structured log entry stored in the trace; visible in UI and readable by follow-on agents
+	EventTraceLog           EventKind = "TraceLog" // structured log entry stored in the trace; visible in UI and readable by follow-on agents
 	EventSessionStart       EventKind = "SessionStart"
 	EventUserPromptSubmit   EventKind = "UserPromptSubmit"
 	EventToken              EventKind = "Token"              // each streamed text chunk (display only, not stored)

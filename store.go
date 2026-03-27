@@ -448,7 +448,7 @@ func LoadTraceData(traceID string) (TraceData, error) {
 
 // SessionInfo holds metadata for listing traces/sessions.
 type SessionInfo struct {
-	ID          string  // trace ID (root span ID)
+	ID          string // trace ID (root span ID)
 	Title       string
 	StartedAt   int64   // UnixNano
 	DurationNs  int64   // last cost event ts - started_at (wall time)
@@ -608,4 +608,3 @@ func DeleteSession(id string) error {
 		return nil
 	})
 }
-

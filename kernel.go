@@ -13,7 +13,7 @@ import (
 	"text/template"
 	"time"
 
-	"swarm_buddy/pkg/toroid/tools"
+	"github.com/yashbonde/toroid-kernel/tools"
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/google"
