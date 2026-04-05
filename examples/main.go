@@ -10,7 +10,7 @@ import (
 	toroid "github.com/yashbonde/toroid-kernel"
 )
 
-// ── event log ────────────────────────────────────────────────────────────────
+// -- event log ----------------------------------------------------------------
 
 type row struct {
 	session string
@@ -24,7 +24,7 @@ func record(session, kind, detail string) {
 	log = append(log, row{session, kind, detail})
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// -- helpers ------------------------------------------------------------------
 
 func shortID(id string) string {
 	// Keep only alphanumeric characters
@@ -50,7 +50,7 @@ func usageLine(tokens map[string]toroid.Usage) string {
 	return strings.Join(parts, " | ")
 }
 
-// ── hook wiring ──────────────────────────────────────────────────────────────
+// -- hook wiring --------------------------------------------------------------
 
 func logForTable(kernel *toroid.Kernel, label string) {
 	kernel.On(toroid.EventSessionStart, func(_ context.Context, e toroid.Event) error {
@@ -94,7 +94,7 @@ func logForTable(kernel *toroid.Kernel, label string) {
 	})
 }
 
-// ── main ─────────────────────────────────────────────────────────────────────
+// -- main ---------------------------------------------------------------------
 
 func main() {
 	sequence := flag.Bool("sequence", false, "Run kernel in sequence mode")
@@ -201,7 +201,7 @@ func runKernelBlock(ctx context.Context, k *toroid.Kernel, prompt string) {
 }
 
 func printTable(k *toroid.Kernel) {
-	// ── Table ────────────────────────────────────────────────────────────────
+	// -- Table ----------------------------------------------------------------
 	const colSession = 9
 	const colKind = 14
 	const colDetail = 85
