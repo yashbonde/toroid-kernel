@@ -45,26 +45,28 @@ type Store struct {
 }
 
 var (
-	dbOnce     sync.Once
+	dbMu       sync.Mutex
 	defaultDB  *bolt.DB
-	defaultDBE error
 )
 
 func openDefaultDB() (*bolt.DB, error) {
-	dbOnce.Do(func() {
-		path, err := BboltPath()
-		if err != nil {
-			defaultDBE = err
-			return
-		}
-		db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
-		if err != nil {
-			defaultDBE = fmt.Errorf("cannot open %s (another swb process may be running): %w", path, err)
-			return
-		}
-		defaultDB = db
-	})
-	return defaultDB, defaultDBE
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	if defaultDB != nil {
+		return defaultDB, nil
+	}
+
+	path, err := BboltPath()
+	if err != nil {
+		return nil, err
+	}
+	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	if err != nil {
+		return nil, fmt.Errorf("cannot open %s (another swb process may be running): %w", path, err)
+	}
+	defaultDB = db
+	return defaultDB, nil
 }
 
 // NewStore opens (or reuses) the singleton bbolt database (~/.swarmbuddy/traces.bbolt.db).
