@@ -512,8 +512,8 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 						case fantasy.MessageRoleTool:
 							if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
 								if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
-									if len(txt.Text) > 30 {
-										txt.Text = txt.Text[:30] + "… [trimmed]"
+									if len(txt.Text) > 800 {
+										txt.Text = txt.Text[:800] + "… [trimmed]"
 										tr.Output = txt
 										msg.Content[p] = tr
 									}
