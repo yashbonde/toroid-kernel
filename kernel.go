@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,6 +30,10 @@ const (
 	ThinkingHigh Thinking = "high" // ~8k tokens
 )
 
+// errQueueInterrupt is returned from OnStepFinish to abort agent.Stream when
+// queued messages are waiting. It is never propagated to callers.
+var errQueueInterrupt = errors.New("queue interrupt")
+
 // Kernel is the agentic orchestrator powered by Fantasy.
 type Kernel struct {
 	cfg              Config
@@ -49,6 +54,12 @@ type Kernel struct {
 	currentTokens    int
 	runningCostUSD   float64
 	todoDB           *sql.DB
+
+	// message queue — callers enqueue messages that are injected at the next
+	// safe interruption point (OnStepFinish), causing the stream to restart
+	// with the queued messages appended to history.
+	messageQueue []string
+	queueMu      sync.Mutex
 }
 
 // Config holds all options for creating a Kernel.
@@ -358,6 +369,25 @@ func (k *Kernel) UpdateUse(u Usage, key string) {
 	k.usageMu.Unlock()
 }
 
+// Enqueue adds a message to the kernel's message queue. It is safe to call
+// from any goroutine, including while Stream is running. The message will be
+// injected into the conversation at the next OnStepFinish boundary, causing
+// the current stream to restart with the message appended to history.
+func (k *Kernel) Enqueue(msg string) {
+	k.queueMu.Lock()
+	k.messageQueue = append(k.messageQueue, msg)
+	k.queueMu.Unlock()
+}
+
+// drainQueue pops all queued messages and returns them.
+func (k *Kernel) drainQueue() []string {
+	k.queueMu.Lock()
+	msgs := k.messageQueue
+	k.messageQueue = nil
+	k.queueMu.Unlock()
+	return msgs
+}
+
 // On registers a hook for an event kind.
 func (k *Kernel) On(kind EventKind, fn HookFn) {
 	k.hooks.On(kind, fn)
@@ -382,6 +412,7 @@ func (k *Kernel) OnAll(fn HookFn) {
 		EventStop,
 		EventPreCompact,
 		EventPostCompact,
+		EventQueueInterrupt,
 		EventSessionEnd,
 	} {
 		k.On(kind, fn)
@@ -526,68 +557,106 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 		}
 	}
 
-	// Build Agent and handle streaming and events
+	// Build Agent and handle streaming and events.
+	// The loop restarts agent.Stream() whenever queued messages are injected
+	// at a step boundary. A flag is set in OnStepFinish; the stream is allowed
+	// to finish normally so all step messages are collected before restarting.
 	agent := fantasy.NewAgent(k.model, k.fantasyAgentOpts...)
-	result, err := agent.Stream(ctx, fantasy.AgentStreamCall{
-		Prompt:   prompt,
-		Messages: k.history,
+	var result *fantasy.AgentResult
+	for {
+		var shouldInterrupt bool
+		var interruptedWith []string
 
-		// Per-step cost accounting
-		OnStepFinish: func(step fantasy.StepResult) error {
-			u := Usage{}
-			u.FromFantasyUsage(step.Usage, k.cfg.Model)
-			k.usageMu.Lock()
-			k.runningCostUSD += u.Cost
-			runningCost := k.runningCostUSD
-			k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
-			k.usageMu.Unlock()
-			k.stepUsage = append(k.stepUsage, u)
-			if k.store != nil {
-				_ = k.store.AppendCost(k.cfg.TraceID, k.cfg.SessionID, u.Cost, runningCost)
+		var streamErr error
+		result, streamErr = agent.Stream(ctx, fantasy.AgentStreamCall{
+			Prompt:   prompt,
+			Messages: k.history,
+
+			// Per-step cost accounting
+			OnStepFinish: func(step fantasy.StepResult) error {
+				u := Usage{}
+				u.FromFantasyUsage(step.Usage, k.cfg.Model)
+				k.usageMu.Lock()
+				k.runningCostUSD += u.Cost
+				runningCost := k.runningCostUSD
+				k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+				k.usageMu.Unlock()
+				k.stepUsage = append(k.stepUsage, u)
+				if k.store != nil {
+					_ = k.store.AppendCost(k.cfg.TraceID, k.cfg.SessionID, u.Cost, runningCost)
+				}
+				_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
+					TurnUsage:    u,
+					TurnCostUSD:  u.Cost,
+					TotalCostUSD: runningCost,
+				})
+
+				// Check queue at this safe step boundary. We set a flag and let
+				// the stream finish naturally so all steps are collected before
+				// we inject the queued messages and restart.
+				if !shouldInterrupt {
+					if queued := k.drainQueue(); len(queued) > 0 {
+						shouldInterrupt = true
+						interruptedWith = queued
+					}
+				}
+				return nil
+			},
+
+			// Live text streaming — fires for each token delta as it arrives
+			OnTextDelta: func(id, text string) error {
+				return k.Fire(ctx, string(EventToken), &TokenPayload{Text: text})
+			},
+
+			// Live reasoning streaming
+			OnReasoningDelta: func(id, text string) error {
+				return k.Fire(ctx, string(EventReasoning), &ReasoningPayload{Text: text})
+			},
+
+			// Tool call fired the moment the LLM finishes emitting it
+			OnToolCall: func(tc fantasy.ToolCallContent) error {
+				return k.Fire(ctx, string(EventPreToolUse), &ToolUsePayload{
+					CallID: tc.ToolCallID,
+					Name:   tc.ToolName,
+					Args:   tc.Input,
+				})
+			},
+
+			// Tool result fired immediately after execution completes
+			OnToolResult: func(tr fantasy.ToolResultContent) error {
+				resStr := fmt.Sprintf("%v", tr.Result)
+				payload := &ToolUseResultPayload{CallID: tr.ToolCallID, Name: tr.ToolName, Result: resStr}
+				if strings.HasPrefix(resStr, "Error:") {
+					payload.Error = resStr
+					return k.Fire(ctx, string(EventPostToolUseFailure), payload)
+				}
+				return k.Fire(ctx, string(EventPostToolUse), payload)
+			},
+		})
+		if streamErr != nil {
+			return streamErr
+		}
+
+		if shouldInterrupt {
+			// Append this iteration's step messages to history, inject queued
+			// messages, fire the interrupt event, then restart.
+			for _, step := range result.Steps {
+				k.stepHistoryStart = append(k.stepHistoryStart, len(k.history))
+				k.history = append(k.history, step.Messages...)
 			}
-			_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
-				TurnUsage:    u,
-				TurnCostUSD:  u.Cost,
-				TotalCostUSD: runningCost,
-			})
-			return nil
-		},
-
-		// Live text streaming — fires for each token delta as it arrives
-		OnTextDelta: func(id, text string) error {
-			return k.Fire(ctx, string(EventToken), &TokenPayload{Text: text})
-		},
-
-		// Live reasoning streaming
-		OnReasoningDelta: func(id, text string) error {
-			return k.Fire(ctx, string(EventReasoning), &ReasoningPayload{Text: text})
-		},
-
-		// Tool call fired the moment the LLM finishes emitting it
-		OnToolCall: func(tc fantasy.ToolCallContent) error {
-			return k.Fire(ctx, string(EventPreToolUse), &ToolUsePayload{
-				CallID: tc.ToolCallID,
-				Name:   tc.ToolName,
-				Args:   tc.Input,
-			})
-		},
-
-		// Tool result fired immediately after execution completes
-		OnToolResult: func(tr fantasy.ToolResultContent) error {
-			resStr := fmt.Sprintf("%v", tr.Result)
-			payload := &ToolUseResultPayload{CallID: tr.ToolCallID, Name: tr.ToolName, Result: resStr}
-			if strings.HasPrefix(resStr, "Error:") {
-				payload.Error = resStr
-				return k.Fire(ctx, string(EventPostToolUseFailure), payload)
+			for _, qm := range interruptedWith {
+				k.history = append(k.history, fantasy.NewUserMessage(qm))
 			}
-			return k.Fire(ctx, string(EventPostToolUse), payload)
-		},
-	})
-	if err != nil {
-		return err
+			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{
+				Messages: interruptedWith,
+			})
+			prompt = ""
+			continue
+		}
+		break
 	}
 
-	// Append step messages to history and fire EventAssistantTurn with full content blocks.
+	// Append final step messages to history and fire EventAssistantTurn.
 	var allStepMsgs []fantasy.Message
 	for _, step := range result.Steps {
 		k.stepHistoryStart = append(k.stepHistoryStart, len(k.history))

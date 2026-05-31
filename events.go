@@ -26,6 +26,7 @@ const (
 	EventPreCompact         EventKind = "PreCompact"         // before compacting the memory
 	EventPostCompact        EventKind = "PostCompact"        // after compaction; payload contains the LLM-generated summary
 	EventSessionEnd         EventKind = "SessionEnd"         // after the session ends
+	EventQueueInterrupt     EventKind = "QueueInterrupt"     // fired when queued messages interrupt the stream at a step boundary
 )
 
 type Event struct {
@@ -133,6 +134,12 @@ type TaskPayload struct {
 // across the session and all subagents it spawned, keyed by session ID.
 type UsagePayload struct {
 	Tokens map[string]Usage `json:"tokens"` // sessionID -> token breakdown
+}
+
+// QueueInterruptPayload is attached to EventQueueInterrupt.
+// Messages contains the injected messages that caused the stream restart.
+type QueueInterruptPayload struct {
+	Messages []string `json:"messages"`
 }
 
 // TurnCostPayload is attached to EventTurnCost, fired after each LLM turn.
