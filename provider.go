@@ -11,22 +11,10 @@ import (
 	"charm.land/fantasy/providers/openaicompat"
 )
 
-// GatewayBaseURLEnv is the primary environment variable holding the base URL of
-// an OpenAI-compatible LLM gateway (e.g. a self-hosted LiteLLM proxy). The value
-// is the gateway origin; the provider appends the OpenAI "/v1" path segment if
-// it is not already present. GatewayBaseURLEnvAlt is accepted as a fallback.
-const (
-	GatewayBaseURLEnv    = "LLM_GATEWAY_BASE_URL"
-	GatewayBaseURLEnvAlt = "LLM_GATEWAY_BASE"
-)
-
-// gatewayBaseURL resolves the configured gateway base URL from the environment.
-func gatewayBaseURL() string {
-	if v := os.Getenv(GatewayBaseURLEnv); v != "" {
-		return v
-	}
-	return os.Getenv(GatewayBaseURLEnvAlt)
-}
+// GatewayBaseURLEnv is the environment variable holding the OpenAI-compatible
+// base URL of an LLM gateway (e.g. a self-hosted LiteLLM proxy), including the
+// "/v1" segment — e.g. "https://my-gateway.example.com/v1".
+const GatewayBaseURLEnv = "LLM_GATEWAY_BASE_URL"
 
 // NewProviderFromLLMId creates a fantasy.Provider from an LLM ID of the form
 // "provider/model-name" (matching the keys in pricing.json).
@@ -41,7 +29,7 @@ func NewProviderFromLLMId(llmID, apiKey string) (fantasy.Provider, error) {
 	case "openai":
 		return openaicompat.New(openaicompat.WithAPIKey(apiKey))
 	case "llmgateway":
-		return NewGatewayProvider(apiKey, gatewayBaseURL())
+		return NewGatewayProvider(apiKey, os.Getenv(GatewayBaseURLEnv))
 	default:
 		return nil, fmt.Errorf("unknown provider %q in LLM ID %q", provider, llmID)
 	}
@@ -54,16 +42,12 @@ func NewProviderFromLLMId(llmID, apiKey string) (fantasy.Provider, error) {
 // a thin configuration of the openai-compatible provider rather than a bespoke
 // transport.
 //
-// baseURL is the gateway origin (e.g. "https://my-gateway.example.com"). The
-// OpenAI "/v1" path segment is appended automatically when absent. apiKey is
-// sent as the bearer token.
+// baseURL is the gateway's OpenAI-compatible base, including the "/v1" segment
+// (e.g. "https://my-gateway.example.com/v1"). apiKey is sent as the bearer token.
 func NewGatewayProvider(apiKey, baseURL string) (fantasy.Provider, error) {
-	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
-		return nil, fmt.Errorf("llmgateway provider requires a base URL (set %s or %s)", GatewayBaseURLEnv, GatewayBaseURLEnvAlt)
-	}
-	if !strings.HasSuffix(baseURL, "/v1") {
-		baseURL += "/v1"
+		return nil, fmt.Errorf("llmgateway provider requires a base URL (set %s)", GatewayBaseURLEnv)
 	}
 	return openaicompat.New(
 		openaicompat.WithName("llmgateway"),
