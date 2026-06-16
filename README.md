@@ -72,7 +72,7 @@ go run ./examples -block
 
 ## Provider Examples
 
-`toroid` currently supports `google`, `anthropic`, and `openai` model prefixes.
+`toroid` currently supports `google`, `anthropic`, `openai`, and `llmgateway` model prefixes.
 
 ### Google
 
@@ -100,6 +100,28 @@ kernel, err := toroid.NewKernel(ctx, toroid.Config{
 kernel, err := toroid.NewKernel(ctx, toroid.Config{
 	Model:   "openai/gpt-5",
 	APIKey:  os.Getenv("OPENAI_API_KEY"),
+	WorkDir: ".",
+})
+```
+
+### LLM Gateway
+
+Use the `llmgateway` prefix to talk to any OpenAI-compatible gateway (for
+example a self-hosted [LiteLLM](https://github.com/BerriAI/litellm) proxy that
+fronts many model families behind a single bearer-authenticated endpoint). The
+gateway speaks the OpenAI `/v1/chat/completions` protocol, including streaming
+and tool calls, so the full agentic loop works unchanged.
+
+Set the gateway base URL via `LLM_GATEWAY_BASE_URL` (or `LLM_GATEWAY_BASE`); the
+`/v1` path segment is appended automatically when absent. The model name after
+the prefix is whatever the gateway routes — e.g. `claude-sonnet-4-6`,
+`gpt-5.4-mini`, `kimi-k2p6`.
+
+```go
+// export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com
+kernel, err := toroid.NewKernel(ctx, toroid.Config{
+	Model:   "llmgateway/claude-sonnet-4-6",
+	APIKey:  os.Getenv("LLM_GATEWAY_KEY"),
 	WorkDir: ".",
 })
 ```
