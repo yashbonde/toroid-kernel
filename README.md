@@ -6,9 +6,11 @@
 
 - Agent kernel built on `charm.land/fantasy`
 - Provider selection from `provider/model` IDs
-- Session persistence with bbolt and SQLite-backed task state
+- Single-file SQLite persistence (traces, costs, events, todos) with OpenTelemetry-compatible trace/span IDs
 - Conversation compaction and history reconstruction
 - Built-in filesystem, shell, search, notification, and subagent tools
+- Background agents — async subagents that wake an idle kernel on completion
+- Platform-agnostic, pluggable notifications
 
 ## Install
 
@@ -16,7 +18,7 @@
 go get github.com/yashbonde/toroid-kernel
 ```
 
-Requires Go `1.26.1` or newer.
+Requires Go `1.26.4` or newer.
 
 ## Quick Start
 
@@ -43,6 +45,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	defer kernel.Close()
 
 	out, usage, err := kernel.Run(ctx, "Summarize the repository and point out release blockers.")
 	if err != nil {
@@ -56,16 +59,17 @@ func main() {
 
 ## Run The Example
 
-Set `GEMINI_TOKEN`, then run the example program from the repository root.
+Set `GEMINI_TOKEN`, then run the minimal example from the repository root:
 
 ```bash
 export GEMINI_TOKEN=your_api_key
-go run ./examples -prompt 'Reply with the word OK and nothing else.'
+go run ./examples/minimal
 ```
 
-You can also use the built-in demo flows:
+The full demo program supports a few flows:
 
 ```bash
+go run ./examples -prompt 'Reply with the word OK and nothing else.'
 go run ./examples -sequence
 go run ./examples -block
 ```
@@ -127,11 +131,33 @@ kernel, err := toroid.NewKernel(ctx, toroid.Config{
 
 Each provider uses the same `toroid.Config` shape. The only required changes are the `Model` prefix and the API key you pass in.
 
+## Persistence & telemetry
+
+When `Save: true`, traces, spans, costs, events, and todos are written to a
+single SQLite database at `~/.swarmbuddy/sql.db`. Span IDs are time-ordered
+[Snowflake](https://en.wikipedia.org/wiki/Snowflake_ID) IDs and the
+trace/span/parent graph maps directly onto OpenTelemetry — `toroid.OTELSpans(traceID)`
+returns spec-valid OTEL-shaped spans you can feed to any OTLP exporter. Call
+`kernel.Close()` when done to checkpoint the store.
+
+## Background agents
+
+`subagent_async` runs a subtask in the background and returns immediately. When
+it finishes, its result is queued and the kernel is woken to process it — even
+if `Run`/`Stream` had already returned. The `MasterIdle` and `TaskCompleted`
+events let a host observe these transitions.
+
+## Notifications
+
+The `notify` tool fires a `Notification` event on the kernel's event bus and
+delivers a best-effort desktop notification (macOS / Linux / Windows). Register
+additional sinks (webhook, Slack, a peer kernel) with `tools.RegisterNotifySink`.
+
 ## Release Notes
 
 - The module path is `github.com/yashbonde/toroid-kernel`.
 - Embedded prompts live in `prompts/` and pricing assets live in `assets/`.
-- Runtime state is stored under `~/.swarmbuddy/`.
+- Runtime state is stored under `~/.swarmbuddy/` (single SQLite DB at `sql.db`).
 
 ## Status
 

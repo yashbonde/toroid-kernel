@@ -1,24 +1,19 @@
 package toroid
 
 import (
-	"encoding/binary"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
-	bolt "go.etcd.io/bbolt"
+	_ "modernc.org/sqlite"
 )
 
-// bucket keys
-var (
-	bktTraces   = []byte("t")
-	bktSpans    = []byte("s")
-	bktMeta     = []byte("m")
-	bktCosts    = []byte("c")
-	bktEvents   = []byte("e")
-	bktMemories = []byte("mem")
-)
+// Persistence is consolidated on a single embedded SQLite database
+// (~/.swarmbuddy/sql.db) holding traces, spans, costs, events, memories — and
+// the todo table created by the tools package. The trace/span/parent IDs map
+// directly onto OpenTelemetry (see id.go / §12.2).
 
 // TraceMeta is stored per trace (root kernel run).
 type TraceMeta struct {
@@ -39,17 +34,61 @@ type SpanMeta struct {
 	EndedAt      int64  `json:"ended_at,omitempty"`
 }
 
-// Store wraps a bbolt database for all persistence needs.
+// Store wraps the shared SQLite database for all persistence needs.
 type Store struct {
-	db *bolt.DB
+	db *sql.DB
 }
 
 var (
-	dbMu       sync.Mutex
-	defaultDB  *bolt.DB
+	dbMu      sync.Mutex
+	defaultDB *sql.DB
 )
 
-func openDefaultDB() (*bolt.DB, error) {
+const schemaDDL = `
+CREATE TABLE IF NOT EXISTS traces (
+	trace_id   TEXT PRIMARY KEY,
+	title      TEXT    NOT NULL DEFAULT '',
+	started_at INTEGER NOT NULL DEFAULT 0,
+	ended_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS spans (
+	trace_id       TEXT    NOT NULL,
+	span_id        TEXT    NOT NULL,
+	parent_span_id TEXT    NOT NULL DEFAULT '',
+	model          TEXT    NOT NULL DEFAULT '',
+	title          TEXT    NOT NULL DEFAULT '',
+	started_at     INTEGER NOT NULL DEFAULT 0,
+	ended_at       INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (trace_id, span_id)
+);
+CREATE TABLE IF NOT EXISTS costs (
+	trace_id  TEXT    NOT NULL,
+	span_id   TEXT    NOT NULL,
+	ts        INTEGER NOT NULL,
+	turn_usd  REAL    NOT NULL,
+	total_usd REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS costs_idx ON costs (trace_id, span_id, ts);
+CREATE TABLE IF NOT EXISTS events (
+	trace_id TEXT    NOT NULL,
+	span_id  TEXT    NOT NULL,
+	ts       INTEGER NOT NULL,
+	seq      INTEGER NOT NULL,
+	kind     TEXT    NOT NULL,
+	data     TEXT    NOT NULL,
+	PRIMARY KEY (trace_id, span_id, seq)
+);
+CREATE INDEX IF NOT EXISTS events_idx ON events (trace_id, span_id, ts, seq);
+CREATE TABLE IF NOT EXISTS memories (
+	span_id TEXT PRIMARY KEY,
+	data    TEXT NOT NULL
+);
+`
+
+// openDefaultSQL opens (or reuses) the singleton SQLite database. Both the
+// trace Store and the todo tools share this one handle so there is no lock
+// contention between them.
+func openDefaultSQL() (*sql.DB, error) {
 	dbMu.Lock()
 	defer dbMu.Unlock()
 
@@ -57,268 +96,144 @@ func openDefaultDB() (*bolt.DB, error) {
 		return defaultDB, nil
 	}
 
-	path, err := BboltPath()
+	path, err := SqlitePath()
 	if err != nil {
 		return nil, err
 	}
-	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 1 * time.Second})
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open %s (another swb process may be running): %w", path, err)
+		return nil, fmt.Errorf("cannot open %s: %w", path, err)
+	}
+	if _, err := db.Exec(schemaDDL); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
 	}
 	defaultDB = db
 	return defaultDB, nil
 }
 
-// NewStore opens (or reuses) the singleton bbolt database (~/.swarmbuddy/traces.bbolt.db).
+// NewStore opens (or reuses) the singleton SQLite database (~/.swarmbuddy/sql.db).
 func NewStore() (*Store, error) {
-	db, err := openDefaultDB()
+	db, err := openDefaultSQL()
 	if err != nil {
 		return nil, err
 	}
 	return &Store{db: db}, nil
 }
 
-// NewStoreReadWrite is an alias for NewStore. Both CLI and server share one file.
-// Only one process should hold the lock at a time.
-func NewStoreReadWrite() (*Store, error) {
-	return NewStore()
+// NewStoreReadWrite is an alias for NewStore; both share the one database file.
+func NewStoreReadWrite() (*Store, error) { return NewStore() }
+
+// DB exposes the underlying shared *sql.DB (used to back the todo tools).
+func (s *Store) DB() *sql.DB { return s.db }
+
+// Close flushes WAL state. It intentionally does NOT close the shared singleton
+// handle, since other live kernels may still be using it; the handle is released
+// on process exit.
+func (s *Store) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, _ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return nil
 }
 
-// UpdateTraceTitle patches only the title field of an existing TraceMeta, preserving StartedAt.
+// UpdateTraceTitle patches only the title of an existing trace, preserving started_at.
 func (s *Store) UpdateTraceTitle(traceID, title string) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		tb, err := tx.CreateBucketIfNotExists(bktTraces)
-		if err != nil {
-			return err
-		}
-		trb, err := tb.CreateBucketIfNotExists([]byte(traceID))
-		if err != nil {
-			return err
-		}
-		var meta TraceMeta
-		if b := trb.Get(bktMeta); b != nil {
-			_ = json.Unmarshal(b, &meta)
-		}
-		meta.TraceID = traceID
-		meta.Title = title
-		b, err := json.Marshal(meta)
-		if err != nil {
-			return err
-		}
-		return trb.Put(bktMeta, b)
-	})
+	_, err := s.db.Exec(
+		`INSERT INTO traces (trace_id, title) VALUES (?, ?)
+		 ON CONFLICT(trace_id) DO UPDATE SET title = excluded.title`,
+		traceID, title)
+	return err
 }
 
-// SaveTraceMeta writes or updates trace metadata.
+// SaveTraceMeta writes or updates trace metadata. started_at/ended_at are only
+// overwritten when the incoming value is non-zero, so a later title-only save
+// never clobbers the original start time.
 func (s *Store) SaveTraceMeta(meta TraceMeta) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		tb, err := tx.CreateBucketIfNotExists(bktTraces)
-		if err != nil {
-			return err
-		}
-		trb, err := tb.CreateBucketIfNotExists([]byte(meta.TraceID))
-		if err != nil {
-			return err
-		}
-		b, err := json.Marshal(meta)
-		if err != nil {
-			return err
-		}
-		return trb.Put(bktMeta, b)
-	})
+	_, err := s.db.Exec(
+		`INSERT INTO traces (trace_id, title, started_at, ended_at) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(trace_id) DO UPDATE SET
+		   title      = excluded.title,
+		   started_at = CASE WHEN excluded.started_at > 0 THEN excluded.started_at ELSE traces.started_at END,
+		   ended_at   = CASE WHEN excluded.ended_at   > 0 THEN excluded.ended_at   ELSE traces.ended_at   END`,
+		meta.TraceID, meta.Title, meta.StartedAt, meta.EndedAt)
+	return err
 }
 
 // LoadTraceMeta reads trace metadata by trace ID.
 func (s *Store) LoadTraceMeta(traceID string) (TraceMeta, error) {
-	var meta TraceMeta
-	err := s.db.View(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb == nil {
-			return nil
-		}
-		trb := tb.Bucket([]byte(traceID))
-		if trb == nil {
-			return nil
-		}
-		b := trb.Get(bktMeta)
-		if b == nil {
-			return nil
-		}
-		return json.Unmarshal(b, &meta)
-	})
-	return meta, err
+	var m TraceMeta
+	row := s.db.QueryRow(`SELECT trace_id, title, started_at, ended_at FROM traces WHERE trace_id = ?`, traceID)
+	err := row.Scan(&m.TraceID, &m.Title, &m.StartedAt, &m.EndedAt)
+	if err == sql.ErrNoRows {
+		return TraceMeta{}, nil
+	}
+	return m, err
 }
 
-// SaveSpanMeta writes or updates span metadata.
+// SaveSpanMeta writes or updates span metadata. Non-empty/non-zero fields update;
+// blank fields preserve the existing value (so an end-of-run save that only sets
+// ended_at keeps the model/title/started_at).
 func (s *Store) SaveSpanMeta(meta SpanMeta) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		tb, err := tx.CreateBucketIfNotExists(bktTraces)
-		if err != nil {
-			return err
-		}
-		trb, err := tb.CreateBucketIfNotExists([]byte(meta.TraceID))
-		if err != nil {
-			return err
-		}
-		sb, err := trb.CreateBucketIfNotExists(bktSpans)
-		if err != nil {
-			return err
-		}
-		spb, err := sb.CreateBucketIfNotExists([]byte(meta.SpanID))
-		if err != nil {
-			return err
-		}
-		b, err := json.Marshal(meta)
-		if err != nil {
-			return err
-		}
-		return spb.Put(bktMeta, b)
-	})
+	_, err := s.db.Exec(
+		`INSERT INTO spans (trace_id, span_id, parent_span_id, model, title, started_at, ended_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(trace_id, span_id) DO UPDATE SET
+		   parent_span_id = CASE WHEN excluded.parent_span_id <> '' THEN excluded.parent_span_id ELSE spans.parent_span_id END,
+		   model          = CASE WHEN excluded.model          <> '' THEN excluded.model          ELSE spans.model END,
+		   title          = CASE WHEN excluded.title          <> '' THEN excluded.title          ELSE spans.title END,
+		   started_at     = CASE WHEN excluded.started_at      > 0  THEN excluded.started_at      ELSE spans.started_at END,
+		   ended_at       = CASE WHEN excluded.ended_at        > 0  THEN excluded.ended_at        ELSE spans.ended_at END`,
+		meta.TraceID, meta.SpanID, meta.ParentSpanID, meta.Model, meta.Title, meta.StartedAt, meta.EndedAt)
+	return err
 }
 
-// LoadLastTotalUSD returns the total_usd from the most recent cost entry for a span, or 0 if none.
+// LoadLastTotalUSD returns the total_usd from the most recent cost entry for a span, or 0.
 func (s *Store) LoadLastTotalUSD(traceID, spanID string) float64 {
-	var last float64
-	_ = s.db.View(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb == nil {
-			return nil
-		}
-		trb := tb.Bucket([]byte(traceID))
-		if trb == nil {
-			return nil
-		}
-		sb := trb.Bucket(bktSpans)
-		if sb == nil {
-			return nil
-		}
-		spb := sb.Bucket([]byte(spanID))
-		if spb == nil {
-			return nil
-		}
-		cb := spb.Bucket(bktCosts)
-		if cb == nil {
-			return nil
-		}
-		// ForEach visits in key order (ascending time); last value wins
-		return cb.ForEach(func(k, v []byte) error {
-			var rec map[string]float64
-			if err := json.Unmarshal(v, &rec); err == nil {
-				last = rec["total_usd"]
-			}
-			return nil
-		})
-	})
-	return last
+	var v float64
+	row := s.db.QueryRow(
+		`SELECT total_usd FROM costs WHERE trace_id = ? AND span_id = ? ORDER BY ts DESC LIMIT 1`,
+		traceID, spanID)
+	_ = row.Scan(&v)
+	return v
 }
 
-// AppendCost records a turn cost under a span's cost bucket.
+// AppendCost records a turn cost under a span.
 func (s *Store) AppendCost(traceID, spanID string, turnUSD, totalUSD float64) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		tb, err := tx.CreateBucketIfNotExists(bktTraces)
-		if err != nil {
-			return err
-		}
-		trb, err := tb.CreateBucketIfNotExists([]byte(traceID))
-		if err != nil {
-			return err
-		}
-		sb, err := trb.CreateBucketIfNotExists(bktSpans)
-		if err != nil {
-			return err
-		}
-		spb, err := sb.CreateBucketIfNotExists([]byte(spanID))
-		if err != nil {
-			return err
-		}
-		cb, err := spb.CreateBucketIfNotExists(bktCosts)
-		if err != nil {
-			return err
-		}
-		// key = 8-byte big-endian UnixNano for natural ordering
-		var key [8]byte
-		binary.BigEndian.PutUint64(key[:], uint64(time.Now().UnixNano()))
-		val, err := json.Marshal(map[string]float64{"turn_usd": turnUSD, "total_usd": totalUSD})
-		if err != nil {
-			return err
-		}
-		return cb.Put(key[:], val)
-	})
+	_, err := s.db.Exec(
+		`INSERT INTO costs (trace_id, span_id, ts, turn_usd, total_usd) VALUES (?, ?, ?, ?, ?)`,
+		traceID, spanID, time.Now().UnixNano(), turnUSD, totalUSD)
+	return err
 }
 
-// AppendEvent records a session event under a span's event bucket.
+// AppendEvent records a session event under a span.
 func (s *Store) AppendEvent(traceID, spanID string, event Event) error {
-	return s.db.Update(func(tx *bolt.Tx) error {
-		tb, err := tx.CreateBucketIfNotExists(bktTraces)
-		if err != nil {
-			return err
-		}
-		trb, err := tb.CreateBucketIfNotExists([]byte(traceID))
-		if err != nil {
-			return err
-		}
-		sb, err := trb.CreateBucketIfNotExists(bktSpans)
-		if err != nil {
-			return err
-		}
-		spb, err := sb.CreateBucketIfNotExists([]byte(spanID))
-		if err != nil {
-			return err
-		}
-		eb, err := spb.CreateBucketIfNotExists(bktEvents)
-		if err != nil {
-			return err
-		}
-		// key = 8nd big-endian UnixNano for natural ordering
-		var key [8]byte
-		binary.BigEndian.PutUint64(key[:], uint64(event.EmitTS))
-		val, err := json.Marshal(event)
-		if err != nil {
-			return err
-		}
-		return eb.Put(key[:], val)
-	})
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(
+		`INSERT INTO events (trace_id, span_id, ts, seq, kind, data) VALUES (?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(trace_id, span_id, seq) DO NOTHING`,
+		traceID, spanID, event.EmitTS, event.Seq, string(event.Kind), string(data))
+	return err
 }
 
 // LoadTraceTotal returns the sum of the last total_usd across all spans for a trace.
-// This represents the cumulative cost of all previous runs under this trace ID.
 func (s *Store) LoadTraceTotal(traceID string) float64 {
 	var total float64
-	_ = s.db.View(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb == nil {
-			return nil
-		}
-		trb := tb.Bucket([]byte(traceID))
-		if trb == nil {
-			return nil
-		}
-		sb := trb.Bucket(bktSpans)
-		if sb == nil {
-			return nil
-		}
-		return sb.ForEach(func(spanKey, _ []byte) error {
-			spb := sb.Bucket(spanKey)
-			if spb == nil {
-				return nil
-			}
-			cb := spb.Bucket(bktCosts)
-			if cb == nil {
-				return nil
-			}
-			// last key has highest time — walk to find it
-			var lastTotal float64
-			_ = cb.ForEach(func(k, v []byte) error {
-				var rec map[string]float64
-				if err := json.Unmarshal(v, &rec); err == nil {
-					lastTotal = rec["total_usd"]
-				}
-				return nil
-			})
-			total += lastTotal
-			return nil
-		})
-	})
+	row := s.db.QueryRow(`
+		SELECT COALESCE(SUM(t.total_usd), 0) FROM (
+			SELECT c.total_usd
+			FROM costs c
+			JOIN (
+				SELECT span_id, MAX(ts) AS mx FROM costs WHERE trace_id = ? GROUP BY span_id
+			) m ON c.span_id = m.span_id AND c.ts = m.mx
+			WHERE c.trace_id = ?
+		) t`, traceID, traceID)
+	_ = row.Scan(&total)
 	return total
 }
 
@@ -328,38 +243,32 @@ func (s *Store) SaveMemories(spanID string, mem map[string]any) error {
 	if err != nil {
 		return err
 	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		mb, err := tx.CreateBucketIfNotExists(bktMemories)
-		if err != nil {
-			return err
-		}
-		return mb.Put([]byte(spanID), b)
-	})
+	_, err = s.db.Exec(
+		`INSERT INTO memories (span_id, data) VALUES (?, ?)
+		 ON CONFLICT(span_id) DO UPDATE SET data = excluded.data`,
+		spanID, string(b))
+	return err
 }
 
 // LoadMemories reads the agent's persistent memory JSON blob for a span.
 func (s *Store) LoadMemories(spanID string) (map[string]any, error) {
-	var mem map[string]any
-	err := s.db.View(func(tx *bolt.Tx) error {
-		mb := tx.Bucket(bktMemories)
-		if mb == nil {
-			return nil
-		}
-		b := mb.Get([]byte(spanID))
-		if b == nil {
-			return nil
-		}
-		return json.Unmarshal(b, &mem)
-	})
-	if mem == nil {
-		mem = map[string]any{}
+	var data string
+	row := s.db.QueryRow(`SELECT data FROM memories WHERE span_id = ?`, spanID)
+	err := row.Scan(&data)
+	if err == sql.ErrNoRows {
+		return map[string]any{}, nil
 	}
-	return mem, err
+	if err != nil {
+		return map[string]any{}, err
+	}
+	mem := map[string]any{}
+	_ = json.Unmarshal([]byte(data), &mem)
+	return mem, nil
 }
 
 // CostEvent is a single turn cost record stored under a span.
 type CostEvent struct {
-	TS       int64   `json:"ts"` // UnixNano (from bucket key)
+	TS       int64   `json:"ts"` // UnixNano
 	TurnUSD  float64 `json:"turn_usd"`
 	TotalUSD float64 `json:"total_usd"`
 }
@@ -377,75 +286,86 @@ type TraceData struct {
 	Spans []SpanData `json:"spans"`
 }
 
-// LoadTraceData reads the full trace + all spans + costs for a given trace ID.
+// LoadTraceData reads the full trace + all spans + costs + events for a trace ID.
 func LoadTraceData(traceID string) (TraceData, error) {
-	db, err := openDefaultDB()
+	db, err := openDefaultSQL()
 	if err != nil {
 		return TraceData{}, err
 	}
 	var td TraceData
-	err = db.View(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb == nil {
-			return nil
+
+	row := db.QueryRow(`SELECT trace_id, title, started_at, ended_at FROM traces WHERE trace_id = ?`, traceID)
+	if err := row.Scan(&td.Trace.TraceID, &td.Trace.Title, &td.Trace.StartedAt, &td.Trace.EndedAt); err != nil && err != sql.ErrNoRows {
+		return td, err
+	}
+
+	spanRows, err := db.Query(
+		`SELECT span_id, parent_span_id, model, title, started_at, ended_at
+		 FROM spans WHERE trace_id = ? ORDER BY started_at, span_id`, traceID)
+	if err != nil {
+		return td, err
+	}
+	defer spanRows.Close()
+
+	for spanRows.Next() {
+		var sd SpanData
+		sd.TraceID = traceID
+		if err := spanRows.Scan(&sd.SpanID, &sd.ParentSpanID, &sd.Model, &sd.Title, &sd.StartedAt, &sd.EndedAt); err != nil {
+			return td, err
 		}
-		trb := tb.Bucket([]byte(traceID))
-		if trb == nil {
-			return nil
+		td.Spans = append(td.Spans, sd)
+	}
+	if err := spanRows.Err(); err != nil {
+		return td, err
+	}
+
+	for i := range td.Spans {
+		sp := &td.Spans[i]
+		if costs, err := loadSpanCosts(db, traceID, sp.SpanID); err == nil {
+			sp.Costs = costs
 		}
-		// trace meta
-		if b := trb.Get(bktMeta); b != nil {
-			_ = json.Unmarshal(b, &td.Trace)
+		if events, err := loadSpanEvents(db, traceID, sp.SpanID); err == nil {
+			sp.Events = events
 		}
-		// spans
-		sb := trb.Bucket(bktSpans)
-		if sb == nil {
-			return nil
+	}
+	return td, nil
+}
+
+func loadSpanCosts(db *sql.DB, traceID, spanID string) ([]CostEvent, error) {
+	rows, err := db.Query(`SELECT ts, turn_usd, total_usd FROM costs WHERE trace_id = ? AND span_id = ? ORDER BY ts`, traceID, spanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CostEvent
+	for rows.Next() {
+		var c CostEvent
+		if err := rows.Scan(&c.TS, &c.TurnUSD, &c.TotalUSD); err != nil {
+			return nil, err
 		}
-		return sb.ForEach(func(spanKey, v []byte) error {
-			if v != nil {
-				return nil // skip non-bucket
-			}
-			spb := sb.Bucket(spanKey)
-			if spb == nil {
-				return nil
-			}
-			var sd SpanData
-			if b := spb.Get(bktMeta); b != nil {
-				_ = json.Unmarshal(b, &sd.SpanMeta)
-			}
-			// costs
-			cb := spb.Bucket(bktCosts)
-			if cb != nil {
-				_ = cb.ForEach(func(k, v []byte) error {
-					ts := int64(binary.BigEndian.Uint64(k))
-					var rec map[string]float64
-					if err := json.Unmarshal(v, &rec); err == nil {
-						sd.Costs = append(sd.Costs, CostEvent{
-							TS:       ts,
-							TurnUSD:  rec["turn_usd"],
-							TotalUSD: rec["total_usd"],
-						})
-					}
-					return nil
-				})
-			}
-			// events
-			eb := spb.Bucket(bktEvents)
-			if eb != nil {
-				_ = eb.ForEach(func(k, v []byte) error {
-					var ev Event
-					if err := json.Unmarshal(v, &ev); err == nil {
-						sd.Events = append(sd.Events, ev)
-					}
-					return nil
-				})
-			}
-			td.Spans = append(td.Spans, sd)
-			return nil
-		})
-	})
-	return td, err
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+func loadSpanEvents(db *sql.DB, traceID, spanID string) ([]Event, error) {
+	rows, err := db.Query(`SELECT data FROM events WHERE trace_id = ? AND span_id = ? ORDER BY seq`, traceID, spanID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Event
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		var ev Event
+		if err := json.Unmarshal([]byte(data), &ev); err == nil {
+			out = append(out, ev)
+		}
+	}
+	return out, rows.Err()
 }
 
 // SessionInfo holds metadata for listing traces/sessions.
@@ -454,7 +374,7 @@ type SessionInfo struct {
 	Title       string
 	StartedAt   int64   // UnixNano
 	DurationNs  int64   // last cost event ts - started_at (wall time)
-	AgentTimeNs int64   // wall time minus total tool execution time
+	AgentTimeNs int64   // sum of per-step durations
 	TotalUSD    float64 // sum of all turn_usd across all spans
 }
 
@@ -476,137 +396,101 @@ func fmtDuration(ns int64) string {
 func (s SessionInfo) DurationFmt() string  { return fmtDuration(s.DurationNs) }
 func (s SessionInfo) AgentTimeFmt() string { return fmtDuration(s.AgentTimeNs) }
 
-// listSessionsFromDB reads all SessionInfo entries from one bbolt handle.
-func listSessionsFromDB(db *bolt.DB) ([]SessionInfo, error) {
-	var infos []SessionInfo
-	err := db.View(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb == nil {
-			return nil
-		}
-		return tb.ForEach(func(k, v []byte) error {
-			if v != nil {
-				return nil // skip non-bucket entries
-			}
-			trb := tb.Bucket(k)
-			if trb == nil {
-				return nil
-			}
-			b := trb.Get(bktMeta)
-			if b == nil {
-				return nil
-			}
-			var meta TraceMeta
-			if err := json.Unmarshal(b, &meta); err != nil {
-				return nil
-			}
-			title := meta.Title
-			if title == "" {
-				title = "(no title)"
-			}
-			info := SessionInfo{
-				ID:        meta.TraceID,
-				Title:     title,
-				StartedAt: meta.StartedAt,
-			}
-			// walk all spans to accumulate cost, wall time, and tool execution time
-			var totalToolNs int64
-			if sb := trb.Bucket(bktSpans); sb != nil {
-				_ = sb.ForEach(func(spanKey, sv []byte) error {
-					if sv != nil {
-						return nil
-					}
-					spb := sb.Bucket(spanKey)
-					if spb == nil {
-						return nil
-					}
-					// cost events → TotalUSD + DurationNs
-					cb := spb.Bucket(bktCosts)
-					if cb != nil {
-						_ = cb.ForEach(func(ck, cv []byte) error {
-							ts := int64(binary.BigEndian.Uint64(ck))
-							var rec map[string]float64
-							if err := json.Unmarshal(cv, &rec); err == nil {
-								info.TotalUSD += rec["turn_usd"]
-								if d := ts - meta.StartedAt; d > info.DurationNs {
-									info.DurationNs = d
-								}
-							}
-							return nil
-						})
-					}
-					// event bucket → sum step durations for agent time.
-					// Each step: UserPromptSubmit (or prev TurnCost) → TurnCost.
-					// This includes both LLM and tool time within a step, but
-					// excludes idle time between resumed runs.
-					eb := spb.Bucket(bktEvents)
-					if eb != nil {
-						var stepStart int64 // EmitTS of run start or previous step end
-						_ = eb.ForEach(func(_, ev []byte) error {
-							var e Event
-							if err := json.Unmarshal(ev, &e); err != nil {
-								return nil
-							}
-							switch e.Kind {
-							case EventUserPromptSubmit:
-								stepStart = e.EmitTS
-							case EventTurnCost:
-								if stepStart > 0 {
-									totalToolNs += e.EmitTS - stepStart
-								}
-								stepStart = e.EmitTS
-							}
-							return nil
-						})
-					}
-					return nil
-				})
-			}
-			if totalToolNs > 0 {
-				info.AgentTimeNs = totalToolNs
-			}
-			infos = append(infos, info)
-			return nil
-		})
-	})
-	if err != nil {
-		return nil, err
-	}
-	return infos, nil
-}
-
 // ListSessions returns all traces sorted newest first.
 func ListSessions() ([]SessionInfo, error) {
-	db, err := openDefaultDB()
+	db, err := openDefaultSQL()
 	if err != nil {
 		return nil, err
 	}
-	infos, err := listSessionsFromDB(db)
+	rows, err := db.Query(`SELECT trace_id, title, started_at FROM traces ORDER BY started_at DESC`)
 	if err != nil {
 		return nil, err
 	}
-	// sort newest-first (IDs are lexicographically monotonic)
-	for i, j := 0, len(infos)-1; i < j; i, j = i+1, j-1 {
-		infos[i], infos[j] = infos[j], infos[i]
+	defer rows.Close()
+
+	var infos []SessionInfo
+	for rows.Next() {
+		var info SessionInfo
+		if err := rows.Scan(&info.ID, &info.Title, &info.StartedAt); err != nil {
+			return nil, err
+		}
+		if info.Title == "" {
+			info.Title = "(no title)"
+		}
+		infos = append(infos, info)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Enrich each session: total cost, wall duration, and agent (per-step) time.
+	for i := range infos {
+		info := &infos[i]
+
+		costRow := db.QueryRow(
+			`SELECT COALESCE(SUM(turn_usd), 0), COALESCE(MAX(ts), 0) FROM costs WHERE trace_id = ?`, info.ID)
+		var maxTS int64
+		_ = costRow.Scan(&info.TotalUSD, &maxTS)
+		if maxTS > info.StartedAt && info.StartedAt > 0 {
+			info.DurationNs = maxTS - info.StartedAt
+		}
+
+		// Agent time: sum of step durations (UserPromptSubmit → TurnCost) per span.
+		spanRows, err := db.Query(`SELECT span_id FROM spans WHERE trace_id = ?`, info.ID)
+		if err != nil {
+			continue
+		}
+		var spanIDs []string
+		for spanRows.Next() {
+			var sid string
+			if err := spanRows.Scan(&sid); err == nil {
+				spanIDs = append(spanIDs, sid)
+			}
+		}
+		spanRows.Close()
+		for _, sid := range spanIDs {
+			events, err := loadSpanEvents(db, info.ID, sid)
+			if err != nil {
+				continue
+			}
+			var stepStart int64
+			for _, e := range events {
+				switch e.Kind {
+				case EventUserPromptSubmit:
+					stepStart = e.EmitTS
+				case EventTurnCost:
+					if stepStart > 0 {
+						info.AgentTimeNs += e.EmitTS - stepStart
+					}
+					stepStart = e.EmitTS
+				}
+			}
+		}
 	}
 	return infos, nil
 }
 
 // DeleteSession removes all data associated with a trace ID.
 func DeleteSession(id string) error {
-	db, err := openDefaultDB()
+	db, err := openDefaultSQL()
 	if err != nil {
 		return err
 	}
-	return db.Update(func(tx *bolt.Tx) error {
-		tb := tx.Bucket(bktTraces)
-		if tb != nil {
-			_ = tb.DeleteBucket([]byte(id))
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`DELETE FROM events WHERE trace_id = ?`,
+		`DELETE FROM costs  WHERE trace_id = ?`,
+		`DELETE FROM spans  WHERE trace_id = ?`,
+		`DELETE FROM traces WHERE trace_id = ?`,
+		`DELETE FROM memories WHERE span_id = ?`,
+	} {
+		if _, err := tx.Exec(stmt, id); err != nil {
+			_ = tx.Rollback()
+			return err
 		}
-		mb := tx.Bucket(bktMemories)
-		if mb != nil {
-			_ = mb.Delete([]byte(id))
-		}
-		return nil
-	})
+	}
+	return tx.Commit()
 }

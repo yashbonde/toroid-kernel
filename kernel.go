@@ -18,7 +18,6 @@ import (
 
 	"charm.land/fantasy"
 	"charm.land/fantasy/providers/google"
-	_ "modernc.org/sqlite"
 )
 
 // Thinking controls the model's thinking budget.
@@ -60,6 +59,16 @@ type Kernel struct {
 	// with the queued messages appended to history.
 	messageQueue []string
 	queueMu      sync.Mutex
+
+	// run-state — supports background agents (§12.4). runMu serializes the agent
+	// loop so Stream and Wake never mutate history concurrently; running reports
+	// whether a loop is currently active; lastWriter is reused when an idle
+	// kernel is woken by a background completion; bgSeq numbers background tasks.
+	runMu      sync.Mutex
+	wakeMu     sync.Mutex
+	running    atomic.Bool
+	lastWriter io.Writer
+	bgSeq      atomic.Uint64
 }
 
 // Config holds all options for creating a Kernel.
@@ -78,7 +87,7 @@ type Config struct {
 	ParentSpanID string `json:"parent_span_id,omitempty"` // parent kernel's SessionID
 
 	// Persistence
-	Save bool `json:"save" description:"persist events, costs and metadata to the bbolt store" default:"false"`
+	Save bool `json:"save" description:"persist events, costs and metadata to the SQLite store" default:"false"`
 
 	// Session management
 	Resume        bool `json:"resume" description:"if true, load existing session history and continue" default:"false"`
@@ -121,13 +130,8 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 
 	ApplyDefaults(&cfg) // cfg OR default_cfg
 
-	// Open todo SQLite DB
-	var todoDB *sql.DB
-	if sqlitePath, err := SqlitePath(); err == nil {
-		if db, err := sql.Open("sqlite", sqlitePath); err == nil {
-			todoDB = db
-		}
-	}
+	// Open the shared SQLite DB (todos + traces/events live in one file).
+	todoDB, _ := openDefaultSQL()
 
 	// Kernel object
 	k := &Kernel{
@@ -139,7 +143,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 	k.tools = initTools(k)
 
-	// Initialize bbolt Store (only when --save is set)
+	// Initialize the SQLite trace Store (only when --save is set)
 	if cfg.Save {
 		store, err := NewStore()
 		if err != nil {
@@ -286,6 +290,7 @@ func initTools(ag *Kernel) *tools.Registry {
 	r.Register(tools.NewMultiEditTool(ag, getDescription("multiedit")))
 	r.Register(tools.NewNotifyTool(ag, getDescription("notify")))
 	r.Register(tools.NewSubagentTool(ag, getDescription("subagent")))
+	r.Register(newSubagentAsyncTool(ag, getDescription("subagent")))
 	r.Register(tools.NewTodoWriteTool(ag, ag.todoDB, getDescription("todowrite")))
 	r.Register(tools.NewTodoReadTool(ag, ag.todoDB, getDescription("todoread")))
 	return r
@@ -557,6 +562,21 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 		}
 	}
 
+	return k.streamCurrent(ctx, w, prompt)
+}
+
+// streamCurrent runs the agent loop over the current in-memory history until it
+// stops (no pending queued messages). Stream prepares history (compaction, new
+// user prompt, pruning) and then calls this; Wake calls it after injecting a
+// background completion. runMu serializes the loop so the two never race on
+// history.
+func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, prompt string) error {
+	k.runMu.Lock()
+	defer k.runMu.Unlock()
+	k.running.Store(true)
+	k.lastWriter = w
+	defer k.running.Store(false)
+
 	// Build Agent and handle streaming and events.
 	// The loop restarts agent.Stream() whenever queued messages are injected
 	// at a step boundary. A flag is set in OnStepFinish; the stream is allowed
@@ -691,8 +711,36 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 
 	_ = k.Fire(ctx, string(EventStop), &UsagePayload{Tokens: usageSnapshot})
 
+	// Record span (and, for a root kernel, trace) end time so the persisted
+	// graph carries OTEL-style start/end timestamps.
+	if k.store != nil {
+		now := time.Now().UnixNano()
+		_ = k.store.SaveSpanMeta(SpanMeta{SpanID: k.cfg.SessionID, TraceID: k.cfg.TraceID, EndedAt: now})
+		if k.cfg.TraceID == k.cfg.SessionID {
+			_ = k.store.SaveTraceMeta(TraceMeta{TraceID: k.cfg.TraceID, EndedAt: now})
+		}
+	}
+
 	// write response and exit
 	w.Write([]byte(result.Response.Content.Text()))
+
+	// If no background completions are queued, the kernel is now idle.
+	k.queueMu.Lock()
+	idle := len(k.messageQueue) == 0
+	k.queueMu.Unlock()
+	if idle {
+		_ = k.Fire(ctx, string(EventMasterIdle), nil)
+	}
+	return nil
+}
+
+// Close releases kernel-held resources. It flushes the trace store; the shared
+// SQLite handle itself is process-global and is released on exit. Safe to call
+// multiple times and on a nil-store kernel.
+func (k *Kernel) Close() error {
+	if k.store != nil {
+		return k.store.Close()
+	}
 	return nil
 }
 

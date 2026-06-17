@@ -4,7 +4,6 @@ package toroid
 
 import (
 	"context"
-	"crypto/rand"
 	"embed"
 	"fmt"
 	"log/slog"
@@ -13,7 +12,6 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
-	"time"
 
 	tsize "github.com/kopoli/go-terminal-size"
 )
@@ -23,26 +21,6 @@ var assetsFS embed.FS
 
 //go:embed prompts/*.tmpl prompts/*.txt
 var promptFS embed.FS
-
-// NewSessionID generates a monotonic, human-readable session ID.
-// Format: <unix_seconds>-<4char_random>
-func NewSessionID() string {
-	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
-	const randLen = 4
-
-	now := time.Now().Unix()
-
-	b := make([]byte, randLen)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", now)
-	}
-
-	for i := range b {
-		b[i] = charset[int(b[i])%len(charset)]
-	}
-
-	return fmt.Sprintf("%d-%s", now, string(b))
-}
 
 // readPrompt loads a prompt file from ~/.swarmbuddy/prompts/<name> if present,
 // falling back to the embedded copy. This allows prompt updates without recompiling.
@@ -213,15 +191,6 @@ func swarmbuddyHome() (string, error) {
 		return "", err
 	}
 	return dir, nil
-}
-
-// BboltPath returns ~/.swarmbuddy/traces.bbolt.db
-func BboltPath() (string, error) {
-	dir, err := swarmbuddyHome()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "traces.bbolt.db"), nil
 }
 
 // SqlitePath returns ~/.swarmbuddy/sql.db

@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	charm.land/fantasy v0.31.0
 	github.com/kopoli/go-terminal-size v0.0.0-20170219200355-5c97524c8b54
-	go.etcd.io/bbolt v1.4.3
+	go.opentelemetry.io/otel/trace v1.44.0
 	modernc.org/sqlite v1.52.0
 )
 
@@ -63,7 +63,6 @@ require (
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.69.0 // indirect
 	go.opentelemetry.io/otel v1.44.0 // indirect
 	go.opentelemetry.io/otel/metric v1.44.0 // indirect
-	go.opentelemetry.io/otel/trace v1.44.0 // indirect
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect

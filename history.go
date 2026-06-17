@@ -6,7 +6,7 @@ import (
 	"charm.land/fantasy"
 )
 
-// ReconstructHistory rebuilds a []fantasy.Message from the events stored in bbolt for a trace.
+// ReconstructHistory rebuilds a []fantasy.Message from the events stored for a trace.
 // Only events after the last compaction are replayed, so the returned history is exactly what
 // the kernel would have in memory for a resumed session.
 //
