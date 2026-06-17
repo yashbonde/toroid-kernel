@@ -74,7 +74,7 @@ type Kernel struct {
 // Config holds all options for creating a Kernel.
 type Config struct {
 	Provider       fantasy.Provider `json:"provider,omitempty" description:"llm provider"`
-	Model          string           `json:"model" description:"llm model name" default:"gemini-3-flash-preview"`
+	Model          string           `json:"model" description:"llm model name" default:"anthropic/claude-haiku-4-5"`
 	APIKey         string           `json:"api_key,omitempty" description:"API key for the provider"`
 	SessionID      string           `json:"session_id,omitempty" description:"unique identifier for the session"`
 	WorkDir        string           `json:"work_dir" description:"working directory" default:"current directory"`

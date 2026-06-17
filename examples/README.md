@@ -8,23 +8,17 @@ canonical way to use each feature.
 Run any example from the repo root:
 
 ```bash
-export GEMINI_TOKEN=your_api_key   # any provider key works; see "Providers" below
+export ANTHROPIC_API_KEY=your_api_key   # default model is anthropic/claude-haiku-4-5; see "Providers" below
 go run ./examples/<name>
 ```
 
-Only `otel` runs without an API key (it drives the store directly).
-
 ## Pattern index
 
-| Example         | Feature                        | Key APIs |
-|-----------------|--------------------------------|----------|
-| `blocking`      | One-shot run, get final text   | `NewKernel`, `Run`, `RunningCostUSD`, `Close` |
-| `streaming`     | Stream tokens to a writer/UI   | `Stream`, `On(EventToken)` |
-| `subagent`      | Synchronous delegation         | `subagent` tool, `On(EventSubagentStart/Stop)`, `RunSubagent` |
-| `background`    | Async delegation + wake-on-done| `SpawnBackground`, `Wake`, `On(EventTaskCompleted/MasterIdle)`, `subagent_async` tool |
-| `events`        | Observe the lifecycle          | `On(EventPreToolUse/PostToolUse/TurnCost)` |
-| `notifications` | Pluggable notification sinks   | `tools.RegisterNotifySink`, `On(EventNotification)` |
-| `otel`          | Persistence + OpenTelemetry    | `NewStore`, `Save`, `OTELSpans`, `ListSessions`, `DeleteSession` |
+| Example      | Feature                                   | Key APIs |
+|--------------|-------------------------------------------|----------|
+| `running`    | Blocking run + streaming run              | `NewKernel`, `Run`, `Stream`, `On(EventToken)`, `RunningCostUSD`, `Close` |
+| `delegation` | Subagents, background agents, OTEL export | `subagent`/`subagent_async` tools, `RunSubagent`, `SpawnBackground`, `On(EventSubagentStart/TaskCompleted/MasterIdle)`, `Save`, `OTELSpans`, `ListSessions` |
+| `events`     | Lifecycle observability + notify sinks    | `On(EventPreToolUse/PostToolUse/TurnCost/Notification)`, `tools.RegisterNotifySink` |
 
 ## Core concepts
 
@@ -47,8 +41,8 @@ Only `otel` runs without an API key (it drives the store directly).
 
 ## Providers
 
-Every example uses `google/gemini-3-flash-preview`, but the only change needed
-for another provider is the `Model` prefix and the API key:
+Every example uses `anthropic/claude-haiku-4-5` (the kernel default), but the
+only change needed for another provider is the `Model` prefix and the API key:
 
 | Prefix       | Model env / key            |
 |--------------|----------------------------|

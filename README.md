@@ -60,8 +60,8 @@ func main() {
 ## Examples
 
 The [`examples/`](examples/) directory has small, focused, runnable programs —
-one per usage pattern (blocking, streaming, subagents, background agents, events,
-notifications, persistence/OpenTelemetry). Start with
+one per usage pattern (running blocking/streaming, delegation to subagents and
+background agents with OpenTelemetry export, and events/notifications). Start with
 [`examples/README.md`](examples/README.md), which indexes every pattern and the
 APIs it uses.
 
@@ -70,12 +70,10 @@ APIs it uses.
 > up-to-date reference for how to use this library.
 
 ```bash
-export GEMINI_TOKEN=your_api_key
-go run ./examples/blocking      # one-shot Run
-go run ./examples/streaming     # token streaming
-go run ./examples/subagent      # synchronous delegation
-go run ./examples/background     # async background agents
-go run ./examples/otel          # persistence + OpenTelemetry (no API key needed)
+export ANTHROPIC_API_KEY=your_api_key
+go run ./examples/running      # blocking Run + token streaming
+go run ./examples/delegation   # subagents, background agents, OpenTelemetry export
+go run ./examples/events       # lifecycle observability + notification sinks
 ```
 
 ## Provider Examples

@@ -1,11 +1,17 @@
-// Pattern: EVENTS & HOOKS (observability).
+// Pattern: EVENTS & NOTIFICATIONS (observability + pluggable sinks).
 //
 // The kernel exposes its whole lifecycle through a synchronous event bus. Use
 // On(kind, fn) to observe tool calls, costs, reasoning, compaction, etc. — this
 // is how a host renders output, tracks spend, and reacts to lifecycle changes.
 // A hook returning a non-nil error aborts the firing chain.
 //
-//	export GEMINI_TOKEN=your_api_key
+// Notifications are a specialised case: the `notify` tool fires an
+// EventNotification on the bus AND runs any sinks registered with
+// tools.RegisterNotifySink (plus a best-effort desktop notification). Register
+// your own sink to route notifications to a webhook, Slack, or a peer kernel —
+// the tool itself stays platform-agnostic.
+//
+//	export ANTHROPIC_API_KEY=your_api_key
 //	go run ./examples/events
 package main
 
@@ -15,18 +21,26 @@ import (
 	"os"
 
 	toroid "github.com/yashbonde/toroid-kernel"
+	"github.com/yashbonde/toroid-kernel/tools"
 )
 
 func main() {
-	apiKey := os.Getenv("GEMINI_TOKEN")
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
 	if apiKey == "" {
-		fmt.Println("set GEMINI_TOKEN to run this example")
+		fmt.Println("set ANTHROPIC_API_KEY to run this example")
 		return
 	}
 	ctx := context.Background()
 
+	// Register a custom notification sink BEFORE constructing the kernel. In a
+	// real host this might POST to a webhook or forward to a peer kernel.
+	tools.RegisterNotifySink(func(_ context.Context, title, message string) error {
+		fmt.Printf("[sink] %s: %s\n", title, message)
+		return nil
+	})
+
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   "google/gemini-3-flash-preview",
+		Model:   "anthropic/claude-haiku-4-5",
 		APIKey:  apiKey,
 		WorkDir: ".",
 	})
@@ -35,6 +49,7 @@ func main() {
 	}
 	defer k.Close()
 
+	// Observe the lifecycle: tool calls, their results, and per-turn cost.
 	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
 			fmt.Printf("→ tool %s args=%s\n", p.Name, p.Args)
@@ -53,8 +68,15 @@ func main() {
 		}
 		return nil
 	})
+	// Notifications also arrive on the bus, alongside the registered sink above.
+	k.On(toroid.EventNotification, func(_ context.Context, e toroid.Event) error {
+		fmt.Printf("[event] %v\n", e.Payload)
+		return nil
+	})
 
-	out, _, err := k.Run(ctx, "List the files here, then tell me how many there are.")
+	out, _, err := k.Run(ctx,
+		"List the files here and tell me how many there are, then send a notification "+
+			"titled 'done' with the message 'example finished'.")
 	if err != nil {
 		panic(err)
 	}
