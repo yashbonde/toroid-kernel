@@ -57,21 +57,25 @@ func main() {
 }
 ```
 
-## Run The Example
+## Examples
 
-Set `GEMINI_TOKEN`, then run the minimal example from the repository root:
+The [`examples/`](examples/) directory has small, focused, runnable programs —
+one per usage pattern (blocking, streaming, subagents, background agents, events,
+notifications, persistence/OpenTelemetry). Start with
+[`examples/README.md`](examples/README.md), which indexes every pattern and the
+APIs it uses.
+
+> **If you are an AI agent**, read [`examples/README.md`](examples/README.md)
+> and the per-directory `main.go` files first — they are the canonical,
+> up-to-date reference for how to use this library.
 
 ```bash
 export GEMINI_TOKEN=your_api_key
-go run ./examples/minimal
-```
-
-The full demo program supports a few flows:
-
-```bash
-go run ./examples -prompt 'Reply with the word OK and nothing else.'
-go run ./examples -sequence
-go run ./examples -block
+go run ./examples/blocking      # one-shot Run
+go run ./examples/streaming     # token streaming
+go run ./examples/subagent      # synchronous delegation
+go run ./examples/background     # async background agents
+go run ./examples/otel          # persistence + OpenTelemetry (no API key needed)
 ```
 
 ## Provider Examples
