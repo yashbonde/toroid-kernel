@@ -168,7 +168,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 			meta, _ := store.LoadTraceMeta(cfg.TraceID)
 			k.title = meta.Title
 			// Restore conversation history by replaying stored events (post-last-compaction only).
-			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, ""); err2 == nil && len(msgs) > 0 {
+			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir); err2 == nil && len(msgs) > 0 {
 				k.history = msgs
 				k.Logf("[resume] reconstructed %d history messages from events for trace %s", len(msgs), cfg.TraceID)
 			} else if err2 != nil {
@@ -454,8 +454,12 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 		}
 	}
 
-	// append user message; important to do this before history validation
-	k.history = append(k.history, fantasy.NewUserMessage(prompt))
+	// append user message; important to do this before history validation.
+	// parseUserMessage inlines any markdown image refs as file parts and returns
+	// the portable (~-rooted) prompt to persist for cross-process resume.
+	userMsg, storedPrompt := parseUserMessage(prompt, k.cfg.WorkDir)
+	k.history = append(k.history, userMsg)
+	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt})
 
 	// history validation
 	if len(k.history) > 0 {
@@ -562,15 +566,15 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 		}
 	}
 
-	return k.streamCurrent(ctx, w, prompt)
+	return k.streamCurrent(ctx, w)
 }
 
 // streamCurrent runs the agent loop over the current in-memory history until it
-// stops (no pending queued messages). Stream prepares history (compaction, new
-// user prompt, pruning) and then calls this; Wake calls it after injecting a
-// background completion. runMu serializes the loop so the two never race on
-// history.
-func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, prompt string) error {
+// stops (no pending queued messages). Stream prepares history (compaction,
+// appending the user message, pruning) and then calls this; Wake calls it after
+// injecting a background completion. runMu serializes the loop so the two never
+// race on history.
+func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	k.runMu.Lock()
 	defer k.runMu.Unlock()
 	k.running.Store(true)
@@ -589,7 +593,9 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, prompt string) 
 
 		var streamErr error
 		result, streamErr = agent.Stream(ctx, fantasy.AgentStreamCall{
-			Prompt:   prompt,
+			// The user turn always lives in k.history (appended by Stream, or a
+			// background completion injected by Wake), so Prompt stays empty —
+			// otherwise fantasy would append a duplicate user message.
 			Messages: k.history,
 
 			// Per-step cost accounting
@@ -670,7 +676,6 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, prompt string) 
 			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{
 				Messages: interruptedWith,
 			})
-			prompt = ""
 			continue
 		}
 		break
@@ -750,8 +755,11 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return nil
 	}
 
+	messagesBefore := len(k.history)
+	tokensBefore := k.currentTokens
 	_ = k.Fire(ctx, string(EventPreCompact), &CompactPayload{
-		MessageCount: len(k.history),
+		MessageCount: messagesBefore,
+		TokenCount:   tokensBefore,
 	})
 
 	prompt, err := readPrompt("compact.kernel.tmpl")
@@ -770,9 +778,6 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	}
 	summary := result.Response.Content.Text()
 
-	// Fire post-compact event so history can be reconstructed from events alone.
-	_ = k.Fire(ctx, string(EventPostCompact), &CompactSummaryPayload{Summary: summary})
-
 	// 2. Reset history
 	if k.systemPrompt != "" {
 		k.history = []fantasy.Message{fantasy.NewSystemMessage(k.systemPrompt)}
@@ -787,6 +792,15 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	)
 	msg.Role = fantasy.MessageRoleAssistant
 	k.history = append(k.history, msg)
+
+	// Fire post-compact event so history can be reconstructed from events alone.
+	// It carries the before/after diff (messages and tokens collapsed).
+	_ = k.Fire(ctx, string(EventPostCompact), &CompactSummaryPayload{
+		Summary:        summary,
+		MessagesBefore: messagesBefore,
+		MessagesAfter:  len(k.history),
+		TokensBefore:   tokensBefore,
+	})
 
 	return nil
 }
@@ -924,7 +938,7 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if w == nil {
 		w = io.Discard
 	}
-	return k.streamCurrent(ctx, w, "")
+	return k.streamCurrent(ctx, w)
 }
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.

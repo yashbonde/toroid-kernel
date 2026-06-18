@@ -108,6 +108,15 @@ func main() {
 	for _, s := range spans {
 		fmt.Printf("  span=%s parent=%s name=%-9s cost=$%.4f\n",
 			s.SpanID, s.ParentSpanID, s.Name, s.CostUSD)
+		// GenAI semantic-convention attributes (model, token usage, cost) — this
+		// is what an OTLP backend reads to render model/token/cost dashboards.
+		for _, a := range s.Attributes {
+			fmt.Printf("      %s = %v\n", a.Key, a.Value)
+		}
+		// Span events carry the full payload as a JSON attribute (no longer dropped).
+		for _, e := range s.Events {
+			fmt.Printf("      · %s @%d %s\n", e.Name, e.TimeUnix, e.Attribute)
+		}
 	}
 
 	sessions, err := toroid.ListSessions()

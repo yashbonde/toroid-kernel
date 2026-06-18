@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 
 	toroid "github.com/yashbonde/toroid-kernel"
 )
@@ -65,4 +67,29 @@ func main() {
 		panic(err)
 	}
 	fmt.Println()
+
+	// --- MULTIMODAL: two ways to get an image in front of the model. ---
+	// img.jpg sits next to this file; resolve an absolute path so it works
+	// regardless of the directory you run from.
+	_, thisFile, _, _ := runtime.Caller(0)
+	imgPath := filepath.Join(filepath.Dir(thisFile), "..", "img.jpg")
+
+	// (1) INLINE ATTACH: a markdown image ref in the prompt is parsed into a
+	// file part and sent with the turn — the model sees the image directly, no
+	// tool call. Text before/after the ref stays interleaved around the image.
+	fmt.Println("\n== multimodal: inline attach ==")
+	out, _, err = k.Run(ctx, fmt.Sprintf("Describe this image in one sentence: ![](%s)", imgPath))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out)
+
+	// (2) TOOL READ: plain prose with no image ref. The model calls the read
+	// tool, which returns the image bytes as a media attachment (Piece 1).
+	fmt.Println("\n== multimodal: tool read ==")
+	out, _, err = k.Run(ctx, fmt.Sprintf("Read the image at %s and tell me in one sentence what you see.", imgPath))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out)
 }

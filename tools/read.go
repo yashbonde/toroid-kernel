@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -34,15 +33,18 @@ func (a ReadArgs) Validate() error {
 }
 
 func NewReadTool(a Agent, desc string) *ToolDef {
+	// errf builds an error tool response; toroid keys tool failure off the
+	// "Error:" content prefix, so every failure path funnels through here.
+	errf := func(format string, a ...any) fantasy.ToolResponse {
+		return fantasy.NewTextErrorResponse("Error: " + fmt.Sprintf(format, a...))
+	}
+
 	fTool := fantasy.NewAgentTool("read", desc, func(ctx context.Context, args ReadArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
 		if err := args.Validate(); err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return errf("%v", err), nil
 		}
 
-		path := args.FilePath
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(a.WorkDir(), path)
-		}
+		path := ResolvePath(args.FilePath, a.WorkDir())
 
 		offset := args.Offset
 		if offset <= 0 {
@@ -55,14 +57,14 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 
 		info, err := os.Stat(path)
 		if err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return errf("%v", err), nil
 		}
 
 		var content string
 		if info.IsDir() {
 			entries, err := os.ReadDir(path)
 			if err != nil {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+				return errf("%v", err), nil
 			}
 			var names []string
 			for _, e := range entries {
@@ -90,17 +92,28 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			// File reading
 			f, err := os.Open(path)
 			if err != nil {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+				return errf("%v", err), nil
 			}
 			defer f.Close()
 
 			// Simple binary check
 			isBinary, err := isBinaryFile(f)
 			if err != nil {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+				return errf("%v", err), nil
 			}
 			if isBinary {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: cannot read binary file: %s", path)}, nil
+				// Images and PDFs are returned as media attachments so a
+				// vision-capable model can see them; other binaries are refused.
+				if mt, ok := MediaType(path); ok {
+					data, err := os.ReadFile(path)
+					if err != nil {
+						return errf("%v", err), nil
+					}
+					resp := fantasy.NewMediaResponse(data, mt)
+					resp.Content = fmt.Sprintf("Read %s (%d bytes, %s)", path, len(data), mt)
+					return resp, nil
+				}
+				return errf("cannot read binary file: %s", path), nil
 			}
 			f.Seek(0, 0)
 
@@ -135,7 +148,7 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			content += "\n</content>"
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: content}, nil
+		return fantasy.NewTextResponse(content), nil
 	})
 
 	return &ToolDef{

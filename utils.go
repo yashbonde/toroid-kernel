@@ -3,7 +3,6 @@
 package toroid
 
 import (
-	"context"
 	"crypto/rand"
 	"embed"
 	"encoding/binary"
@@ -49,13 +48,8 @@ func readAssets(name string) ([]byte, error) {
 }
 
 const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorGreen  = "\033[32m"
-	colorYellow = "\033[33m"
-	colorBlue   = "\033[34m"
-	colorCyan   = "\033[36m"
-	colorGray   = "\033[90m"
+	colorReset = "\033[0m"
+	colorGray  = "\033[90m"
 )
 
 var (
@@ -107,20 +101,12 @@ func wrapInLogWidth(x string) string {
 	return b.String()
 }
 
-func logLine(level, color, msg string) {
-	slog.Log(context.Background(), slog.LevelInfo, fmt.Sprintf("%s", wrapInLogWidth(msg)))
-}
-
 func LogInfo(msg string, args ...any) {
-	logLine("INFO", colorCyan, fmt.Sprintf(msg, args...))
+	slog.Info(wrapInLogWidth(fmt.Sprintf(msg, args...)))
 }
 
 func LogError(msg string, args ...any) {
-	logLine("ERRO", colorRed, fmt.Sprintf(msg, args...))
-}
-
-func LogDebug(msg string, args ...any) {
-	logLine("DBUG", colorGray, fmt.Sprintf(msg, args...))
+	slog.Error(wrapInLogWidth(fmt.Sprintf(msg, args...)))
 }
 
 func PrettyPrintHistory(kernel *Kernel) {
@@ -206,41 +192,6 @@ func SqlitePath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(dir, "sql.db"), nil
-}
-
-// StorageDir returns ~/.swarmbuddy/storage/, creating it if needed.
-func StorageDir() (string, error) {
-	dir, err := swarmbuddyHome()
-	if err != nil {
-		return "", err
-	}
-	p := filepath.Join(dir, "storage")
-	if err := os.MkdirAll(p, 0755); err != nil {
-		return "", err
-	}
-	return p, nil
-}
-
-// TracesDir returns ~/.swarmbuddy/traces/, creating it if needed.
-func TracesDir() (string, error) {
-	dir, err := swarmbuddyHome()
-	if err != nil {
-		return "", err
-	}
-	p := filepath.Join(dir, "traces")
-	if err := os.MkdirAll(p, 0755); err != nil {
-		return "", err
-	}
-	return p, nil
-}
-
-// ConfigPath returns ~/.swarmbuddy/config.json
-func ConfigPath() (string, error) {
-	dir, err := swarmbuddyHome()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "config.json"), nil
 }
 
 // RunnerDir returns {cwd}/.swarmbuddy_tmp/{traceID}/, creating it if needed.

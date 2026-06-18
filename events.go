@@ -39,6 +39,38 @@ type Event struct {
 	Payload   any       `json:"payload,omitempty"`
 }
 
+// nonObservableKinds are display-only and control-plane signals that are not part
+// of the observability trace: streamed display tokens, reasoning deltas, and
+// idle/title/queue bookkeeping. They are excluded from OTEL span events so the
+// exported trace carries only meaningful work, not UI chatter.
+var nonObservableKinds = map[EventKind]bool{
+	EventToken:          true, // streamed display chunks (also not persisted)
+	EventReasoning:      true, // streamed thinking deltas (also not persisted)
+	EventMasterIdle:     true,
+	EventTitle:          true,
+	EventQueueInterrupt: true,
+}
+
+// Observable reports whether an event of this kind belongs in the observability
+// trace (and therefore in OTEL span events). Display-only and control-plane kinds
+// return false.
+func (k EventKind) Observable() bool { return !nonObservableKinds[k] }
+
+// OTEL renders the event as an OpenTelemetry span event: a point-in-time
+// annotation carrying the event name, wall-clock timestamp, and the full payload
+// serialized as a JSON attribute. This is the single canonical mapping used both
+// when persisting (Save:true) and when exporting via OTELSpans, so the stored and
+// exported shapes can never drift.
+func (e Event) OTEL() OTELEvent {
+	oe := OTELEvent{Name: string(e.Kind), TimeUnix: e.EmitTS}
+	if e.Payload != nil {
+		if b, err := json.Marshal(e.Payload); err == nil && len(b) > 0 && string(b) != "null" {
+			oe.Attribute = string(b)
+		}
+	}
+	return oe
+}
+
 // fantasy event to Swarm Buddy event Map
 
 const (
@@ -101,10 +133,14 @@ type CompactPayload struct {
 	TokenCount   int `json:"token_count"`
 }
 
-// CompactSummaryPayload is attached to EventPostCompact.
-// It contains the LLM-generated summary of the conversation before the context was reset.
+// CompactSummaryPayload is attached to EventPostCompact. It carries the
+// LLM-generated summary plus the before/after shape of the history, so consumers
+// can see exactly what compaction collapsed (messages and tokens removed).
 type CompactSummaryPayload struct {
-	Summary string `json:"summary"`
+	Summary        string `json:"summary"`
+	MessagesBefore int    `json:"messages_before,omitempty"`
+	MessagesAfter  int    `json:"messages_after,omitempty"`
+	TokensBefore   int    `json:"tokens_before,omitempty"`
 }
 
 // AssistantTurnPayload is attached to EventAssistantTurn.

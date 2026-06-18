@@ -123,9 +123,6 @@ func NewStore() (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-// NewStoreReadWrite is an alias for NewStore; both share the one database file.
-func NewStoreReadWrite() (*Store, error) { return NewStore() }
-
 // DB exposes the underlying shared *sql.DB (used to back the todo tools).
 func (s *Store) DB() *sql.DB { return s.db }
 
@@ -500,15 +497,26 @@ func DeleteSession(id string) error {
 //
 // The kernel's persisted trace/span graph maps directly onto OpenTelemetry: a
 // span is a kernel run, child spans are subagents, and kernel Events become span
-// events. OTELSpans converts a stored trace into OTEL-shaped snapshots carrying
-// real otel/trace IDs (derived via OTELIDs), so a host can feed them to any OTLP
-// exporter without the kernel taking a hard dependency on the OpenTelemetry SDK.
+// events. There is ONE canonical OTEL shape, and it is derived on read from the
+// raw Events stored under Save:true — the DB keeps full-fidelity Events and
+// OTELSpans projects them losslessly (payloads land in span-event attributes,
+// token usage and cost in GenAI semantic-convention span attributes). Because the
+// projection is the single source of truth, the persisted and exported views can
+// never drift. A host feeds these snapshots to any OTLP exporter without the
+// kernel taking a hard dependency on the OpenTelemetry SDK.
 
-// OTELEvent is a single event recorded against a span.
+// OTELEvent is a single event recorded against a span (an OTEL span event).
 type OTELEvent struct {
 	Name      string `json:"name"`
 	TimeUnix  int64  `json:"time_unix_nano"`
 	Attribute string `json:"attribute,omitempty"` // JSON payload, if any
+}
+
+// OTELKeyValue is a single OpenTelemetry span attribute. Value is a scalar
+// (string, int64, float64, or bool) per the OTEL attribute model.
+type OTELKeyValue struct {
+	Key   string `json:"key"`
+	Value any    `json:"value"`
 }
 
 // OTELSpan is an OpenTelemetry-shaped view of a kernel span.
@@ -519,8 +527,9 @@ type OTELSpan struct {
 	Name         string            `json:"name"`
 	StartUnix    int64             `json:"start_unix_nano"`
 	EndUnix      int64             `json:"end_unix_nano"`
-	Model        string            `json:"model,omitempty"`
-	CostUSD      float64           `json:"cost_usd"`
+	Model        string            `json:"model,omitempty"`      // convenience mirror of gen_ai.request.model
+	CostUSD      float64           `json:"cost_usd"`             // convenience mirror of gen_ai.usage.cost_usd
+	Attributes   []OTELKeyValue    `json:"attributes,omitempty"` // GenAI semantic-convention attributes
 	Events       []OTELEvent       `json:"events,omitempty"`
 }
 
@@ -546,12 +555,17 @@ func OTELSpans(traceID string) ([]OTELSpan, error) {
 
 		var cost float64
 		if n := len(sp.Costs); n > 0 {
-			cost = sp.Costs[n-1].TotalUSD
+			cost = sp.Costs[n-1].TotalUSD // total_usd is cumulative; last row is the span total
 		}
 
+		// Span events: the single canonical Event->OTEL mapping, filtered to
+		// observability-relevant kinds (drops display/control-plane chatter).
 		events := make([]OTELEvent, 0, len(sp.Events))
 		for _, ev := range sp.Events {
-			events = append(events, OTELEvent{Name: string(ev.Kind), TimeUnix: ev.EmitTS})
+			if !ev.Kind.Observable() {
+				continue
+			}
+			events = append(events, ev.OTEL())
 		}
 
 		out = append(out, OTELSpan{
@@ -563,8 +577,61 @@ func OTELSpans(traceID string) ([]OTELSpan, error) {
 			EndUnix:      sp.EndedAt,
 			Model:        sp.Model,
 			CostUSD:      cost,
+			Attributes:   spanAttributes(sp, cost),
 			Events:       events,
 		})
 	}
 	return out, nil
+}
+
+// spanAttributes builds the OTEL GenAI semantic-convention attributes for a span:
+// the request model plus aggregated token usage and cost. These are what let
+// backends like Langfuse or SigNoz render model/token/cost dashboards natively.
+func spanAttributes(sp SpanData, cost float64) []OTELKeyValue {
+	attrs := make([]OTELKeyValue, 0, 8)
+	if sp.Model != "" {
+		attrs = append(attrs, OTELKeyValue{Key: "gen_ai.request.model", Value: sp.Model})
+	}
+
+	u := aggregateUsage(sp)
+	addTokens := func(key string, n int64) {
+		if n > 0 {
+			attrs = append(attrs, OTELKeyValue{Key: key, Value: n})
+		}
+	}
+	addTokens("gen_ai.usage.input_tokens", u.Input)
+	addTokens("gen_ai.usage.output_tokens", u.Output)
+	addTokens("gen_ai.usage.reasoning_tokens", u.Reasoning)
+	addTokens("gen_ai.usage.cache_read_tokens", u.CacheRead)
+	addTokens("gen_ai.usage.cache_write_tokens", u.CacheWrite)
+	addTokens("gen_ai.usage.total_tokens", u.Input+u.Output)
+
+	attrs = append(attrs, OTELKeyValue{Key: "gen_ai.usage.cost_usd", Value: cost})
+	return attrs
+}
+
+// aggregateUsage sums per-turn token usage recorded on a span's TurnCost events.
+// Loaded events carry Payload as a decoded map, so it is re-marshaled into the
+// typed payload rather than type-asserted.
+func aggregateUsage(sp SpanData) Usage {
+	var total Usage
+	for _, ev := range sp.Events {
+		if ev.Kind != EventTurnCost || ev.Payload == nil {
+			continue
+		}
+		var p TurnCostPayload
+		b, err := json.Marshal(ev.Payload)
+		if err != nil {
+			continue
+		}
+		if err := json.Unmarshal(b, &p); err != nil {
+			continue
+		}
+		total.Input += p.TurnUsage.Input
+		total.Output += p.TurnUsage.Output
+		total.Reasoning += p.TurnUsage.Reasoning
+		total.CacheRead += p.TurnUsage.CacheRead
+		total.CacheWrite += p.TurnUsage.CacheWrite
+	}
+	return total
 }
