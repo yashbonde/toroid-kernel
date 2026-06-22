@@ -119,17 +119,9 @@ func main() {
 	fmt.Println(out)
 	fmt.Printf("sessions billed: %d | cost: $%.6f\n", len(usage.Tokens), k.RunningCostUSD())
 
-	// --- STREAMING: render token deltas as they arrive via EventToken. ---
-	// Stream also writes the final text to its io.Writer, but a UI typically wants
-	// the per-token deltas — so we stream to io.Discard and render from the hook.
+	// --- STREAMING: Stream writes the final text to its io.Writer. ---
 	fmt.Println("\n== streaming (Stream) ==")
-	k.On(toroid.EventToken, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TokenPayload); ok {
-			fmt.Print(p.Text)
-		}
-		return nil
-	})
-	if err := k.Stream(ctx, "Count from 1 to 5, one number per line. Then fetch the details for the current user.", io.Discard); err != nil {
+	if err := k.Stream(ctx, "Count from 1 to 5, one number per line. Then fetch the details for the current user.", os.Stdout); err != nil {
 		panic(err)
 	}
 	fmt.Println()

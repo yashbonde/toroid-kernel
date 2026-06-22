@@ -43,7 +43,6 @@ type Kernel struct {
 	Store            *Store
 	seq              atomic.Uint64
 	SystemPrompt     string
-	Title            string
 	History          []fantasy.Message
 	StepUsage        []Usage          // per-step token usage, index-aligned with StepHistoryStart
 	StepHistoryStart []int            // history index where each step's messages begin
@@ -84,8 +83,8 @@ type Config struct {
 	ThinkingWriter io.Writer        `json:"-"`
 
 	// Tools
-	ComputerTools bool            `json:"computer_tools" description:"if true, include the computer tools" default:"true"`
-	Tools         *tools.Registry `json:"tools,omitempty" description:"custom tools"`
+	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
+	Tools                *tools.Registry `json:"tools,omitempty" description:"custom tools"`
 
 	// Trace/span hierarchy
 	TraceID         string `json:"trace_id,omitempty"`          // inherited from parent; root sets TraceID = SessionID
@@ -96,8 +95,7 @@ type Config struct {
 	Save bool `json:"save" description:"persist events, costs and metadata to the SQLite store" default:"false"`
 
 	// Session management
-	Resume        bool `json:"resume" description:"if true, load existing session history and continue" default:"false"`
-	GenerateTitle bool `json:"generate_title" description:"if true, generate title for the session" default:"false"`
+	Resume bool `json:"resume" description:"if true, load existing session history and continue" default:"false"`
 
 	// compaction
 	CompactionBufferSize int `json:"compaction_buffer_size" description:"buffer size for history compaction" default:"30000"`
@@ -151,7 +149,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	// register all tools
-	if cfg.ComputerTools {
+	if cfg.IncludeComputerTools {
 		getDescription := func(name string) string {
 			b, _ := readPrompt(name + ".tool.tmpl")
 			lines := strings.Split(string(b), "\n")
@@ -205,9 +203,6 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 				StartedAt:       time.Now().UnixNano(),
 			})
 		} else {
-			// Load existing title so we can update it
-			meta, _ := store.LoadTraceMeta(cfg.TraceID)
-			k.Title = meta.Title
 			// Restore conversation history by replaying stored events (post-last-compaction only).
 			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir); err2 == nil && len(msgs) > 0 {
 				k.History = msgs
@@ -253,7 +248,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// Default AttachLoggerHooks if nil
 	if cfg.AttachLoggerHooks != nil && *cfg.AttachLoggerHooks {
 		k.OnAll(func(ctx context.Context, e Event) error {
-			if e.Kind == EventToken || e.Kind == EventReasoning {
+			if e.Kind == EventReasoning {
 				return nil
 			}
 			k.Logf(string(e.Kind) + " " + fmt.Sprintf("%v", e.Payload))
@@ -384,7 +379,7 @@ func (k *Kernel) Fire(ctx context.Context, kind string, payload any) error {
 		Seq:       k.seq.Add(1),
 		Payload:   payload,
 	}
-	if k.Store != nil && event.Kind != EventToken && event.Kind != EventReasoning {
+	if k.Store != nil && event.Kind != EventReasoning {
 		_ = k.Store.AppendEvent(k.Cfg.TraceID, k.Cfg.SessionID, event)
 	}
 	return k.Hooks.Fire(ctx, event)
@@ -452,7 +447,6 @@ func (k *Kernel) OnAll(fn HookFn) {
 	for _, kind := range []EventKind{
 		EventSessionStart,
 		EventUserPromptSubmit,
-		EventToken,
 		EventPermissionRequest,
 		EventPreToolUse,
 		EventPostToolUse,
@@ -462,7 +456,6 @@ func (k *Kernel) OnAll(fn HookFn) {
 		EventMasterIdle,
 		EventNotification,
 		EventTaskCompleted,
-		EventTitle,
 		EventReasoning,
 		EventStop,
 		EventPreCompact,
@@ -512,24 +505,6 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	for _, o := range opts {
 		o(&ro)
 	}
-	if ro.schema != nil {
-		resp, err := k.LM.GenerateObject(ctx, fantasy.ObjectCall{
-			Prompt:            fantasy.Prompt{fantasy.NewUserMessage(prompt)},
-			Schema:            *ro.schema,
-			SchemaName:        ro.schemaName,
-			SchemaDescription: ro.schemaDescription,
-		})
-		if err != nil {
-			return err
-		}
-		b, err := json.Marshal(resp.Object)
-		if err != nil {
-			return err
-		}
-		_, err = w.Write(b)
-		return err
-	}
-
 	// Fire session start only once
 	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
@@ -562,57 +537,6 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		if k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
 			k.LogErr("Last item (%d) is 'user' message. Got: '%s'", len(k.History)-1, k.History[len(k.History)-1].Role)
 			panic("Last item is 'user' message.")
-		}
-
-		// Shoot out a coroutine to generate title, last message is always user so this
-		// works fine. Why not use a subagent?
-		// Because subagents are meant for complex tasks that requires the full prompt
-		// and intelligence. We can get away with a very small prompt and thus less cost
-		if k.Cfg.GenerateTitle && k.Title == "" {
-			go func() {
-				ctx := context.Background()
-				agent := fantasy.NewAgent(k.LM, k.FantasyAgentOpts...)
-				titlePrompt, err := readPrompt("title.kernel.tmpl")
-				if err != nil {
-					k.LogErr("Failed to read title prompt: %v", err)
-					return
-				}
-				// feed the last message and
-				resp, err := agent.Generate(ctx, fantasy.AgentCall{
-					Prompt:   string(titlePrompt),
-					Messages: k.History[len(k.History)-1:],
-				})
-				if err != nil {
-					k.LogErr("Failed to generate title: %v", err)
-					return
-				}
-				title := strings.SplitN(strings.TrimSpace(resp.Response.Content.Text()), "\n", 2)[0]
-				k.Title = title
-				if k.Store != nil {
-					_ = k.Store.SaveTraceMeta(TraceMeta{
-						TraceID:   k.Cfg.TraceID,
-						Title:     title,
-						StartedAt: time.Now().UnixNano(),
-					})
-					_ = k.Store.SaveSpanMeta(SpanMeta{
-						SpanID:       k.Cfg.SessionID,
-						TraceID:      k.Cfg.TraceID,
-						ParentSpanID: k.Cfg.ParentSpanID,
-						Model:        k.Cfg.Model,
-						Title:        title,
-					})
-				}
-				_ = k.Fire(ctx, string(EventTitle), &TitlePayload{
-					Title: title,
-				})
-				u := Usage{}
-				u.FromFantasyUsage(resp.TotalUsage, k.Cfg.Model)
-				_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
-					TurnUsage:    u,
-					TurnCostUSD:  u.Cost,
-					TotalCostUSD: u.Cost, // this is the overall expense
-				})
-			}()
 		}
 
 		// Walk StepUsage backwards, accumulating tokens. Steps whose cumulative
@@ -658,7 +582,39 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		}
 	}
 
-	return k.streamCurrent(ctx, w)
+	// When schema is set, discard the free-text output from the agent loop;
+	// only the structured JSON from GenerateObject goes to the caller's writer.
+	loopWriter := w
+	if ro.schema != nil {
+		loopWriter = io.Discard
+	}
+	if err := k.streamCurrent(ctx, loopWriter); err != nil {
+		return err
+	}
+
+	if ro.schema != nil {
+		// GenerateObject requires the last message to be user/tool role.
+		// After the agentic loop the last message is assistant, so append a
+		// user turn that asks the model to emit structured output.
+		historyForSchema := append(k.History, fantasy.NewUserMessage("Now return your findings in the required JSON format."))
+		resp, err := k.LM.GenerateObject(ctx, fantasy.ObjectCall{
+			Prompt:            historyForSchema,
+			Schema:            *ro.schema,
+			SchemaName:        ro.schemaName,
+			SchemaDescription: ro.schemaDescription,
+		})
+		if err != nil {
+			return err
+		}
+		b, err := json.Marshal(resp.Object)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(b)
+		return err
+	}
+
+	return nil
 }
 
 // repeatCallGuard returns a stop condition that halts the agent when the last n
@@ -789,11 +745,6 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 					shouldCompact = true
 				}
 				return nil
-			},
-
-			// Live text streaming — fires for each token delta as it arrives
-			OnTextDelta: func(id, text string) error {
-				return k.Fire(ctx, string(EventToken), &TokenPayload{Text: text})
 			},
 
 			// Live reasoning streaming
@@ -1010,7 +961,6 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 	subCfg.SessionID = NewSessionID()     // new session ID
 	subCfg.TraceID = k.Cfg.TraceID        // inherit trace
 	subCfg.ParentSpanID = k.Cfg.SessionID // parent span = current session
-	subCfg.GenerateTitle = false          // don't cascade titleGeneration coroutines
 
 	// Create an independent Kernel instance for the subagent
 	subKernel, err := NewKernel(ctx, subCfg)

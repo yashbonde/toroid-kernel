@@ -8,7 +8,6 @@ const (
 	EventTraceLog           EventKind = "TraceLog" // structured log entry stored in the trace; visible in UI and readable by follow-on agents
 	EventSessionStart       EventKind = "SessionStart"
 	EventUserPromptSubmit   EventKind = "UserPromptSubmit"
-	EventToken              EventKind = "Token"              // each streamed text chunk (display only, not stored)
 	EventPermissionRequest  EventKind = "PermissionRequest"  // before a tool is called, if permission is required
 	EventPreToolUse         EventKind = "PreToolUse"         // before a tool is called
 	EventPostToolUse        EventKind = "PostToolUse"        // after a tool call is completed
@@ -18,7 +17,6 @@ const (
 	EventMasterIdle         EventKind = "MasterIdle"         // after the main agent is idle
 	EventNotification       EventKind = "Notification"       // before the notification is sent
 	EventTaskCompleted      EventKind = "TaskCompleted"      // before the task is completed
-	EventTitle              EventKind = "Title"              // fired async when session title is ready
 	EventReasoning          EventKind = "Reasoning"          // streamed reasoning/thinking tokens (display only, not stored)
 	EventAssistantTurn      EventKind = "AssistantTurn"      // full structured content blocks for the turn (thinking+text+tool_use)
 	EventTurnCost           EventKind = "TurnCost"           // after each LLM turn, with incremental cost
@@ -40,14 +38,12 @@ type Event struct {
 }
 
 // nonObservableKinds are display-only and control-plane signals that are not part
-// of the observability trace: streamed display tokens, reasoning deltas, and
-// idle/title/queue bookkeeping. They are excluded from OTEL span events so the
-// exported trace carries only meaningful work, not UI chatter.
+// of the observability trace: reasoning deltas and idle/queue bookkeeping. They
+// are excluded from OTEL span events so the exported trace carries only
+// meaningful work, not UI chatter.
 var nonObservableKinds = map[EventKind]bool{
-	EventToken:          true, // streamed display chunks (also not persisted)
 	EventReasoning:      true, // streamed thinking deltas (also not persisted)
 	EventMasterIdle:     true,
-	EventTitle:          true,
 	EventQueueInterrupt: true,
 }
 
@@ -91,16 +87,8 @@ type UserPromptPayload struct {
 	Prompt string `json:"prompt"`
 }
 
-type TokenPayload struct {
-	Text string `json:"text"`
-}
-
 type ReasoningPayload struct {
 	Text string `json:"text"`
-}
-
-type TitlePayload struct {
-	Title string `json:"title"`
 }
 
 type ToolUsePayload struct {

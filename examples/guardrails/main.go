@@ -105,7 +105,7 @@ func emitText(text string) fantasy.StreamResponse {
 func newKernel(ctx context.Context, cfg toroid.Config, lm fantasy.LanguageModel, tool *tools.ToolDef) *toroid.Kernel {
 	cfg.Provider = mockProvider{lm: lm}
 	cfg.Model = "mock/mock-model"
-	cfg.ComputerTools = false
+	cfg.IncludeComputerTools = false
 	// The agent's tool list is frozen when NewKernel builds it, so custom tools
 	// must be supplied via Config.Tools (merged in before that) rather than
 	// registered afterwards.

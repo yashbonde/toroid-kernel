@@ -46,7 +46,7 @@ func main() {
 	model := flag.String("model", "anthropic/claude-haiku-4-5", "llm model name")
 	workdir := flag.String("workdir", ".", "working directory")
 	thinking := flag.String("thinking", "none", "thinking budget: none | low | high")
-	tokens := flag.Bool("tokens", false, "include per-token Token/Reasoning deltas in the stream")
+	tokens := flag.Bool("tokens", false, "include per-step Reasoning deltas in the stream")
 	flag.Parse()
 
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -85,8 +85,8 @@ func main() {
 	enc := json.NewEncoder(os.Stdout)
 
 	emit := func(_ context.Context, e toroid.Event) error {
-		if !*tokens && (e.Kind == toroid.EventToken || e.Kind == toroid.EventReasoning) {
-			return nil // noisy display-only deltas; opt in with -tokens
+		if !*tokens && e.Kind == toroid.EventReasoning {
+			return nil // noisy reasoning deltas; opt in with -tokens
 		}
 		mu.Lock()
 		defer mu.Unlock()
