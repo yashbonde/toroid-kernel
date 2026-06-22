@@ -22,24 +22,33 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 
 	"charm.land/fantasy"
+	fantasyschema "charm.land/fantasy/schema"
 	toroid "github.com/yashbonde/toroid-kernel"
 	tools "github.com/yashbonde/toroid-kernel/tools"
 )
 
 func main() {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
-	if apiKey == "" {
-		fmt.Println("set ANTHROPIC_API_KEY to run this example")
-		return
-	}
 	ctx := context.Background()
 
+	// Prefer llmgateway when configured, fall back to Anthropic.
+	apiKey := os.Getenv("LLM_GATEWAY_KEY")
+	model := "llmgateway/claude-haiku-4-5"
+	if apiKey == "" {
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		model = "anthropic/claude-haiku-4-5"
+	}
+	if apiKey == "" {
+		fmt.Println("set LLM_GATEWAY_KEY or ANTHROPIC_API_KEY to run this example")
+		return
+	}
+
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   "anthropic/claude-haiku-4-5",
+		Model:   model,
 		APIKey:  apiKey,
 		WorkDir: ".",
 	})
@@ -145,6 +154,26 @@ func main() {
 	// tool, which returns the image bytes as a media attachment (Piece 1).
 	fmt.Println("\n== multimodal: tool read ==")
 	out, _, err = k.Run(ctx, fmt.Sprintf("Read the image at %s and tell me in one sentence what you see.", imgPath))
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(out)
+
+	// --- STRUCTURED GENERATION: Run with WithSchema bypasses the agent loop
+	// and calls GenerateObject directly, returning a JSON object that strictly
+	// matches the schema. No tool calls, no history — single-turn only.
+	fmt.Println("\n== structured generation (Run + WithSchema) ==")
+	type DirectoryInfo struct {
+		ProjectType string   `json:"project_type"`
+		MainFiles   []string `json:"main_files"`
+		Description string   `json:"description"`
+	}
+	dirSchema := fantasyschema.Generate(reflect.TypeOf(DirectoryInfo{}))
+	// Structured generation is single-turn with no tools — embed the facts directly.
+	out, _, err = k.Run(ctx,
+		"This is a Go library called toroid-kernel. Its root files include kernel.go, store.go, utils.go, multimodal.go, otlp.go, provider.go, and an examples/ directory. Return structured info about this project.",
+		toroid.WithSchema(dirSchema, "DirectoryInfo", "Structured summary of a project directory"),
+	)
 	if err != nil {
 		panic(err)
 	}

@@ -79,6 +79,7 @@ type Config struct {
 	SessionID      string           `json:"session_id,omitempty" description:"unique identifier for the session"`
 	WorkDir        string           `json:"work_dir" description:"working directory" default:"current directory"`
 	MaxIter        int              `json:"max_iter" description:"max tool-call iterations" default:"50"`
+	MaxRepeatCalls int              `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
 	Thinking       Thinking         `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer        `json:"-"`
 
@@ -267,6 +268,21 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		fantasy.WithMaxRetries(5),
 	}
 
+	// Loop guards. MaxIter caps the absolute number of tool-call steps;
+	// MaxRepeatCalls catches a model spinning on the same call before it ever
+	// reaches that cap. Both are wired as fantasy stop conditions so the agent
+	// halts cleanly at a step boundary (history stays consistent).
+	var stops []fantasy.StopCondition
+	if cfg.MaxIter > 0 {
+		stops = append(stops, fantasy.StepCountIs(cfg.MaxIter))
+	}
+	if cfg.MaxRepeatCalls > 0 {
+		stops = append(stops, k.repeatCallGuard(cfg.MaxRepeatCalls))
+	}
+	if len(stops) > 0 {
+		opts = append(opts, fantasy.WithStopConditions(stops...))
+	}
+
 	// Handle thinking
 	if cfg.Thinking != ThinkingNone {
 		if cfg.ThinkingWriter != nil {
@@ -383,8 +399,29 @@ func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 		k.Sessions[key] = u
 	}
 	k.runningCostUSD += u.Cost
-	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+	// u is a single step's usage here; its input-side tokens are the size of the
+	// request that step sent (the whole conversation so far), so this is a valid
+	// snapshot of context-window occupancy. See windowTokens.
+	k.currentTokens = windowTokens(u)
 	return k.runningCostUSD
+}
+
+// windowTokens estimates how full the context window is from a single request's
+// usage: the input-side tokens (fresh + cache-read + cache-write are disjoint
+// slices of the prompt) plus the tokens generated, which become part of the
+// window on the next turn. It must be fed a single step's usage, never an
+// agent's summed TotalUsage (which double-counts re-read context across steps).
+func windowTokens(u Usage) int {
+	return int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
+}
+
+// overContextThreshold reports whether context-window occupancy has reached the
+// point where we should compact. Shared by the pre-turn check and the in-loop
+// check so both use identical logic.
+func (k *Kernel) overContextThreshold() bool {
+	k.usageMu.Lock()
+	defer k.usageMu.Unlock()
+	return k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize
 }
 
 // Enqueue adds a message to the kernel's message queue. It is safe to call
@@ -438,19 +475,61 @@ func (k *Kernel) OnAll(fn HookFn) {
 }
 
 // Run runs the agent loop and returns the final text response.
-func (k *Kernel) Run(ctx context.Context, prompt string) (string, UsagePayload, error) {
+// RunOption configures a single Run or Stream call.
+type RunOption func(*runOptions)
+
+type runOptions struct {
+	schema            *fantasy.Schema
+	schemaName        string
+	schemaDescription string
+}
+
+// WithSchema enables structured generation for this Run/Stream call.
+// The model will produce a JSON object matching the given schema instead of
+// free text. Run returns the raw JSON; Stream writes it to the writer.
+func WithSchema(schema fantasy.Schema, name, description string) RunOption {
+	return func(o *runOptions) {
+		o.schema = &schema
+		o.schemaName = name
+		o.schemaDescription = description
+	}
+}
+
+func (k *Kernel) Run(ctx context.Context, prompt string, opts ...RunOption) (string, UsagePayload, error) {
 	var buf strings.Builder
 	var usage UsagePayload
 	k.On(EventStop, func(ctx context.Context, e Event) error {
 		usage = *e.Payload.(*UsagePayload)
 		return nil
 	})
-	err := k.Stream(ctx, prompt, &buf)
+	err := k.Stream(ctx, prompt, &buf, opts...)
 	return buf.String(), usage, err
 }
 
 // Stream runs the agent loop and streams the response to the writer.
-func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
+func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ...RunOption) error {
+	var ro runOptions
+	for _, o := range opts {
+		o(&ro)
+	}
+	if ro.schema != nil {
+		resp, err := k.LM.GenerateObject(ctx, fantasy.ObjectCall{
+			Prompt:            fantasy.Prompt{fantasy.NewUserMessage(prompt)},
+			Schema:            *ro.schema,
+			SchemaName:        ro.schemaName,
+			SchemaDescription: ro.schemaDescription,
+		})
+		if err != nil {
+			return err
+		}
+		b, err := json.Marshal(resp.Object)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(b)
+		return err
+	}
+
 	// Fire session start only once
 	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
@@ -460,7 +539,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 	}
 
 	// Auto-compact if approaching context limit; important to do this before adding user prompt
-	if k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize {
+	if k.overContextThreshold() {
 		k.Logf("auto-compacting: currentTokens=%d threshold=%d", k.currentTokens, k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize)
 		if err := k.Compact(ctx); err != nil {
 			return err
@@ -582,6 +661,71 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 	return k.streamCurrent(ctx, w)
 }
 
+// repeatCallGuard returns a stop condition that halts the agent when the last n
+// steps all issued the exact same tool calls (name + input) AND received the
+// exact same results.
+//
+// Keying on the result — not just the arguments — is what keeps legitimate
+// polling alive: a poll that observes changing state (a job that flips from
+// "pending" to "done", a file that grows, a queue that drains) produces a
+// different signature each step and is never tripped. Only a call that repeats
+// with identical args and identical output — i.e. making no progress — counts as
+// a stuck loop. A poll that genuinely needs to wait should yield between checks
+// (sleep/backoff) rather than spin the synchronous agent loop; this guard is the
+// backstop for the spin case.
+func (k *Kernel) repeatCallGuard(n int) fantasy.StopCondition {
+	return func(steps []fantasy.StepResult) bool {
+		if n <= 1 || len(steps) < n {
+			return false
+		}
+		var last string
+		for i := 0; i < n; i++ {
+			sig := stepCallSignature(steps[len(steps)-1-i])
+			if sig == "" {
+				return false // a step with no tool calls isn't a spin
+			}
+			if i == 0 {
+				last = sig
+			} else if sig != last {
+				return false
+			}
+		}
+		k.Logf("loop guard: stopping after %d consecutive identical tool calls with identical results", n)
+		return true
+	}
+}
+
+// stepCallSignature builds a stable signature of every tool call in a step,
+// pairing each call's (name, input) with its result so that progress-making
+// repeats produce distinct signatures. Returns "" if the step made no calls.
+func stepCallSignature(step fantasy.StepResult) string {
+	results := map[string]string{}
+	for _, msg := range step.Messages {
+		if msg.Role != fantasy.MessageRoleTool {
+			continue
+		}
+		for _, part := range msg.Content {
+			if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+				if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
+					results[tr.ToolCallID] = txt.Text
+				} else {
+					results[tr.ToolCallID] = fmt.Sprintf("%v", tr.Output)
+				}
+			}
+		}
+	}
+	var b strings.Builder
+	for _, tc := range step.Content.ToolCalls() {
+		b.WriteString(tc.ToolName)
+		b.WriteByte('\x00')
+		b.WriteString(tc.Input)
+		b.WriteByte('\x00')
+		b.WriteString(results[tc.ToolCallID])
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
 // streamCurrent runs the agent loop over the current in-memory history until it
 // stops (no pending queued messages). Stream prepares history (compaction,
 // appending the user message, pruning) and then calls this; Wake calls it after
@@ -602,6 +746,7 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	var result *fantasy.AgentResult
 	for {
 		var shouldInterrupt bool
+		var shouldCompact bool
 		var interruptedWith []string
 
 		var streamErr error
@@ -634,6 +779,14 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 						shouldInterrupt = true
 						interruptedWith = queued
 					}
+				}
+				// Also check context pressure at this boundary. A long agentic turn
+				// can balloon the window far past the limit within a single Stream
+				// call; checking only between Runs lets it overflow. We flag it and
+				// let the stream finish so all step messages are collected, then
+				// compact and restart the loop below.
+				if !shouldInterrupt && !shouldCompact && k.overContextThreshold() {
+					shouldCompact = true
 				}
 				return nil
 			},
@@ -687,6 +840,21 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 			})
 			continue
 		}
+
+		if shouldCompact {
+			// Collect this iteration's step messages into history first so the
+			// summary covers everything generated so far, then compact (which
+			// resets History to the summary) and restart the loop on the smaller
+			// window. A queue interrupt takes precedence and is handled above.
+			for _, step := range result.Steps {
+				k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
+				k.History = append(k.History, step.Messages...)
+			}
+			if err := k.Compact(ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		break
 	}
 
@@ -710,7 +878,16 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	u.FromFantasyUsage(result.TotalUsage, k.Cfg.Model)
 	k.usageMu.Lock()
 	k.Sessions[k.Cfg.SessionID] = u
-	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+	// currentTokens must track context-window occupancy, NOT the turn's cumulative
+	// billed tokens. result.TotalUsage sums every step, so in a multi-step turn it
+	// counts each step's re-read of the (cached) context over and over — wildly
+	// over-stating how full the window is. The window occupancy is the last step's
+	// request size (its input-side tokens) plus what it generated.
+	if n := len(result.Steps); n > 0 {
+		var last Usage
+		last.FromFantasyUsage(result.Steps[n-1].Usage, k.Cfg.Model)
+		k.currentTokens = windowTokens(last)
+	}
 	k.usageMu.Unlock()
 
 	if k.Cfg.ShowHistory != nil && *k.Cfg.ShowHistory {
@@ -804,6 +981,15 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	)
 	msg.Role = fantasy.MessageRoleAssistant
 	k.History = append(k.History, msg)
+
+	// Reset the occupancy gauge to reflect the new, tiny history. Without this it
+	// keeps the stale pre-compaction value, which would immediately re-trigger the
+	// in-loop threshold check (and misreport context usage until the next turn's
+	// usage lands). ~4 chars/token is a coarse estimate of the summary's size; the
+	// next stream replaces it with the real measured value.
+	k.usageMu.Lock()
+	k.currentTokens = (len(k.SystemPrompt) + len(summary)) / 4
+	k.usageMu.Unlock()
 
 	// Fire post-compact event so history can be reconstructed from events alone.
 	// It carries the before/after diff (messages and tokens collapsed).

@@ -3,3 +3,10 @@
 bin/
 coverage.out
 dist/
+
+# Built example binaries (compiled artifacts, never committed)
+examples/toroid-repl/app
+examples/toroid-repl/app_stripped
+examples/toroid-repl/app_upx
+examples/toroid-repl/toroid-repl
+examples/toroid-cli/toroid-cli
