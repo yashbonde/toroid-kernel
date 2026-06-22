@@ -15,10 +15,8 @@ import (
 var imageRefRe = regexp.MustCompile(`!\[[^\]]*\]\(([^)]+)\)`)
 
 // parseUserMessage turns a raw prompt into a user Message and the string that
-// should be persisted for it. Markdown image refs to readable, model-supported
-// files become interleaved file parts (so "text ![](x) text" arrives as
-// text→image→text, which fantasy.NewUserMessage cannot express). Each such ref
-// is rewritten in the persisted string to its ~-rooted absolute path, so a
+// should be persisted for it. "text ![x](path) text" is loaded as text→image→text,
+// which fantasy.NewUserMessage cannot express. x -> ~/.../path absolute path, so a
 // session resumed from any directory still resolves to the same file. Refs that
 // don't resolve are left as literal text — the model simply sees a broken link.
 func parseUserMessage(prompt, workDir string) (fantasy.Message, string) {

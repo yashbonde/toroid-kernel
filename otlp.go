@@ -2,6 +2,7 @@ package toroid
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -408,31 +409,79 @@ func orNow(end, start int64) int64 {
 	return start + 1
 }
 
-// postOTLP marshals and POSTs an OTLP request to an OTLP/HTTP JSON endpoint.
+// otlpMaxAttempts bounds the retry loop in postOTLP (1 try + 3 retries).
+const otlpMaxAttempts = 4
+
+// gzipJSON marshals req and gzip-compresses it. OTLP/JSON is verbose and highly
+// compressible, so this typically shrinks the body several-fold.
+func gzipJSON(req otlpRequest) ([]byte, error) {
+	raw, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(raw); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// postOTLP gzip-encodes and POSTs an OTLP request to an OTLP/HTTP JSON endpoint,
+// retrying transient failures (transport errors, 429, and 5xx) with exponential
+// backoff. 4xx responses fail immediately — retrying a rejected request is
+// pointless. The context bounds the total wait.
 func postOTLP(ctx context.Context, endpoint string, headers map[string]string, req otlpRequest) error {
-	body, err := json.Marshal(req)
+	body, err := gzipJSON(req)
 	if err != nil {
 		return err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	for k, v := range headers {
-		httpReq.Header.Set(k, v)
-	}
+
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(httpReq)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+	var lastErr error
+	for attempt := 0; attempt < otlpMaxAttempts; attempt++ {
+		if attempt > 0 {
+			// Exponential backoff: 0.5s, 1s, 2s …
+			delay := time.Duration(500<<(attempt-1)) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Content-Encoding", "gzip")
+		for k, v := range headers {
+			httpReq.Header.Set(k, v)
+		}
+
+		resp, err := client.Do(httpReq)
+		if err != nil {
+			lastErr = err // transport error: retry
+			continue
+		}
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("OTLP export to %s failed: %s: %s", endpoint, resp.Status, msg)
+		resp.Body.Close()
+
+		switch {
+		case resp.StatusCode >= 200 && resp.StatusCode < 300:
+			return nil
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+			lastErr = fmt.Errorf("OTLP export to %s failed: %s: %s", endpoint, resp.Status, msg)
+			// transient: retry
+		default:
+			return fmt.Errorf("OTLP export to %s failed: %s: %s", endpoint, resp.Status, msg) // 4xx: give up
+		}
 	}
-	return nil
+	return fmt.Errorf("OTLP export to %s failed after %d attempts: %w", endpoint, otlpMaxAttempts, lastErr)
 }
 
 // LangfuseOTLP pushes a stored trace to a Langfuse project's OTLP endpoint as a

@@ -35,21 +35,21 @@ var errQueueInterrupt = errors.New("queue interrupt")
 
 // Kernel is the agentic orchestrator powered by Fantasy.
 type Kernel struct {
-	cfg              Config
-	provider         fantasy.Provider
-	model            fantasy.LanguageModel
-	hooks            *HookRegistry
-	tools            *tools.Registry
-	store            *Store
+	Cfg              Config
+	Provider         fantasy.Provider
+	LM               fantasy.LanguageModel
+	Hooks            *HookRegistry
+	Tools            *tools.Registry
+	Store            *Store
 	seq              atomic.Uint64
-	systemPrompt     string
-	title            string
-	history          []fantasy.Message
-	stepUsage        []Usage          // per-step token usage, index-aligned with stepHistoryStart
-	stepHistoryStart []int            // history index where each step's messages begin
-	usage            map[string]Usage // sessionID -> total tokens used (self + subagents)
+	SystemPrompt     string
+	Title            string
+	History          []fantasy.Message
+	StepUsage        []Usage          // per-step token usage, index-aligned with StepHistoryStart
+	StepHistoryStart []int            // history index where each step's messages begin
+	Sessions         map[string]Usage // sessionID -> total tokens used (self + subagents)
 	usageMu          sync.Mutex
-	fantasyAgentOpts []fantasy.AgentOption
+	FantasyAgentOpts []fantasy.AgentOption
 	currentTokens    int
 	runningCostUSD   float64
 	todoDB           *sql.DB
@@ -82,9 +82,14 @@ type Config struct {
 	Thinking       Thinking         `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer        `json:"-"`
 
+	// Tools
+	ComputerTools bool            `json:"computer_tools" description:"if true, include the computer tools" default:"true"`
+	Tools         *tools.Registry `json:"tools,omitempty" description:"custom tools"`
+
 	// Trace/span hierarchy
-	TraceID      string `json:"trace_id,omitempty"`       // inherited from parent; root sets TraceID = SessionID
-	ParentSpanID string `json:"parent_span_id,omitempty"` // parent kernel's SessionID
+	TraceID         string `json:"trace_id,omitempty"`          // inherited from parent; root sets TraceID = SessionID
+	ParentSpanID    string `json:"parent_span_id,omitempty"`    // parent kernel's SessionID
+	PreviousTraceID string `json:"previous_trace_id,omitempty"` // previous trace id when compaction is triggered
 
 	// Persistence
 	Save bool `json:"save" description:"persist events, costs and metadata to the SQLite store" default:"false"`
@@ -128,28 +133,62 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		cfg.TraceID = cfg.SessionID
 	}
 
-	ApplyDefaults(&cfg) // cfg OR default_cfg
-
-	// Open the shared SQLite DB (todos + traces/events live in one file).
-	todoDB, _ := openDefaultSQL()
+	// Open the shared SQLite DB only when persistence is requested.
+	var todoDB *sql.DB
+	if cfg.Save {
+		todoDB, _ = openDefaultSQL()
+	}
 
 	// Kernel object
 	k := &Kernel{
-		cfg:           cfg,
-		hooks:         &HookRegistry{},
-		usage:         map[string]Usage{},
+		Cfg:           cfg,
+		Hooks:         &HookRegistry{},
+		Sessions:      map[string]Usage{},
 		currentTokens: 0,
 		todoDB:        todoDB,
+		Tools:         tools.NewRegistry(),
 	}
-	k.tools = initTools(k)
 
-	// Initialize the SQLite trace Store (only when --save is set)
+	// register all tools
+	if cfg.ComputerTools {
+		getDescription := func(name string) string {
+			b, _ := readPrompt(name + ".tool.tmpl")
+			lines := strings.Split(string(b), "\n")
+			if len(lines) > 1 {
+				return lines[1]
+			}
+			return "Tool " + name
+		}
+		k.Tools.Register(tools.NewReadTool(k, getDescription("read")))
+		k.Tools.Register(tools.NewWriteTool(k, getDescription("write")))
+		k.Tools.Register(tools.NewLsTool(k, getDescription("ls")))
+		k.Tools.Register(tools.NewBashTool(k, getDescription("bash")))
+		k.Tools.Register(tools.NewEditTool(k, getDescription("edit")))
+		k.Tools.Register(tools.NewGlobTool(k, getDescription("glob")))
+		k.Tools.Register(tools.NewGrepTool(k, getDescription("grep")))
+		k.Tools.Register(tools.NewMultiEditTool(k, getDescription("multiedit")))
+		k.Tools.Register(tools.NewNotifyTool(k, getDescription("notify")))
+		k.Tools.Register(tools.NewSubagentTool(k, getDescription("subagent")))
+		k.Tools.Register(newSubagentAsyncTool(k, getDescription("subagent")))
+		k.Tools.Register(tools.NewTodoWriteTool(k, k.todoDB, getDescription("todowrite")))
+		k.Tools.Register(tools.NewTodoReadTool(k, k.todoDB, getDescription("todoread")))
+	}
+
+	if cfg.Tools != nil {
+		for _, t := range cfg.Tools.Tools() {
+			k.Tools.Register(t)
+		}
+	}
+
+	ApplyDefaultDataTypes(&cfg) // cfg OR default_cfg
+
+	// Initialize the SQLite trace Store (only when save is set)
 	if cfg.Save {
 		store, err := NewStore()
 		if err != nil {
 			return nil, err
 		}
-		k.store = store
+		k.Store = store
 
 		_ = store.SaveSpanMeta(SpanMeta{
 			SpanID:       cfg.SessionID,
@@ -160,16 +199,17 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		})
 		if cfg.TraceID == cfg.SessionID {
 			_ = store.SaveTraceMeta(TraceMeta{
-				TraceID:   cfg.TraceID,
-				StartedAt: time.Now().UnixNano(),
+				TraceID:         cfg.TraceID,
+				PreviousTraceID: cfg.PreviousTraceID,
+				StartedAt:       time.Now().UnixNano(),
 			})
 		} else {
 			// Load existing title so we can update it
 			meta, _ := store.LoadTraceMeta(cfg.TraceID)
-			k.title = meta.Title
+			k.Title = meta.Title
 			// Restore conversation history by replaying stored events (post-last-compaction only).
 			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir); err2 == nil && len(msgs) > 0 {
-				k.history = msgs
+				k.History = msgs
 				k.Logf("[resume] reconstructed %d history messages from events for trace %s", len(msgs), cfg.TraceID)
 			} else if err2 != nil {
 				k.LogErr("[resume] failed to reconstruct history: %v", err2)
@@ -182,7 +222,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	if err != nil {
 		return nil, err
 	}
-	k.systemPrompt = systemPrompt
+	k.SystemPrompt = systemPrompt
 
 	// Load the model
 	if cfg.Provider == nil {
@@ -201,11 +241,11 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	if err != nil {
 		return nil, err
 	}
-	k.model = model
+	k.LM = model
 
 	// Build Fantasy Tools
 	var fTools []fantasy.AgentTool
-	for _, t := range k.tools.Tools() {
+	for _, t := range k.Tools.Tools() {
 		fTools = append(fTools, t.AgentTool)
 	}
 
@@ -263,37 +303,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 			},
 		}))
 	}
-	k.fantasyAgentOpts = opts
+	k.FantasyAgentOpts = opts
 
 	return k, nil
-}
-
-func initTools(ag *Kernel) *tools.Registry {
-	r := tools.NewRegistry()
-
-	getDescription := func(name string) string {
-		b, _ := readPrompt(name + ".tool.tmpl")
-		lines := strings.Split(string(b), "\n")
-		if len(lines) > 1 {
-			return lines[1]
-		}
-		return "Tool " + name
-	}
-
-	r.Register(tools.NewReadTool(ag, getDescription("read")))
-	r.Register(tools.NewWriteTool(ag, getDescription("write")))
-	r.Register(tools.NewLsTool(ag, getDescription("ls")))
-	r.Register(tools.NewBashTool(ag, getDescription("bash")))
-	r.Register(tools.NewEditTool(ag, getDescription("edit")))
-	r.Register(tools.NewGlobTool(ag, getDescription("glob")))
-	r.Register(tools.NewGrepTool(ag, getDescription("grep")))
-	r.Register(tools.NewMultiEditTool(ag, getDescription("multiedit")))
-	r.Register(tools.NewNotifyTool(ag, getDescription("notify")))
-	r.Register(tools.NewSubagentTool(ag, getDescription("subagent")))
-	r.Register(newSubagentAsyncTool(ag, getDescription("subagent")))
-	r.Register(tools.NewTodoWriteTool(ag, ag.todoDB, getDescription("todowrite")))
-	r.Register(tools.NewTodoReadTool(ag, ag.todoDB, getDescription("todoread")))
-	return r
 }
 
 func buildSystemPrompt(workDir string) (string, error) {
@@ -315,9 +327,9 @@ func buildSystemPrompt(workDir string) (string, error) {
 }
 
 // Implement tools.Agent interface
-func (k *Kernel) WorkDir() string   { return k.cfg.WorkDir }
-func (k *Kernel) SessionID() string { return k.cfg.SessionID }
-func (k *Kernel) Model() string     { return k.cfg.Model }
+func (k *Kernel) WorkDir() string   { return k.Cfg.WorkDir }
+func (k *Kernel) SessionID() string { return k.Cfg.SessionID }
+func (k *Kernel) Model() string     { return k.Cfg.Model }
 
 // RunningCostUSD returns the cumulative LLM cost so far in this session.
 func (k *Kernel) RunningCostUSD() float64 {
@@ -330,15 +342,15 @@ func (k *Kernel) RunningCostUSD() float64 {
 func (k *Kernel) ContextUsage() (int, int) {
 	k.usageMu.Lock()
 	defer k.usageMu.Unlock()
-	return k.currentTokens, k.cfg.TotalContextSize
+	return k.currentTokens, k.Cfg.TotalContextSize
 }
 
 func (k *Kernel) Logf(msg string, args ...any) {
-	LogInfo("["+k.cfg.TraceID+"] "+msg, args...)
+	LogInfo("["+k.Cfg.TraceID+"] "+msg, args...)
 }
 
 func (k *Kernel) LogErr(msg string, args ...any) {
-	LogError("["+k.cfg.TraceID+"] "+msg, args...)
+	LogError("["+k.Cfg.TraceID+"] "+msg, args...)
 }
 
 // FireTraceLog emits an EventTraceLog with the given severity and message.
@@ -349,29 +361,30 @@ func (k *Kernel) FireTraceLog(ctx context.Context, logType, message string) erro
 func (k *Kernel) Fire(ctx context.Context, kind string, payload any) error {
 	event := Event{
 		Kind:      EventKind(kind),
-		SessionID: k.cfg.SessionID,
-		TraceID:   k.cfg.TraceID,
-		SpanID:    k.cfg.SessionID,
+		SessionID: k.Cfg.SessionID,
+		TraceID:   k.Cfg.TraceID,
+		SpanID:    k.Cfg.SessionID,
 		EmitTS:    time.Now().UnixNano(),
 		Seq:       k.seq.Add(1),
 		Payload:   payload,
 	}
-	if k.store != nil && event.Kind != EventToken && event.Kind != EventReasoning {
-		_ = k.store.AppendEvent(k.cfg.TraceID, k.cfg.SessionID, event)
+	if k.Store != nil && event.Kind != EventToken && event.Kind != EventReasoning {
+		_ = k.Store.AppendEvent(k.Cfg.TraceID, k.Cfg.SessionID, event)
 	}
-	return k.hooks.Fire(ctx, event)
+	return k.Hooks.Fire(ctx, event)
 }
 
-// TODO: Improve this function, idea is to use this as a single place for all usage udpates
-func (k *Kernel) UpdateUse(u Usage, key string) {
+func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 	k.usageMu.Lock()
+	defer k.usageMu.Unlock()
 	if len(key) == 0 {
-		k.usage[k.cfg.SessionID] = u
+		k.Sessions[k.Cfg.SessionID] = u
 	} else {
-		k.usage[key] = u
+		k.Sessions[key] = u
 	}
+	k.runningCostUSD += u.Cost
 	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
-	k.usageMu.Unlock()
+	return k.runningCostUSD
 }
 
 // Enqueue adds a message to the kernel's message queue. It is safe to call
@@ -395,7 +408,7 @@ func (k *Kernel) drainQueue() []string {
 
 // On registers a hook for an event kind.
 func (k *Kernel) On(kind EventKind, fn HookFn) {
-	k.hooks.On(kind, fn)
+	k.Hooks.On(kind, fn)
 }
 
 func (k *Kernel) OnAll(fn HookFn) {
@@ -439,16 +452,16 @@ func (k *Kernel) Run(ctx context.Context, prompt string) (string, UsagePayload, 
 // Stream runs the agent loop and streams the response to the writer.
 func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 	// Fire session start only once
-	if len(k.history) == 0 {
+	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
-		if k.systemPrompt != "" {
-			k.history = append(k.history, fantasy.NewSystemMessage(k.systemPrompt))
+		if k.SystemPrompt != "" {
+			k.History = append(k.History, fantasy.NewSystemMessage(k.SystemPrompt))
 		}
 	}
 
 	// Auto-compact if approaching context limit; important to do this before adding user prompt
-	if k.currentTokens > 0 && k.currentTokens >= k.cfg.TotalContextSize-k.cfg.CompactionBufferSize {
-		k.Logf("auto-compacting: currentTokens=%d threshold=%d", k.currentTokens, k.cfg.TotalContextSize-k.cfg.CompactionBufferSize)
+	if k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize {
+		k.Logf("auto-compacting: currentTokens=%d threshold=%d", k.currentTokens, k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize)
 		if err := k.Compact(ctx); err != nil {
 			return err
 		}
@@ -457,18 +470,18 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 	// append user message; important to do this before history validation.
 	// parseUserMessage inlines any markdown image refs as file parts and returns
 	// the portable (~-rooted) prompt to persist for cross-process resume.
-	userMsg, storedPrompt := parseUserMessage(prompt, k.cfg.WorkDir)
-	k.history = append(k.history, userMsg)
+	userMsg, storedPrompt := parseUserMessage(prompt, k.Cfg.WorkDir)
+	k.History = append(k.History, userMsg)
 	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt})
 
 	// history validation
-	if len(k.history) > 0 {
-		if k.systemPrompt != "" && k.history[0].Role != fantasy.MessageRoleSystem {
-			k.LogErr("Kernel provided with system prompt. SysPrompt should be first item in history, found: '%s'", k.history[len(k.history)-1].Role)
+	if len(k.History) > 0 {
+		if k.SystemPrompt != "" && k.History[0].Role != fantasy.MessageRoleSystem {
+			k.LogErr("Kernel provided with system prompt. SysPrompt should be first item in history, found: '%s'", k.History[len(k.History)-1].Role)
 			panic("Kernel provided with system prompt. SysPrompt should be first item in history")
 		}
-		if k.history[len(k.history)-1].Role != fantasy.MessageRoleUser {
-			k.LogErr("Last item (%d) is 'user' message. Got: '%s'", len(k.history)-1, k.history[len(k.history)-1].Role)
+		if k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
+			k.LogErr("Last item (%d) is 'user' message. Got: '%s'", len(k.History)-1, k.History[len(k.History)-1].Role)
 			panic("Last item is 'user' message.")
 		}
 
@@ -476,10 +489,10 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 		// works fine. Why not use a subagent?
 		// Because subagents are meant for complex tasks that requires the full prompt
 		// and intelligence. We can get away with a very small prompt and thus less cost
-		if k.cfg.GenerateTitle && k.title == "" {
+		if k.Cfg.GenerateTitle && k.Title == "" {
 			go func() {
 				ctx := context.Background()
-				agent := fantasy.NewAgent(k.model, k.fantasyAgentOpts...)
+				agent := fantasy.NewAgent(k.LM, k.FantasyAgentOpts...)
 				titlePrompt, err := readPrompt("title.kernel.tmpl")
 				if err != nil {
 					k.LogErr("Failed to read title prompt: %v", err)
@@ -488,25 +501,25 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 				// feed the last message and
 				resp, err := agent.Generate(ctx, fantasy.AgentCall{
 					Prompt:   string(titlePrompt),
-					Messages: k.history[len(k.history)-1:],
+					Messages: k.History[len(k.History)-1:],
 				})
 				if err != nil {
 					k.LogErr("Failed to generate title: %v", err)
 					return
 				}
 				title := strings.SplitN(strings.TrimSpace(resp.Response.Content.Text()), "\n", 2)[0]
-				k.title = title
-				if k.store != nil {
-					_ = k.store.SaveTraceMeta(TraceMeta{
-						TraceID:   k.cfg.TraceID,
+				k.Title = title
+				if k.Store != nil {
+					_ = k.Store.SaveTraceMeta(TraceMeta{
+						TraceID:   k.Cfg.TraceID,
 						Title:     title,
 						StartedAt: time.Now().UnixNano(),
 					})
-					_ = k.store.SaveSpanMeta(SpanMeta{
-						SpanID:       k.cfg.SessionID,
-						TraceID:      k.cfg.TraceID,
-						ParentSpanID: k.cfg.ParentSpanID,
-						Model:        k.cfg.Model,
+					_ = k.Store.SaveSpanMeta(SpanMeta{
+						SpanID:       k.Cfg.SessionID,
+						TraceID:      k.Cfg.TraceID,
+						ParentSpanID: k.Cfg.ParentSpanID,
+						Model:        k.Cfg.Model,
 						Title:        title,
 					})
 				}
@@ -514,7 +527,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 					Title: title,
 				})
 				u := Usage{}
-				u.FromFantasyUsage(resp.TotalUsage, k.cfg.Model)
+				u.FromFantasyUsage(resp.TotalUsage, k.Cfg.Model)
 				_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
 					TurnUsage:    u,
 					TurnCostUSD:  u.Cost,
@@ -523,25 +536,25 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 			}()
 		}
 
-		// Walk stepUsage backwards, accumulating tokens. Steps whose cumulative
+		// Walk StepUsage backwards, accumulating tokens. Steps whose cumulative
 		// token total exceeds ToolCallPrunedSize get their history messages trimmed:
 		// tool call args are cleared, tool results are truncated to 30 chars.
-		if len(k.stepUsage) > 0 && len(k.stepHistoryStart) == len(k.stepUsage) {
+		if len(k.StepUsage) > 0 && len(k.StepHistoryStart) == len(k.StepUsage) {
 			var accumulated int
-			for i := len(k.stepUsage) - 1; i >= 0; i-- {
-				u := k.stepUsage[i]
+			for i := len(k.StepUsage) - 1; i >= 0; i-- {
+				u := k.StepUsage[i]
 				accumulated += int(u.Input + u.Output)
-				if accumulated <= k.cfg.ToolCallPrunedSize {
+				if accumulated <= k.Cfg.ToolCallPrunedSize {
 					continue
 				}
 				// This step is beyond the budget — trim its history messages.
-				start := k.stepHistoryStart[i]
-				end := len(k.history)
-				if i+1 < len(k.stepHistoryStart) {
-					end = k.stepHistoryStart[i+1]
+				start := k.StepHistoryStart[i]
+				end := len(k.History)
+				if i+1 < len(k.StepHistoryStart) {
+					end = k.StepHistoryStart[i+1]
 				}
 				for j := start; j < end; j++ {
-					msg := &k.history[j]
+					msg := &k.History[j]
 					for p, part := range msg.Content {
 						switch msg.Role {
 						case fantasy.MessageRoleAssistant:
@@ -585,7 +598,7 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	// The loop restarts agent.Stream() whenever queued messages are injected
 	// at a step boundary. A flag is set in OnStepFinish; the stream is allowed
 	// to finish normally so all step messages are collected before restarting.
-	agent := fantasy.NewAgent(k.model, k.fantasyAgentOpts...)
+	agent := fantasy.NewAgent(k.LM, k.FantasyAgentOpts...)
 	var result *fantasy.AgentResult
 	for {
 		var shouldInterrupt bool
@@ -593,23 +606,19 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 
 		var streamErr error
 		result, streamErr = agent.Stream(ctx, fantasy.AgentStreamCall{
-			// The user turn always lives in k.history (appended by Stream, or a
+			// The user turn always lives in k.History (appended by Stream, or a
 			// background completion injected by Wake), so Prompt stays empty —
 			// otherwise fantasy would append a duplicate user message.
-			Messages: k.history,
+			Messages: k.History,
 
 			// Per-step cost accounting
 			OnStepFinish: func(step fantasy.StepResult) error {
 				u := Usage{}
-				u.FromFantasyUsage(step.Usage, k.cfg.Model)
-				k.usageMu.Lock()
-				k.runningCostUSD += u.Cost
-				runningCost := k.runningCostUSD
-				k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
-				k.usageMu.Unlock()
-				k.stepUsage = append(k.stepUsage, u)
-				if k.store != nil {
-					_ = k.store.AppendCost(k.cfg.TraceID, k.cfg.SessionID, u.Cost, runningCost)
+				u.FromFantasyUsage(step.Usage, k.Cfg.Model)
+				runningCost := k.UpdateUse(u, "")
+				k.StepUsage = append(k.StepUsage, u)
+				if k.Store != nil {
+					_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
 				}
 				_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
 					TurnUsage:    u,
@@ -667,11 +676,11 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 			// Append this iteration's step messages to history, inject queued
 			// messages, fire the interrupt event, then restart.
 			for _, step := range result.Steps {
-				k.stepHistoryStart = append(k.stepHistoryStart, len(k.history))
-				k.history = append(k.history, step.Messages...)
+				k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
+				k.History = append(k.History, step.Messages...)
 			}
 			for _, qm := range interruptedWith {
-				k.history = append(k.history, fantasy.NewUserMessage(qm))
+				k.History = append(k.History, fantasy.NewUserMessage(qm))
 			}
 			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{
 				Messages: interruptedWith,
@@ -684,8 +693,8 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	// Append final step messages to history and fire EventAssistantTurn.
 	var allStepMsgs []fantasy.Message
 	for _, step := range result.Steps {
-		k.stepHistoryStart = append(k.stepHistoryStart, len(k.history))
-		k.history = append(k.history, step.Messages...)
+		k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
+		k.History = append(k.History, step.Messages...)
 		allStepMsgs = append(allStepMsgs, step.Messages...)
 	}
 	if len(allStepMsgs) > 0 {
@@ -696,12 +705,15 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 		}
 	}
 
-	// Update Usage (Per-Turn)
+	// Update Usage (Per-Turn) — update session map and token count without adding to cost again
 	var u Usage
-	u.FromFantasyUsage(result.TotalUsage, k.cfg.Model)
-	k.UpdateUse(u, "")
+	u.FromFantasyUsage(result.TotalUsage, k.Cfg.Model)
+	k.usageMu.Lock()
+	k.Sessions[k.Cfg.SessionID] = u
+	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+	k.usageMu.Unlock()
 
-	if k.cfg.ShowHistory != nil && *k.cfg.ShowHistory {
+	if k.Cfg.ShowHistory != nil && *k.Cfg.ShowHistory {
 		// Print history (after usage update so currentTokens is accurate)
 		PrettyPrintHistory(k)
 	}
@@ -709,8 +721,8 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	// Fire stop with usage
 	usageSnapshot := make(map[string]Usage)
 	k.usageMu.Lock()
-	for k, v := range k.usage {
-		usageSnapshot[k] = v
+	for sid, v := range k.Sessions {
+		usageSnapshot[sid] = v
 	}
 	k.usageMu.Unlock()
 
@@ -718,11 +730,11 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 
 	// Record span (and, for a root kernel, trace) end time so the persisted
 	// graph carries OTEL-style start/end timestamps.
-	if k.store != nil {
+	if k.Store != nil {
 		now := time.Now().UnixNano()
-		_ = k.store.SaveSpanMeta(SpanMeta{SpanID: k.cfg.SessionID, TraceID: k.cfg.TraceID, EndedAt: now})
-		if k.cfg.TraceID == k.cfg.SessionID {
-			_ = k.store.SaveTraceMeta(TraceMeta{TraceID: k.cfg.TraceID, EndedAt: now})
+		_ = k.Store.SaveSpanMeta(SpanMeta{SpanID: k.Cfg.SessionID, TraceID: k.Cfg.TraceID, EndedAt: now})
+		if k.Cfg.TraceID == k.Cfg.SessionID {
+			_ = k.Store.SaveTraceMeta(TraceMeta{TraceID: k.Cfg.TraceID, EndedAt: now})
 		}
 	}
 
@@ -743,19 +755,19 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 // SQLite handle itself is process-global and is released on exit. Safe to call
 // multiple times and on a nil-store kernel.
 func (k *Kernel) Close() error {
-	if k.store != nil {
-		return k.store.Close()
+	if k.Store != nil {
+		return k.Store.Close()
 	}
 	return nil
 }
 
 // Compact summarizes the current history and resets it.
 func (k *Kernel) Compact(ctx context.Context) error {
-	if len(k.history) == 0 {
+	if len(k.History) == 0 {
 		return nil
 	}
 
-	messagesBefore := len(k.history)
+	messagesBefore := len(k.History)
 	tokensBefore := k.currentTokens
 	_ = k.Fire(ctx, string(EventPreCompact), &CompactPayload{
 		MessageCount: messagesBefore,
@@ -768,10 +780,10 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	}
 
 	// 1. Generate summary by calling the LLM
-	agent := fantasy.NewAgent(k.model, fantasy.WithMaxRetries(5))
+	agent := fantasy.NewAgent(k.LM, fantasy.WithMaxRetries(5))
 	result, err := agent.Generate(ctx, fantasy.AgentCall{
 		Prompt:   string(prompt),
-		Messages: k.history,
+		Messages: k.History,
 	})
 	if err != nil {
 		return err
@@ -779,26 +791,26 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	summary := result.Response.Content.Text()
 
 	// 2. Reset history
-	if k.systemPrompt != "" {
-		k.history = []fantasy.Message{fantasy.NewSystemMessage(k.systemPrompt)}
+	if k.SystemPrompt != "" {
+		k.History = []fantasy.Message{fantasy.NewSystemMessage(k.SystemPrompt)}
 	} else {
-		k.history = []fantasy.Message{}
+		k.History = []fantasy.Message{}
 	}
-	k.history = append(k.history, fantasy.NewUserMessage(
+	k.History = append(k.History, fantasy.NewUserMessage(
 		"Tell me the summary of our conversation.",
 	))
 	msg := fantasy.NewUserMessage(
 		"Here is a summary of our previous interaction for your reference:\n\n" + summary,
 	)
 	msg.Role = fantasy.MessageRoleAssistant
-	k.history = append(k.history, msg)
+	k.History = append(k.History, msg)
 
 	// Fire post-compact event so history can be reconstructed from events alone.
 	// It carries the before/after diff (messages and tokens collapsed).
 	_ = k.Fire(ctx, string(EventPostCompact), &CompactSummaryPayload{
 		Summary:        summary,
 		MessagesBefore: messagesBefore,
-		MessagesAfter:  len(k.history),
+		MessagesAfter:  len(k.History),
 		TokensBefore:   tokensBefore,
 	})
 
@@ -808,10 +820,10 @@ func (k *Kernel) Compact(ctx context.Context) error {
 // RunSubagent runs a subagent synchronously and returns its output.
 func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 	// Inherit provider, model, and key from parent, but clean up
-	subCfg := k.cfg
+	subCfg := k.Cfg
 	subCfg.SessionID = NewSessionID()     // new session ID
-	subCfg.TraceID = k.cfg.TraceID        // inherit trace
-	subCfg.ParentSpanID = k.cfg.SessionID // parent span = current session
+	subCfg.TraceID = k.Cfg.TraceID        // inherit trace
+	subCfg.ParentSpanID = k.Cfg.SessionID // parent span = current session
 	subCfg.GenerateTitle = false          // don't cascade titleGeneration coroutines
 
 	// Create an independent Kernel instance for the subagent
@@ -822,7 +834,7 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 
 	// Fire an event to let the system know a subagent is starting
 	_ = k.Fire(ctx, string(EventSubagentStart), &SubagentPayload{
-		SessionID: subKernel.cfg.SessionID,
+		SessionID: subKernel.Cfg.SessionID,
 		Prompt:    task,
 	})
 
@@ -831,7 +843,7 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 
 	// Fire stop event for the subagent
 	_ = k.Fire(ctx, string(EventSubagentStop), &SubagentPayload{
-		SessionID:    subKernel.cfg.SessionID,
+		SessionID:    subKernel.Cfg.SessionID,
 		Prompt:       task,
 		Output:       output,
 		UsagePayload: usage,
@@ -928,11 +940,11 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	if len(k.history) == 0 && k.systemPrompt != "" {
-		k.history = append(k.history, fantasy.NewSystemMessage(k.systemPrompt))
+	if len(k.History) == 0 && k.SystemPrompt != "" {
+		k.History = append(k.History, fantasy.NewSystemMessage(k.SystemPrompt))
 	}
 	for _, m := range msgs {
-		k.history = append(k.history, fantasy.NewUserMessage(m))
+		k.History = append(k.History, fantasy.NewUserMessage(m))
 	}
 	w := k.lastWriter
 	if w == nil {

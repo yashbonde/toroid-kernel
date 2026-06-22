@@ -110,10 +110,10 @@ func LogError(msg string, args ...any) {
 }
 
 func PrettyPrintHistory(kernel *Kernel) {
-	LogInfo("Printing History: %d (tokens: %d)", len(kernel.history), kernel.currentTokens)
+	LogInfo("Printing History: %d (tokens: %d)", len(kernel.History), kernel.currentTokens)
 	var b strings.Builder
 	indent := strings.Repeat(" ", logPrefix)
-	for _, msg := range kernel.history {
+	for _, msg := range kernel.History {
 		message := indent + colorGray + string(msg.Role) + colorReset + ": " + strings.ReplaceAll(fmt.Sprintf("%v", msg.Content), "\n", "\\n")
 		if len(message) > logWidth {
 			message = message[:logWidth-3] + "..."
@@ -123,7 +123,7 @@ func PrettyPrintHistory(kernel *Kernel) {
 	fmt.Fprint(os.Stdout, b.String())
 }
 
-func ApplyDefaults(cfg any) {
+func ApplyDefaultDataTypes(cfg any) {
 	v := reflect.ValueOf(cfg).Elem()
 	t := v.Type()
 
@@ -194,9 +194,9 @@ func SqlitePath() (string, error) {
 	return filepath.Join(dir, "sql.db"), nil
 }
 
-// RunnerDir returns {cwd}/.swarmbuddy_tmp/{traceID}/, creating it if needed.
+// RunnerDir returns {cwd}/.swb/{traceID}/, creating it if needed.
 func RunnerDir(cwd, traceID string) (string, error) {
-	p := filepath.Join(cwd, ".swarmbuddy_tmp", traceID)
+	p := filepath.Join(cwd, ".swb", traceID)
 	if err := os.MkdirAll(p, 0755); err != nil {
 		return "", err
 	}

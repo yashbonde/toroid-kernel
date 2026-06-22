@@ -18,10 +18,11 @@ import (
 
 // TraceMeta is stored per trace (root kernel run).
 type TraceMeta struct {
-	TraceID   string `json:"trace_id"`
-	Title     string `json:"title,omitempty"`
-	StartedAt int64  `json:"started_at"` // UnixNano
-	EndedAt   int64  `json:"ended_at,omitempty"`
+	TraceID         string `json:"trace_id"`
+	Title           string `json:"title,omitempty"`
+	StartedAt       int64  `json:"started_at"` // UnixNano
+	EndedAt         int64  `json:"ended_at,omitempty"`
+	PreviousTraceID string `json:"previous_trace_id,omitempty"`
 }
 
 // SpanMeta is stored per span (kernel session, including subagents).
@@ -47,10 +48,11 @@ var (
 
 const schemaDDL = `
 CREATE TABLE IF NOT EXISTS traces (
-	trace_id   TEXT PRIMARY KEY,
-	title      TEXT    NOT NULL DEFAULT '',
-	started_at INTEGER NOT NULL DEFAULT 0,
-	ended_at   INTEGER NOT NULL DEFAULT 0
+	trace_id          TEXT PRIMARY KEY,
+	title             TEXT    NOT NULL DEFAULT '',
+	started_at        INTEGER NOT NULL DEFAULT 0,
+	ended_at          INTEGER NOT NULL DEFAULT 0,
+	previous_trace_id TEXT    NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS spans (
 	trace_id       TEXT    NOT NULL,
@@ -151,20 +153,21 @@ func (s *Store) UpdateTraceTitle(traceID, title string) error {
 // never clobbers the original start time.
 func (s *Store) SaveTraceMeta(meta TraceMeta) error {
 	_, err := s.db.Exec(
-		`INSERT INTO traces (trace_id, title, started_at, ended_at) VALUES (?, ?, ?, ?)
+		`INSERT INTO traces (trace_id, title, started_at, ended_at, previous_trace_id) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(trace_id) DO UPDATE SET
-		   title      = excluded.title,
-		   started_at = CASE WHEN excluded.started_at > 0 THEN excluded.started_at ELSE traces.started_at END,
-		   ended_at   = CASE WHEN excluded.ended_at   > 0 THEN excluded.ended_at   ELSE traces.ended_at   END`,
-		meta.TraceID, meta.Title, meta.StartedAt, meta.EndedAt)
+		   title             = excluded.title,
+		   started_at        = CASE WHEN excluded.started_at > 0 THEN excluded.started_at ELSE traces.started_at END,
+		   ended_at          = CASE WHEN excluded.ended_at   > 0 THEN excluded.ended_at   ELSE traces.ended_at   END,
+		   previous_trace_id = CASE WHEN excluded.previous_trace_id <> '' THEN excluded.previous_trace_id ELSE traces.previous_trace_id END`,
+		meta.TraceID, meta.Title, meta.StartedAt, meta.EndedAt, meta.PreviousTraceID)
 	return err
 }
 
 // LoadTraceMeta reads trace metadata by trace ID.
 func (s *Store) LoadTraceMeta(traceID string) (TraceMeta, error) {
 	var m TraceMeta
-	row := s.db.QueryRow(`SELECT trace_id, title, started_at, ended_at FROM traces WHERE trace_id = ?`, traceID)
-	err := row.Scan(&m.TraceID, &m.Title, &m.StartedAt, &m.EndedAt)
+	row := s.db.QueryRow(`SELECT trace_id, title, started_at, ended_at, previous_trace_id FROM traces WHERE trace_id = ?`, traceID)
+	err := row.Scan(&m.TraceID, &m.Title, &m.StartedAt, &m.EndedAt, &m.PreviousTraceID)
 	if err == sql.ErrNoRows {
 		return TraceMeta{}, nil
 	}
@@ -292,8 +295,8 @@ func LoadTraceData(traceID string) (TraceData, error) {
 	}
 	var td TraceData
 
-	row := db.QueryRow(`SELECT trace_id, title, started_at, ended_at FROM traces WHERE trace_id = ?`, traceID)
-	if err := row.Scan(&td.Trace.TraceID, &td.Trace.Title, &td.Trace.StartedAt, &td.Trace.EndedAt); err != nil && err != sql.ErrNoRows {
+	row := db.QueryRow(`SELECT trace_id, title, started_at, ended_at, previous_trace_id FROM traces WHERE trace_id = ?`, traceID)
+	if err := row.Scan(&td.Trace.TraceID, &td.Trace.Title, &td.Trace.StartedAt, &td.Trace.EndedAt, &td.Trace.PreviousTraceID); err != nil && err != sql.ErrNoRows {
 		return td, err
 	}
 

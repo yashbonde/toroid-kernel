@@ -19,11 +19,15 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"charm.land/fantasy"
 	toroid "github.com/yashbonde/toroid-kernel"
+	tools "github.com/yashbonde/toroid-kernel/tools"
 )
 
 func main() {
@@ -44,6 +48,59 @@ func main() {
 	}
 	defer k.Close()
 
+	// GetUser tool: fetches a random user profile from randomuser.me
+	type GetUserArgs struct {
+		Gender   bool `json:"gender,omitempty"`
+		Name     bool `json:"name,omitempty"`
+		Location bool `json:"location,omitempty"`
+		Email    bool `json:"email,omitempty"`
+		Dob      bool `json:"dob,omitempty"`
+		Cell     bool `json:"cell,omitempty"`
+	}
+
+	k.Tools.Register(&tools.ToolDef{
+		Name:        "get_user",
+		Description: "Fetch the current user profile from randomuser.me",
+		AgentTool: fantasy.NewAgentTool(
+			"get_user",
+			"Fetch the current user profile from randomuser.me",
+			func(ctx context.Context, args GetUserArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+				var fields []string
+				if args.Gender {
+					fields = append(fields, "gender")
+				}
+				if args.Name {
+					fields = append(fields, "name")
+				}
+				if args.Location {
+					fields = append(fields, "location")
+				}
+				if args.Email {
+					fields = append(fields, "email")
+				}
+				if args.Dob {
+					fields = append(fields, "dob")
+				}
+				if args.Cell {
+					fields = append(fields, "cell")
+				}
+				url := "https://randomuser.me/api/"
+				if len(fields) > 0 {
+					url += "?inc=" + strings.Join(fields, ",")
+				}
+				resp, err := http.Get(url)
+				if err != nil {
+					return fantasy.ToolResponse{}, err
+				}
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					return fantasy.ToolResponse{}, err
+				}
+				return fantasy.ToolResponse{Type: "text", Content: string(body)}, nil
+			}),
+	})
+
 	// --- BLOCKING: Run returns the complete answer at once. ---
 	fmt.Println("== blocking (Run) ==")
 	out, usage, err := k.Run(ctx, "In one sentence, what is in this directory?")
@@ -63,7 +120,7 @@ func main() {
 		}
 		return nil
 	})
-	if err := k.Stream(ctx, "Count from 1 to 5, one number per line.", io.Discard); err != nil {
+	if err := k.Stream(ctx, "Count from 1 to 5, one number per line. Then fetch the details for the current user.", io.Discard); err != nil {
 		panic(err)
 	}
 	fmt.Println()

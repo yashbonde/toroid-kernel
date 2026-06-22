@@ -5,9 +5,25 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"charm.land/fantasy"
 )
+
+// memTodoStore is an in-memory fallback used when Save=false (no SQLite).
+var memTodos sync.Map // key: sessionID → *memTodoStore
+
+type memTodoStore struct {
+	mu     sync.Mutex
+	tasks  map[string]Task
+	order  []string
+	maxPos int
+}
+
+func getMemStore(sessionID string) *memTodoStore {
+	v, _ := memTodos.LoadOrStore(sessionID, &memTodoStore{tasks: map[string]Task{}})
+	return v.(*memTodoStore)
+}
 
 const createTodosTable = `
 CREATE TABLE IF NOT EXISTS todos (
@@ -41,13 +57,47 @@ func ensureTodosTable(db *sql.DB) error {
 
 func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 	fTool := fantasy.NewAgentTool("todo_write", desc, func(ctx context.Context, args TodoWriteArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		sessionID := a.SessionID()
+
 		if db == nil {
-			return fantasy.ToolResponse{Type: "text", Content: "todo storage unavailable"}, nil
+			// in-memory path
+			ms := getMemStore(sessionID)
+			ms.mu.Lock()
+			defer ms.mu.Unlock()
+			for _, tm := range args.Tasks {
+				if tm.ID == "" {
+					continue
+				}
+				cur, exists := ms.tasks[tm.ID]
+				if !exists {
+					ms.maxPos++
+					cur = Task{ID: tm.ID, Status: "pending"}
+					ms.order = append(ms.order, tm.ID)
+				}
+				if tm.Title != "" {
+					cur.Title = tm.Title
+				}
+				if tm.Status != "" {
+					cur.Status = tm.Status
+				}
+				if tm.Details != "" {
+					cur.Details = tm.Details
+				}
+				ms.tasks[tm.ID] = cur
+				if cur.Status == "completed" {
+					_ = a.Fire(ctx, "TaskCompleted", map[string]any{
+						"task_id": cur.ID,
+						"title":   cur.Title,
+						"status":  cur.Status,
+					})
+				}
+			}
+			return fantasy.ToolResponse{Type: "text", Content: "ok"}, nil
 		}
+
 		if err := ensureTodosTable(db); err != nil {
 			return fantasy.ToolResponse{}, fmt.Errorf("todo table: %w", err)
 		}
-		sessionID := a.SessionID()
 
 		// Load existing tasks to preserve order and merge
 		rows, err := db.QueryContext(ctx,
@@ -130,9 +180,20 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 
 func NewTodoReadTool(a Agent, db *sql.DB, desc string) *ToolDef {
 	fTool := fantasy.NewAgentTool("todo_read", desc, func(ctx context.Context, args TodoReadArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+		sessionID := a.SessionID()
+
 		if db == nil {
-			return fantasy.ToolResponse{Type: "text", Content: "[]"}, nil
+			ms := getMemStore(sessionID)
+			ms.mu.Lock()
+			defer ms.mu.Unlock()
+			tasks := make([]Task, 0, len(ms.order))
+			for _, id := range ms.order {
+				tasks = append(tasks, ms.tasks[id])
+			}
+			b, _ := json.Marshal(tasks)
+			return fantasy.ToolResponse{Type: "text", Content: string(b)}, nil
 		}
+
 		if err := ensureTodosTable(db); err != nil {
 			return fantasy.ToolResponse{}, fmt.Errorf("todo table: %w", err)
 		}

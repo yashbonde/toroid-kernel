@@ -19,6 +19,40 @@ go run ./examples/<name>
 | `running`    | Blocking run + streaming run              | `NewKernel`, `Run`, `Stream`, `On(EventToken)`, `RunningCostUSD`, `Close` |
 | `delegation` | Subagents, background agents, OTEL export | `subagent`/`subagent_async` tools, `RunSubagent`, `SpawnBackground`, `On(EventSubagentStart/TaskCompleted/MasterIdle)`, `Save`, `OTELSpans`, `ListSessions` |
 | `events`     | Lifecycle observability + notify sinks    | `On(EventPreToolUse/PostToolUse/TurnCost/Notification)`, `tools.RegisterNotifySink` |
+| `toroid-cli` | CLI runner that emits every event as NDJSON on stdout — wrap it in a subprocess from any language | `NewKernel`, `OnAll`, `Run`, JSON-encoded `Event` |
+| `toroid-repl` | Interactive, pretty-printing chat REPL — rendered Markdown answers, trimmed tool-call lines, running cost | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `Run`, `RunningCostUSD` |
+
+`toroid-cli` takes the prompt as an argument and is the recommended way to embed
+the kernel in a non-Go host:
+
+```bash
+go run ./examples/toroid-cli 'what files are in this directory?'
+# each stdout line is one JSON-encoded toroid.Event; diagnostics go to stderr
+```
+
+`toroid-repl` is the human-facing counterpart: an interactive loop that renders
+Markdown answers (headings, **bold**, `code`, fenced blocks, lists), shows tool
+calls as compact trimmed one-liners, and tracks running cost. Targeting knobs are
+environment variables; per-run toggles are flags:
+
+```bash
+export TOROID_LLM_TOKEN=your_api_key
+TOROID_MODEL=anthropic/claude-haiku-4-5 go run ./examples/toroid-repl --thinking high --save
+# in-REPL: /help /cost /model /reset /clear /exit (or Ctrl-D)
+```
+
+| Env var | Meaning | Default |
+|---------|---------|---------|
+| `TOROID_MODEL` | provider/model id | `anthropic/claude-haiku-4-5` |
+| `TOROID_LLM_TOKEN` | API key for the provider | _(required)_ |
+| `TOROID_MAX_ITER` | max tool iterations | kernel default (50) |
+| `TOROID_TRIM` | max chars per tool arg/result line | 120 |
+
+| Flag | Meaning | Default |
+|------|---------|---------|
+| `--save` | persist events/costs to the SQLite store | off |
+| `--thinking` | `none` \| `low` \| `high` | `low` |
+| `--no-colour` | disable ANSI styling | off |
 
 ## Core concepts
 
