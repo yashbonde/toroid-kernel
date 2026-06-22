@@ -399,8 +399,29 @@ func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 		k.Sessions[key] = u
 	}
 	k.runningCostUSD += u.Cost
-	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+	// u is a single step's usage here; its input-side tokens are the size of the
+	// request that step sent (the whole conversation so far), so this is a valid
+	// snapshot of context-window occupancy. See windowTokens.
+	k.currentTokens = windowTokens(u)
 	return k.runningCostUSD
+}
+
+// windowTokens estimates how full the context window is from a single request's
+// usage: the input-side tokens (fresh + cache-read + cache-write are disjoint
+// slices of the prompt) plus the tokens generated, which become part of the
+// window on the next turn. It must be fed a single step's usage, never an
+// agent's summed TotalUsage (which double-counts re-read context across steps).
+func windowTokens(u Usage) int {
+	return int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
+}
+
+// overContextThreshold reports whether context-window occupancy has reached the
+// point where we should compact. Shared by the pre-turn check and the in-loop
+// check so both use identical logic.
+func (k *Kernel) overContextThreshold() bool {
+	k.usageMu.Lock()
+	defer k.usageMu.Unlock()
+	return k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize
 }
 
 // Enqueue adds a message to the kernel's message queue. It is safe to call
@@ -518,7 +539,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	}
 
 	// Auto-compact if approaching context limit; important to do this before adding user prompt
-	if k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize {
+	if k.overContextThreshold() {
 		k.Logf("auto-compacting: currentTokens=%d threshold=%d", k.currentTokens, k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize)
 		if err := k.Compact(ctx); err != nil {
 			return err
@@ -725,6 +746,7 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	var result *fantasy.AgentResult
 	for {
 		var shouldInterrupt bool
+		var shouldCompact bool
 		var interruptedWith []string
 
 		var streamErr error
@@ -757,6 +779,14 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 						shouldInterrupt = true
 						interruptedWith = queued
 					}
+				}
+				// Also check context pressure at this boundary. A long agentic turn
+				// can balloon the window far past the limit within a single Stream
+				// call; checking only between Runs lets it overflow. We flag it and
+				// let the stream finish so all step messages are collected, then
+				// compact and restart the loop below.
+				if !shouldInterrupt && !shouldCompact && k.overContextThreshold() {
+					shouldCompact = true
 				}
 				return nil
 			},
@@ -810,6 +840,21 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 			})
 			continue
 		}
+
+		if shouldCompact {
+			// Collect this iteration's step messages into history first so the
+			// summary covers everything generated so far, then compact (which
+			// resets History to the summary) and restart the loop on the smaller
+			// window. A queue interrupt takes precedence and is handled above.
+			for _, step := range result.Steps {
+				k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
+				k.History = append(k.History, step.Messages...)
+			}
+			if err := k.Compact(ctx); err != nil {
+				return err
+			}
+			continue
+		}
 		break
 	}
 
@@ -833,7 +878,16 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	u.FromFantasyUsage(result.TotalUsage, k.Cfg.Model)
 	k.usageMu.Lock()
 	k.Sessions[k.Cfg.SessionID] = u
-	k.currentTokens = int(u.Input + u.Output + u.CacheRead + u.CacheWrite)
+	// currentTokens must track context-window occupancy, NOT the turn's cumulative
+	// billed tokens. result.TotalUsage sums every step, so in a multi-step turn it
+	// counts each step's re-read of the (cached) context over and over — wildly
+	// over-stating how full the window is. The window occupancy is the last step's
+	// request size (its input-side tokens) plus what it generated.
+	if n := len(result.Steps); n > 0 {
+		var last Usage
+		last.FromFantasyUsage(result.Steps[n-1].Usage, k.Cfg.Model)
+		k.currentTokens = windowTokens(last)
+	}
 	k.usageMu.Unlock()
 
 	if k.Cfg.ShowHistory != nil && *k.Cfg.ShowHistory {
@@ -927,6 +981,15 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	)
 	msg.Role = fantasy.MessageRoleAssistant
 	k.History = append(k.History, msg)
+
+	// Reset the occupancy gauge to reflect the new, tiny history. Without this it
+	// keeps the stale pre-compaction value, which would immediately re-trigger the
+	// in-loop threshold check (and misreport context usage until the next turn's
+	// usage lands). ~4 chars/token is a coarse estimate of the summary's size; the
+	// next stream replaces it with the real measured value.
+	k.usageMu.Lock()
+	k.currentTokens = (len(k.SystemPrompt) + len(summary)) / 4
+	k.usageMu.Unlock()
 
 	// Fire post-compact event so history can be reconstructed from events alone.
 	// It carries the before/after diff (messages and tokens collapsed).
