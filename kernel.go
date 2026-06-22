@@ -79,6 +79,7 @@ type Config struct {
 	SessionID      string           `json:"session_id,omitempty" description:"unique identifier for the session"`
 	WorkDir        string           `json:"work_dir" description:"working directory" default:"current directory"`
 	MaxIter        int              `json:"max_iter" description:"max tool-call iterations" default:"50"`
+	MaxRepeatCalls int              `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
 	Thinking       Thinking         `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer        `json:"-"`
 
@@ -265,6 +266,21 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		fantasy.WithSystemPrompt(systemPrompt),
 		fantasy.WithTools(fTools...),
 		fantasy.WithMaxRetries(5),
+	}
+
+	// Loop guards. MaxIter caps the absolute number of tool-call steps;
+	// MaxRepeatCalls catches a model spinning on the same call before it ever
+	// reaches that cap. Both are wired as fantasy stop conditions so the agent
+	// halts cleanly at a step boundary (history stays consistent).
+	var stops []fantasy.StopCondition
+	if cfg.MaxIter > 0 {
+		stops = append(stops, fantasy.StepCountIs(cfg.MaxIter))
+	}
+	if cfg.MaxRepeatCalls > 0 {
+		stops = append(stops, k.repeatCallGuard(cfg.MaxRepeatCalls))
+	}
+	if len(stops) > 0 {
+		opts = append(opts, fantasy.WithStopConditions(stops...))
 	}
 
 	// Handle thinking
@@ -580,6 +596,71 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
 	}
 
 	return k.streamCurrent(ctx, w)
+}
+
+// repeatCallGuard returns a stop condition that halts the agent when the last n
+// steps all issued the exact same tool calls (name + input) AND received the
+// exact same results.
+//
+// Keying on the result — not just the arguments — is what keeps legitimate
+// polling alive: a poll that observes changing state (a job that flips from
+// "pending" to "done", a file that grows, a queue that drains) produces a
+// different signature each step and is never tripped. Only a call that repeats
+// with identical args and identical output — i.e. making no progress — counts as
+// a stuck loop. A poll that genuinely needs to wait should yield between checks
+// (sleep/backoff) rather than spin the synchronous agent loop; this guard is the
+// backstop for the spin case.
+func (k *Kernel) repeatCallGuard(n int) fantasy.StopCondition {
+	return func(steps []fantasy.StepResult) bool {
+		if n <= 1 || len(steps) < n {
+			return false
+		}
+		var last string
+		for i := 0; i < n; i++ {
+			sig := stepCallSignature(steps[len(steps)-1-i])
+			if sig == "" {
+				return false // a step with no tool calls isn't a spin
+			}
+			if i == 0 {
+				last = sig
+			} else if sig != last {
+				return false
+			}
+		}
+		k.Logf("loop guard: stopping after %d consecutive identical tool calls with identical results", n)
+		return true
+	}
+}
+
+// stepCallSignature builds a stable signature of every tool call in a step,
+// pairing each call's (name, input) with its result so that progress-making
+// repeats produce distinct signatures. Returns "" if the step made no calls.
+func stepCallSignature(step fantasy.StepResult) string {
+	results := map[string]string{}
+	for _, msg := range step.Messages {
+		if msg.Role != fantasy.MessageRoleTool {
+			continue
+		}
+		for _, part := range msg.Content {
+			if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+				if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
+					results[tr.ToolCallID] = txt.Text
+				} else {
+					results[tr.ToolCallID] = fmt.Sprintf("%v", tr.Output)
+				}
+			}
+		}
+	}
+	var b strings.Builder
+	for _, tc := range step.Content.ToolCalls() {
+		b.WriteString(tc.ToolName)
+		b.WriteByte('\x00')
+		b.WriteString(tc.Input)
+		b.WriteByte('\x00')
+		b.WriteString(results[tc.ToolCallID])
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // streamCurrent runs the agent loop over the current in-memory history until it
