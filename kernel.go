@@ -438,19 +438,61 @@ func (k *Kernel) OnAll(fn HookFn) {
 }
 
 // Run runs the agent loop and returns the final text response.
-func (k *Kernel) Run(ctx context.Context, prompt string) (string, UsagePayload, error) {
+// RunOption configures a single Run or Stream call.
+type RunOption func(*runOptions)
+
+type runOptions struct {
+	schema            *fantasy.Schema
+	schemaName        string
+	schemaDescription string
+}
+
+// WithSchema enables structured generation for this Run/Stream call.
+// The model will produce a JSON object matching the given schema instead of
+// free text. Run returns the raw JSON; Stream writes it to the writer.
+func WithSchema(schema fantasy.Schema, name, description string) RunOption {
+	return func(o *runOptions) {
+		o.schema = &schema
+		o.schemaName = name
+		o.schemaDescription = description
+	}
+}
+
+func (k *Kernel) Run(ctx context.Context, prompt string, opts ...RunOption) (string, UsagePayload, error) {
 	var buf strings.Builder
 	var usage UsagePayload
 	k.On(EventStop, func(ctx context.Context, e Event) error {
 		usage = *e.Payload.(*UsagePayload)
 		return nil
 	})
-	err := k.Stream(ctx, prompt, &buf)
+	err := k.Stream(ctx, prompt, &buf, opts...)
 	return buf.String(), usage, err
 }
 
 // Stream runs the agent loop and streams the response to the writer.
-func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer) error {
+func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ...RunOption) error {
+	var ro runOptions
+	for _, o := range opts {
+		o(&ro)
+	}
+	if ro.schema != nil {
+		resp, err := k.LM.GenerateObject(ctx, fantasy.ObjectCall{
+			Prompt:            fantasy.Prompt{fantasy.NewUserMessage(prompt)},
+			Schema:            *ro.schema,
+			SchemaName:        ro.schemaName,
+			SchemaDescription: ro.schemaDescription,
+		})
+		if err != nil {
+			return err
+		}
+		b, err := json.Marshal(resp.Object)
+		if err != nil {
+			return err
+		}
+		_, err = w.Write(b)
+		return err
+	}
+
 	// Fire session start only once
 	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
