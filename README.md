@@ -12,6 +12,14 @@
 - Background agents — async subagents that wake an idle kernel on completion
 - Platform-agnostic, pluggable notifications
 
+## Architecture
+
+For a deep dive into how the kernel is wired — construction, the turn loop,
+tools, the single SQLite store, OTEL-native telemetry, context management,
+sub/background agents, and the roadmap — see the
+[architecture explainer](assets/ARCHITECTURE.md). It links directly to the
+relevant source files.
+
 ## Install
 
 ```bash
