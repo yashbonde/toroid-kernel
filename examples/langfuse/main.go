@@ -43,11 +43,17 @@ func main() {
 
 	ctx := context.Background()
 
+	model := "llmgateway/kimi-k2p6"
+	if m := os.Getenv("TOROID_MODEL"); m != "" {
+		model = m
+	}
+
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   "llmgateway/kimi-k2p6",
-		APIKey:  gatewayKey,
-		WorkDir: ".",
-		Save:    true, // persist the trace so we can export it to Langfuse
+		Model:                model,
+		APIKey:               gatewayKey,
+		WorkDir:              ".",
+		Save:                 true, // persist the trace so we can export it to Langfuse
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		panic(err)

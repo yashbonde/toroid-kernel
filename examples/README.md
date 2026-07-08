@@ -70,7 +70,7 @@ TOROID_MODEL=anthropic/claude-haiku-4-5 go run ./examples/toroid-repl --thinking
   kernel on completion) → inter-kernel communication (planned). All share one
   trace via `TraceID`/`ParentSpanID`.
 - **Persistence is OTEL-native.** With `Save: true`, everything lands in
-  `~/.swarmbuddy/sql.db`; `toroid.OTELSpans(traceID)` exports spec-valid
+  `~/.toroid/sql.db`; `toroid.OTELSpans(traceID)` exports spec-valid
   OpenTelemetry spans for any OTLP backend.
 
 ## Providers

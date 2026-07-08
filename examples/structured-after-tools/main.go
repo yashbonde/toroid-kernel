@@ -37,16 +37,20 @@ func main() {
 
 	apiKey := os.Getenv("LLM_GATEWAY_KEY")
 	model := "llmgateway/glm-5p2"
+	if m := os.Getenv("TOROID_MODEL"); m != "" {
+		model = m
+	}
 	if apiKey == "" {
 		fmt.Println("set LLM_GATEWAY_KEY to run this example")
 		os.Exit(1)
 	}
 
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:            model,
-		APIKey:           apiKey,
-		WorkDir:          ".",
-		TotalContextSize: 200_000, // avoid mid-run compaction
+		Model:                model,
+		APIKey:               apiKey,
+		WorkDir:              ".",
+		TotalContextSize:     200_000, // avoid mid-run compaction
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		panic(err)

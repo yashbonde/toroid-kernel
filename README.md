@@ -136,7 +136,7 @@ Each provider uses the same `toroid.Config` shape. The only required changes are
 ## Persistence & telemetry
 
 When `Save: true`, traces, spans, costs, events, and todos are written to a
-single SQLite database at `~/.swarmbuddy/sql.db`. Span IDs are time-ordered
+single SQLite database at `~/.toroid/sql.db`. Span IDs are time-ordered
 [Snowflake](https://en.wikipedia.org/wiki/Snowflake_ID) IDs and the
 trace/span/parent graph maps directly onto OpenTelemetry — `toroid.OTELSpans(traceID)`
 returns spec-valid OTEL-shaped spans you can feed to any OTLP exporter. Call
@@ -155,11 +155,23 @@ The `notify` tool fires a `Notification` event on the kernel's event bus and
 delivers a best-effort desktop notification (macOS / Linux / Windows). Register
 additional sinks (webhook, Slack, a peer kernel) with `tools.RegisterNotifySink`.
 
+## Skills
+
+When `Config.LoadSkills` is unset or `true` (the default), the kernel scans
+`~/.toroid/skills/*.md` at startup and reads only each file's frontmatter
+(`name` + `description`) into the system prompt — the full body is not loaded.
+The kernel registers a `skill` tool that takes a file path and returns that
+file's full contents; the model calls it once a listed skill looks relevant,
+or a user can just name a skill file directly in their prompt and the model
+will load it the same way. This keeps the token cost proportional to how many
+skills are actually used, not how many exist on disk. Set `LoadSkills` to
+`false` to disable scanning and skip registering the tool entirely.
+
 ## Release Notes
 
 - The module path is `github.com/yashbonde/toroid-kernel`.
 - Embedded prompts live in `prompts/` and pricing assets live in `assets/`.
-- Runtime state is stored under `~/.swarmbuddy/` (single SQLite DB at `sql.db`).
+- Runtime state is stored under `~/.toroid/` (single SQLite DB at `sql.db`).
 
 ## Status
 

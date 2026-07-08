@@ -12,7 +12,7 @@ import (
 )
 
 // Persistence is consolidated on a single embedded SQLite database
-// (~/.swarmbuddy/sql.db) holding traces, spans, costs, events, memories — and
+// (~/.toroid/sql.db) holding traces, spans, costs, events, memories — and
 // the todo table created by the tools package. The trace/span/parent IDs map
 // directly onto OpenTelemetry (see id.go / §12.2).
 
@@ -116,7 +116,7 @@ func openDefaultSQL() (*sql.DB, error) {
 	return defaultDB, nil
 }
 
-// NewStore opens (or reuses) the singleton SQLite database (~/.swarmbuddy/sql.db).
+// NewStore opens (or reuses) the singleton SQLite database (~/.toroid/sql.db).
 func NewStore() (*Store, error) {
 	db, err := openDefaultSQL()
 	if err != nil {

@@ -46,11 +46,16 @@ func main() {
 		fmt.Println("set LLM_GATEWAY_KEY or ANTHROPIC_API_KEY to run this example")
 		return
 	}
+	// Allow overriding the model via env to run the example across providers.
+	if m := os.Getenv("TOROID_MODEL"); m != "" {
+		model = m
+	}
 
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   model,
-		APIKey:  apiKey,
-		WorkDir: ".",
+		Model:                model,
+		APIKey:               apiKey,
+		WorkDir:              ".",
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		panic(err)
@@ -126,30 +131,40 @@ func main() {
 	}
 	fmt.Println()
 
-	// --- MULTIMODAL: two ways to get an image in front of the model. ---
-	// img.jpg sits next to this file; resolve an absolute path so it works
-	// regardless of the directory you run from.
-	_, thisFile, _, _ := runtime.Caller(0)
-	imgPath := filepath.Join(filepath.Dir(thisFile), "..", "img.jpg")
-
-	// (1) INLINE ATTACH: a markdown image ref in the prompt is parsed into a
-	// file part and sent with the turn — the model sees the image directly, no
-	// tool call. Text before/after the ref stays interleaved around the image.
-	fmt.Println("\n== multimodal: inline attach ==")
-	out, _, err = k.Run(ctx, fmt.Sprintf("Describe this image in one sentence: ![](%s)", imgPath))
-	if err != nil {
-		panic(err)
+	// --- MULTIMODAL: two ways to get an image in front of the model. Gated on
+	// TOROID_IMAGES so text-only models (glm/kimi) can skip; defaults on to keep
+	// the example's normal behaviour for an image-capable default model.
+	imagesOK := true
+	if v := os.Getenv("TOROID_IMAGES"); v != "" {
+		imagesOK = v == "1" || v == "true"
 	}
-	fmt.Println(out)
+	if imagesOK {
+		// img.jpg sits next to this file; resolve an absolute path so it works
+		// regardless of the directory you run from.
+		_, thisFile, _, _ := runtime.Caller(0)
+		imgPath := filepath.Join(filepath.Dir(thisFile), "..", "img.jpg")
 
-	// (2) TOOL READ: plain prose with no image ref. The model calls the read
-	// tool, which returns the image bytes as a media attachment (Piece 1).
-	fmt.Println("\n== multimodal: tool read ==")
-	out, _, err = k.Run(ctx, fmt.Sprintf("Read the image at %s and tell me in one sentence what you see.", imgPath))
-	if err != nil {
-		panic(err)
+		// (1) INLINE ATTACH: a markdown image ref in the prompt is parsed into a
+		// file part and sent with the turn — the model sees the image directly, no
+		// tool call. Text before/after the ref stays interleaved around the image.
+		fmt.Println("\n== multimodal: inline attach ==")
+		out, _, err = k.Run(ctx, fmt.Sprintf("Describe this image in one sentence: ![](%s)", imgPath))
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(out)
+
+		// (2) TOOL READ: plain prose with no image ref. The model calls the read
+		// tool, which returns the image bytes as a media attachment (Piece 1).
+		fmt.Println("\n== multimodal: tool read ==")
+		out, _, err = k.Run(ctx, fmt.Sprintf("Read the image at %s and tell me in one sentence what you see.", imgPath))
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(out)
+	} else {
+		fmt.Println("\n== multimodal: skipped (text-only model) ==")
 	}
-	fmt.Println(out)
 
 	// --- STRUCTURED GENERATION: Run with WithSchema bypasses the agent loop
 	// and calls GenerateObject directly, returning a JSON object that strictly

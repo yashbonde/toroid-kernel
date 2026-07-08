@@ -52,6 +52,7 @@ type Kernel struct {
 	currentTokens    int
 	runningCostUSD   float64
 	todoDB           *sql.DB
+	mcpClients       []io.Closer // open connections to configured MCP servers, closed in Close()
 
 	// message queue — callers enqueue messages that are injected at the next
 	// safe interruption point (OnStepFinish), causing the stream to restart
@@ -85,6 +86,16 @@ type Config struct {
 	// Tools
 	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
 	Tools                *tools.Registry `json:"tools,omitempty" description:"custom tools"`
+
+	// Skills: if unset or true, scan ~/.toroid/skills/*.md at startup for
+	// skill metadata (name + description only) and register the skill tool
+	// so the model can load a skill's full body on demand.
+	LoadSkills *bool `json:"load_skills,omitempty" description:"scan ~/.toroid/skills/ for skill metadata at startup and register the skill tool" default:"true"`
+
+	// MCP: remote Model Context Protocol servers to connect at startup. Each
+	// server's tools are discovered via tools/list and registered into the
+	// kernel's registry, name-prefixed per server to avoid collisions.
+	MCPServers []tools.MCPServerConfig `json:"mcp_servers,omitempty" description:"remote MCP servers to connect and register tools from"`
 
 	// Trace/span hierarchy
 	TraceID         string `json:"trace_id,omitempty"`          // inherited from parent; root sets TraceID = SessionID
@@ -132,6 +143,21 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		cfg.TraceID = cfg.SessionID
 	}
 
+	// Apply context-window defaults. The struct-tag `default` values are NOT
+	// auto-applied, so a caller that omits these leaves them at 0 — which makes
+	// overContextThreshold treat threshold = TotalContextSize-CompactionBufferSize
+	// = 0 and fire on the very first non-empty turn, spuriously compacting and
+	// restarting the agent loop every turn. That restart re-enters agent.Stream
+	// with an assistant-tail history and an empty prompt, which the provider
+	// rejects ("prompt can't be empty when the last message is not a user or tool
+	// message") — breaking structured-generation runs outright.
+	if cfg.TotalContextSize <= 0 {
+		cfg.TotalContextSize = 300000
+	}
+	if cfg.CompactionBufferSize <= 0 {
+		cfg.CompactionBufferSize = 30000
+	}
+
 	// Open the shared SQLite DB only when persistence is requested.
 	var todoDB *sql.DB
 	if cfg.Save {
@@ -148,16 +174,17 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		Tools:         tools.NewRegistry(),
 	}
 
+	getDescription := func(name string) string {
+		b, _ := readPrompt(name + ".tool.tmpl")
+		lines := strings.Split(string(b), "\n")
+		if len(lines) > 1 {
+			return lines[1]
+		}
+		return "Tool " + name
+	}
+
 	// register all tools
 	if cfg.IncludeComputerTools {
-		getDescription := func(name string) string {
-			b, _ := readPrompt(name + ".tool.tmpl")
-			lines := strings.Split(string(b), "\n")
-			if len(lines) > 1 {
-				return lines[1]
-			}
-			return "Tool " + name
-		}
 		k.Tools.Register(tools.NewReadTool(k, getDescription("read")))
 		k.Tools.Register(tools.NewWriteTool(k, getDescription("write")))
 		k.Tools.Register(tools.NewLsTool(k, getDescription("ls")))
@@ -180,6 +207,26 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	ApplyDefaultDataTypes(&cfg) // cfg OR default_cfg
+
+	// Skills: scan ~/.toroid/skills/ for metadata only (progressive
+	// disclosure). Full skill bodies are loaded lazily via the skill tool,
+	// either by the model recognizing a relevant skill or by the user naming
+	// one explicitly in their prompt.
+	var skills []SkillMeta
+	if cfg.LoadSkills == nil || *cfg.LoadSkills {
+		skills, _ = discoverSkills()
+		k.Tools.Register(tools.NewSkillTool(k, getDescription("skill")))
+	}
+
+	// MCP: connect each configured remote server and register its tools.
+	// Connections stay open for the kernel's lifetime and are closed in Close().
+	for _, sc := range cfg.MCPServers {
+		client, err := tools.ConnectMCPServer(ctx, k.Tools, sc)
+		if err != nil {
+			return nil, fmt.Errorf("mcp server %q: %w", sc.BaseURL, err)
+		}
+		k.mcpClients = append(k.mcpClients, client)
+	}
 
 	// Initialize the SQLite trace Store (only when save is set)
 	if cfg.Save {
@@ -214,7 +261,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	// Load system prompt
-	systemPrompt, err := buildSystemPrompt(cfg.WorkDir)
+	systemPrompt, err := buildSystemPrompt(cfg.WorkDir, skills)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +366,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	return k, nil
 }
 
-func buildSystemPrompt(workDir string) (string, error) {
+func buildSystemPrompt(workDir string, skills []SkillMeta) (string, error) {
 	raw, err := readPrompt("system.tmpl")
 	if err != nil {
 		return "", err
@@ -333,6 +380,7 @@ func buildSystemPrompt(workDir string) (string, error) {
 	err = tmpl.Execute(&buf, map[string]any{
 		"WorkDir": workDir,
 		"Date":    time.Now().Format("2006-01-02 15:04:05"),
+		"Skills":  skills,
 	})
 	return buf.String(), err
 }
@@ -416,6 +464,13 @@ func windowTokens(u Usage) int {
 func (k *Kernel) overContextThreshold() bool {
 	k.usageMu.Lock()
 	defer k.usageMu.Unlock()
+	// A non-positive context size means "unbounded" — never report over threshold.
+	// Without this guard a zero TotalContextSize makes the threshold 0 and fires on
+	// every turn (spurious compaction). NewKernel applies a default, but guard here
+	// too so the invariant holds regardless of how Cfg was constructed.
+	if k.Cfg.TotalContextSize <= 0 {
+		return false
+	}
 	return k.currentTokens > 0 && k.currentTokens >= k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize
 }
 
@@ -501,6 +556,11 @@ func (k *Kernel) Run(ctx context.Context, prompt string, opts ...RunOption) (str
 
 // Stream runs the agent loop and streams the response to the writer.
 func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ...RunOption) error {
+	// One chat = one Stream/Run: give all of this run's turns a shared gateway
+	// trace id so the upstream groups them under a single trace (preserved if the
+	// context already carries one, e.g. a subagent running inside a parent chat).
+	ctx = WithGatewayTrace(ctx)
+
 	var ro runOptions
 	for _, o := range opts {
 		o(&ro)
@@ -883,6 +943,9 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 // SQLite handle itself is process-global and is released on exit. Safe to call
 // multiple times and on a nil-store kernel.
 func (k *Kernel) Close() error {
+	for _, c := range k.mcpClients {
+		_ = c.Close()
+	}
 	if k.Store != nil {
 		return k.Store.Close()
 	}

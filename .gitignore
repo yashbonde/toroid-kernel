@@ -1,5 +1,6 @@
 .DS_Store
-.swarmbuddy_tmp/
+.toroid_tmp/
+.claude/
 bin/
 coverage.out
 dist/

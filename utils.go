@@ -27,10 +27,10 @@ var assetsFS embed.FS
 //go:embed prompts/*.tmpl prompts/*.txt
 var promptFS embed.FS
 
-// readPrompt loads a prompt file from ~/.swarmbuddy/prompts/<name> if present,
+// readPrompt loads a prompt file from ~/.toroid/prompts/<name> if present,
 // falling back to the embedded copy. This allows prompt updates without recompiling.
 func readPrompt(name string) ([]byte, error) {
-	if dir, err := swarmbuddyHome(); err == nil {
+	if dir, err := toroidHome(); err == nil {
 		if b, err := os.ReadFile(filepath.Join(dir, "prompts", name)); err == nil {
 			return b, nil
 		}
@@ -39,7 +39,7 @@ func readPrompt(name string) ([]byte, error) {
 }
 
 func readAssets(name string) ([]byte, error) {
-	if dir, err := swarmbuddyHome(); err == nil {
+	if dir, err := toroidHome(); err == nil {
 		if b, err := os.ReadFile(filepath.Join(dir, "assets", name)); err == nil {
 			return b, nil
 		}
@@ -172,22 +172,22 @@ func ApplyDefaultDataTypes(cfg any) {
 	}
 }
 
-// swarmbuddyHome returns ~/.swarmbuddy, creating it if needed.
-func swarmbuddyHome() (string, error) {
+// toroidHome returns ~/.toroid, creating it if needed.
+func toroidHome() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".swarmbuddy")
+	dir := filepath.Join(home, ".toroid")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
 	return dir, nil
 }
 
-// SqlitePath returns ~/.swarmbuddy/sql.db
+// SqlitePath returns ~/.toroid/sql.db
 func SqlitePath() (string, error) {
-	dir, err := swarmbuddyHome()
+	dir, err := toroidHome()
 	if err != nil {
 		return "", err
 	}

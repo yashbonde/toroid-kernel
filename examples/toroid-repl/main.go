@@ -147,12 +147,13 @@ func main() {
 // /reset to start a fresh session.
 func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, error) {
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:    cfg.model,
-		APIKey:   apiKey,
-		WorkDir:  cfg.workdir,
-		Thinking: cfg.thinking,
-		MaxIter:  cfg.maxIter,
-		Save:     cfg.save,
+		Model:                cfg.model,
+		APIKey:               apiKey,
+		WorkDir:              cfg.workdir,
+		Thinking:             cfg.thinking,
+		MaxIter:              cfg.maxIter,
+		Save:                 cfg.save,
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		return nil, err

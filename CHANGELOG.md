@@ -3,6 +3,36 @@
 All notable changes to toroid-kernel are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## v0.4.0
+
+Adds two extensibility primitives: on-demand Skills and an MCP client, plus a
+runtime-state rename.
+
+### Added
+
+- **Skills.** When `Config.LoadSkills` is unset or `true` (default), the kernel
+  scans `~/.toroid/skills/*.md` at startup and loads only each file's
+  frontmatter (`name` + `description`) into the system prompt. A new `skill`
+  tool loads a skill's full body on demand — by the model recognizing a
+  relevant skill, or a user naming one directly — so token cost scales with
+  skills actually used, not skills that exist on disk.
+- **MCP client.** `Config.MCPServers []tools.MCPServerConfig` connects to
+  remote Model Context Protocol servers (streamable HTTP) at kernel startup,
+  built on `github.com/mark3labs/mcp-go`. Each server's tools are discovered
+  via `tools/list` and registered into the kernel's tool registry, prefixed
+  `<server>__<tool>` to avoid collisions across servers. Connections are
+  closed in `Kernel.Close()`.
+- `assets/benchmark.md` — benchmark selection (Terminal-Bench, Tau-bench,
+  Harness-Bench methodology) and a feature-by-feature comparison against
+  Claude Code, the Claude Agent SDK, OpenAI Codex CLI, and pi.dev.
+
+### Changed
+
+- **Runtime state moved from `~/.swarmbuddy` to `~/.toroid`.** Affects the
+  SQLite store path, the prompt/asset override directories, and the new
+  skills directory. This is a breaking change for anyone relying on the old
+  path — no migration is performed automatically.
+
 ## v0.3.3
 
 This release consolidates three independent lines of work — a compaction

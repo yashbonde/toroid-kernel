@@ -68,10 +68,11 @@ func main() {
 
 	ctx := context.Background()
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:    *model,
-		APIKey:   apiKey,
-		WorkDir:  *workdir,
-		Thinking: toroid.Thinking(*thinking),
+		Model:                *model,
+		APIKey:               apiKey,
+		WorkDir:              *workdir,
+		Thinking:             toroid.Thinking(*thinking),
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "kernel init:", err)

@@ -25,10 +25,20 @@ import (
 )
 
 func main() {
-	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	// Prefer llmgateway when configured, fall back to Anthropic.
+	apiKey := os.Getenv("LLM_GATEWAY_KEY")
+	model := "llmgateway/claude-haiku-4-5"
 	if apiKey == "" {
-		fmt.Println("set ANTHROPIC_API_KEY to run this example")
+		apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		model = "anthropic/claude-haiku-4-5"
+	}
+	if apiKey == "" {
+		fmt.Println("set LLM_GATEWAY_KEY or ANTHROPIC_API_KEY to run this example")
 		return
+	}
+	// Allow overriding the model via env to run the example across providers.
+	if m := os.Getenv("TOROID_MODEL"); m != "" {
+		model = m
 	}
 	ctx := context.Background()
 
@@ -40,9 +50,10 @@ func main() {
 	})
 
 	k, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   "anthropic/claude-haiku-4-5",
-		APIKey:  apiKey,
-		WorkDir: ".",
+		Model:                model,
+		APIKey:               apiKey,
+		WorkDir:              ".",
+		IncludeComputerTools: true,
 	})
 	if err != nil {
 		panic(err)
