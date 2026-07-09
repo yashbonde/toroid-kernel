@@ -21,6 +21,7 @@ go run ./examples/<name>
 | `events`     | Lifecycle observability + notify sinks    | `On(EventPreToolUse/PostToolUse/TurnCost/Notification)`, `tools.RegisterNotifySink` |
 | `toroid-cli` | CLI runner that emits every event as NDJSON on stdout — wrap it in a subprocess from any language | `NewKernel`, `OnAll`, `Run`, JSON-encoded `Event` |
 | `toroid-repl` | Interactive, pretty-printing chat REPL — rendered Markdown answers, trimmed tool-call lines, running cost | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `Run`, `RunningCostUSD` |
+| `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
 
 `toroid-cli` takes the prompt as an argument and is the recommended way to embed
 the kernel in a non-Go host:

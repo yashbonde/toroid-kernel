@@ -17,6 +17,8 @@
 //	-workdir  working directory    (default current directory)
 //	-thinking thinking budget      none | low | high   (default none)
 //	-tokens   include per-token Token/Reasoning deltas  (default false)
+//	-plain    print only the final assistant response as plain text,
+//	          not the NDJSON event stream                (default false)
 //
 // Example (Python):
 //
@@ -47,6 +49,7 @@ func main() {
 	workdir := flag.String("workdir", ".", "working directory")
 	thinking := flag.String("thinking", "none", "thinking budget: none | low | high")
 	tokens := flag.Bool("tokens", false, "include per-step Reasoning deltas in the stream")
+	plain := flag.Bool("plain", false, "print only the final assistant response as plain text, not the NDJSON event stream")
 	flag.Parse()
 
 	prompt := strings.TrimSpace(strings.Join(flag.Args(), " "))
@@ -79,6 +82,19 @@ func main() {
 		os.Exit(1)
 	}
 	defer k.Close()
+
+	if *plain {
+		// -plain: skip the event stream entirely and print just the final
+		// answer. This is the same text the AssistantTurn event carries —
+		// Run already returns it directly, so there's nothing to subscribe to.
+		out, _, err := k.Run(ctx, prompt)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "run:", err)
+			os.Exit(1)
+		}
+		fmt.Println(out)
+		return
+	}
 
 	// stdout is a single shared stream; events can fire from subagent goroutines,
 	// so serialize writes to keep each JSON object on its own intact line.

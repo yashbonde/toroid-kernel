@@ -5,8 +5,8 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ## v0.4.0
 
-Adds two extensibility primitives: on-demand Skills and an MCP client, plus a
-runtime-state rename.
+Adds two extensibility primitives — on-demand Skills and an MCP client — plus
+a runtime-state rename, REPL UX improvements, and a more robust pricing lookup.
 
 ### Added
 
@@ -17,14 +17,40 @@ runtime-state rename.
   relevant skill, or a user naming one directly — so token cost scales with
   skills actually used, not skills that exist on disk.
 - **MCP client.** `Config.MCPServers []tools.MCPServerConfig` connects to
-  remote Model Context Protocol servers (streamable HTTP) at kernel startup,
-  built on `github.com/mark3labs/mcp-go`. Each server's tools are discovered
-  via `tools/list` and registered into the kernel's tool registry, prefixed
+  remote Model Context Protocol servers at kernel startup, built on
+  `github.com/mark3labs/mcp-go`. Each server's tools are discovered via
+  `tools/list` and registered into the kernel's tool registry, prefixed
   `<server>__<tool>` to avoid collisions across servers. Connections are
-  closed in `Kernel.Close()`.
+  closed in `Kernel.Close()`. Transport tries streamable HTTP first, then
+  falls back to legacy SSE if the server rejects the initialize request with
+  a 4xx. `MCPServerConfig.Headers` lets callers attach auth headers (e.g. an
+  OAuth bearer token) to every request.
+- **`toroid-cli -plain` flag.** Prints only the final assistant response as
+  plain text instead of the NDJSON event stream — useful when the CLI is
+  embedded as a subprocess that just needs the answer text.
+- **`examples/usage-with-mcp`** — end-to-end example connecting the kernel to
+  Slack's hosted MCP server, showing `Config.MCPServers` + `MCPServerConfig`
+  with OAuth bearer-token headers.
+- **REPL ESC-to-cancel.** The terminal is put in cbreak mode during a turn so
+  a single ESC press cancels the running request via `context.Cancel`. Falls
+  back gracefully on platforms without termios support.
+- **REPL reasoning rendering.** Thinking/reasoning output is now shown inside
+  dimmed separator lines with proper newline handling, so tool calls and
+  results don't bleed into reasoning text.
+- **REPL turn footer.** Shows output-token throughput (`N tok/s`) alongside
+  running cost. When the model isn't in `pricing.json` (e.g. gateway-routed),
+  the footer reads "pricing unavailable" instead of a misleading `$0.000000`.
+- **REPL workdir display.** The workdir is now resolved to an absolute path
+  and displayed relative to `$HOME` (e.g. `~/projects/foo`) in the banner and
+  `/model` command.
 - `assets/benchmark.md` — benchmark selection (Terminal-Bench, Tau-bench,
   Harness-Bench methodology) and a feature-by-feature comparison against
-  Claude Code, the Claude Agent SDK, OpenAI Codex CLI, and pi.dev.
+  Claude Code, the Claude Agent SDK, OpenAI Codex CLI, and pi.dev. Updated
+  to reflect that toroid now has partial MCP and Skills support, with revised
+  radar chart and gap analysis.
+- `assets/standard_pricing.md` — notes on gateway vs local pricing estimation
+  (LiteLLM `x-litellm-response-cost` header behaviour for streaming vs
+  non-streaming calls).
 
 ### Changed
 
@@ -32,6 +58,20 @@ runtime-state rename.
   SQLite store path, the prompt/asset override directories, and the new
   skills directory. This is a breaking change for anyone relying on the old
   path — no migration is performed automatically.
+- **Pricing lookup rewrite (`pricing.go`).** `GetModelPricing` now strips
+  `llmgateway/` prefixes, expands version-dot normalization (covers more
+  version patterns like `-4-8` → `-4.8`, `-5-5` → `-5.5`), and tries each
+  name variant against bare keys plus `anthropic/`, `openai/`, and `google/`
+  provider prefixes before falling back to the fuzzy prefix match. This
+  resolves pricing for gateway-routed models that were previously missed.
+- **REPL Markdown rendering.** Inline code now uses blue foreground instead
+  of a background colour; fenced code blocks drop the `│` gutter prefix;
+  strikethrough (`~~text~~`) is now rendered with ANSI SGR 9.
+
+### Housekeeping
+
+- `.gitignore` now covers Windows example binaries, the `usage-with-mcp`
+  binary, and `*.err` scratch files.
 
 ## v0.3.3
 

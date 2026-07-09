@@ -9,6 +9,18 @@ import (
 	"charm.land/fantasy"
 )
 
+// versionDotReplacer normalizes dash-separated version suffixes in model IDs
+// to the dotted form used in pricing.json (e.g. "claude-sonnet-4-6" ->
+// "claude-sonnet-4.6"). It is intentionally conservative — only literal
+// single-digit/single-digit pairs that actually appear in the table are
+// rewritten, so param-size suffixes like "gemma-4-26b" are left untouched.
+var versionDotReplacer = strings.NewReplacer(
+	"-4-8", "-4.8", "-4-7", "-4.7", "-4-6", "-4.6", "-4-5", "-4.5", "-4-1", "-4.1",
+	"-3-5", "-3.5", "-3-1", "-3.1",
+	"-2-5", "-2.5", "-2-0", "-2.0",
+	"-5-5", "-5.5", "-5-4", "-5.4", "-5-3", "-5.3", "-5-2", "-5.2", "-5-1", "-5.1",
+)
+
 // ModelPricing defines the cost per token for an LLM.
 type ModelPricing struct {
 	Prompt     float64 `json:"Prompt"`
@@ -43,22 +55,45 @@ func GetModelPricing(modelID string) (ModelPricing, error) {
 		log.Fatal("Failed to unmarshal pricing.json: ", err)
 	}
 
-	// Model pricing lookup
+	// Model pricing lookup.
 	id := strings.ToLower(modelID)
-	if strings.HasPrefix(id, "models/") {
-		id = id[7:]
+	id = strings.TrimPrefix(id, "models/")
+	// "llmgateway/" is a virtual OpenAI-compatible provider that fronts real
+	// models behind a single endpoint; strip it so the underlying model name
+	// resolves to its real pricing entry (e.g. llmgateway/claude-sonnet-4-6 ->
+	// anthropic/claude-sonnet-4.6).
+	id = strings.TrimPrefix(id, "llmgateway/")
+
+	// Normalize version suffixes: try the raw id and a dot-substituted variant
+	// (e.g. haiku-4-5 -> haiku-4.5).
+	dotted := versionDotReplacer.Replace(id)
+	nameVariants := []string{id}
+	if dotted != id {
+		nameVariants = append(nameVariants, dotted)
 	}
-	// Normalize: try both the raw id and a dot-substituted variant (e.g. haiku-4-5 -> haiku-4.5)
-	candidates := []string{id, strings.NewReplacer("-4-5", "-4.5", "-3-5", "-3.5", "-2-0", "-2.0").Replace(id)}
-	for _, candidate := range candidates {
-		if pricing, ok := p.table[candidate]; ok {
-			return pricing, nil // Direct match
-		}
-		if !strings.Contains(candidate, "/") {
-			if pricing, ok := p.table["google/"+candidate]; ok {
-				return pricing, nil // Match with google/ prefix
+
+	// Try each name variant against the bare key and each known provider prefix.
+	// This lets a gateway-routed bare name (e.g. "claude-sonnet-4.6") match its
+	// "anthropic/claude-sonnet-4.6" entry, and a bare Google model match
+	// "google/...". Exact matches across all variants are preferred over the
+	// fuzzy fallback below.
+	providerPrefixes := []string{"", "anthropic/", "openai/", "google/"}
+	for _, name := range nameVariants {
+		hasProvider := strings.Contains(name, "/")
+		for _, pfx := range providerPrefixes {
+			if hasProvider && pfx != "" {
+				continue // don't double-prefix "anthropic/anthropic/..."
+			}
+			if pricing, ok := p.table[pfx+name]; ok {
+				return pricing, nil
 			}
 		}
+	}
+
+	// Last-resort fuzzy prefix match: a minor revision absent from the table
+	// falls back to its base model (e.g. "claude-opus-4.8.1" -> "claude-opus-4.8").
+	// Kept for backwards compatibility.
+	for _, candidate := range nameVariants {
 		for k, pricing := range p.table {
 			if strings.HasPrefix(candidate, k) || strings.HasPrefix(k, candidate) {
 				return pricing, nil

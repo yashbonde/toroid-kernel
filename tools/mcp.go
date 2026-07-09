@@ -3,11 +3,13 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
 	"charm.land/fantasy"
 	mcpclient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -18,24 +20,43 @@ type MCPServerConfig struct {
 	// from different servers can't collide. Defaults to the server's own
 	// name (from its initialize response) if left empty.
 	Name string
-	// BaseURL is the server's streamable-HTTP endpoint, e.g. "http://localhost:7842/mcp".
+	// BaseURL is the server's MCP endpoint, e.g. "http://localhost:7842/mcp".
 	BaseURL string
+	// Headers are sent on every request to BaseURL — e.g. an OAuth bearer
+	// token for servers that require authentication ("Authorization": "Bearer <token>").
+	Headers map[string]string
 }
 
-// ConnectMCPServer connects to a streamable-HTTP MCP server, lists its tools,
-// and registers each one into reg as a ToolDef that proxies calls back to the
-// server over the same connection. The returned client stays open for the
-// life of the kernel — callers are responsible for closing it (the kernel
-// does this in Close).
+// ConnectMCPServer connects to an MCP server, lists its tools, and registers
+// each one into reg as a ToolDef that proxies calls back to the server over
+// the same connection. It first tries streamable HTTP, then falls back to
+// legacy SSE if the server rejects the initialize request with a 4xx.
+// The returned client stays open for the life of the kernel — callers are
+// responsible for closing it (the kernel does this in Close).
 func ConnectMCPServer(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
-	c, err := mcpclient.NewStreamableHttpClient(cfg.BaseURL)
+	c, err := connectStreamableHTTP(ctx, reg, cfg)
+	if err == nil {
+		return c, nil
+	}
+	if errors.Is(err, transport.ErrLegacySSEServer) {
+		return connectSSE(ctx, reg, cfg)
+	}
+	return nil, err
+}
+
+func connectStreamableHTTP(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
+	var opts []transport.StreamableHTTPCOption
+	if len(cfg.Headers) > 0 {
+		opts = append(opts, transport.WithHTTPHeaders(cfg.Headers))
+	}
+	c, err := mcpclient.NewStreamableHttpClient(cfg.BaseURL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("mcp %s: %w", cfg.BaseURL, err)
 	}
 	if err := c.Start(ctx); err != nil {
+		c.Close()
 		return nil, fmt.Errorf("mcp %s: start: %w", cfg.BaseURL, err)
 	}
-
 	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
 		Params: mcp.InitializeParams{
 			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
@@ -46,7 +67,42 @@ func ConnectMCPServer(ctx context.Context, reg *Registry, cfg MCPServerConfig) (
 		c.Close()
 		return nil, fmt.Errorf("mcp %s: initialize: %w", cfg.BaseURL, err)
 	}
+	return finishConnection(ctx, reg, cfg, c, initRes)
+}
 
+func connectSSE(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
+	var opts []transport.ClientOption
+	if len(cfg.Headers) > 0 {
+		opts = append(opts, transport.WithHeaders(cfg.Headers))
+	}
+	c, err := mcpclient.NewSSEMCPClient(cfg.BaseURL, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("mcp %s (sse): %w", cfg.BaseURL, err)
+	}
+	if err := c.Start(ctx); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("mcp %s (sse): start: %w", cfg.BaseURL, err)
+	}
+	initRes, err := c.Initialize(ctx, mcp.InitializeRequest{
+		Params: mcp.InitializeParams{
+			ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+			ClientInfo:      mcp.Implementation{Name: "toroid-kernel", Version: "0.1.0"},
+		},
+	})
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("mcp %s (sse): initialize: %w", cfg.BaseURL, err)
+	}
+	return finishConnection(ctx, reg, cfg, c, initRes)
+}
+
+func finishConnection(
+	ctx context.Context,
+	reg *Registry,
+	cfg MCPServerConfig,
+	c *mcpclient.Client,
+	initRes *mcp.InitializeResult,
+) (*mcpclient.Client, error) {
 	name := cfg.Name
 	if name == "" && initRes != nil {
 		name = initRes.ServerInfo.Name

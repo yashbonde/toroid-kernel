@@ -19,6 +19,7 @@ var (
 	aDim       = "\x1b[2m"
 	aItalic    = "\x1b[3m"
 	aUnderline = "\x1b[4m"
+	aStrikethrough = "\x1b[9m"
 
 	aRed     = "\x1b[31m"
 	aGreen   = "\x1b[32m"
@@ -28,22 +29,21 @@ var (
 	aCyan    = "\x1b[36m"
 	aGray    = "\x1b[90m"
 
-	// Inline code: a subtle background so it stands out without shouting.
-	aCodeBG  = "\x1b[48;5;236m\x1b[38;5;215m"
 	aHeading = aBold + aCyan
 )
 
 // disableColor blanks every styling code so all rendering becomes plain text.
 func disableColor() {
-	aReset, aBold, aDim, aItalic, aUnderline = "", "", "", "", ""
+	aReset, aBold, aDim, aItalic, aUnderline, aStrikethrough = "", "", "", "", "", ""
 	aRed, aGreen, aYellow, aBlue, aMagenta, aCyan, aGray = "", "", "", "", "", "", ""
-	aCodeBG, aHeading = "", ""
+	aHeading = ""
 }
 
 var (
 	reInlineCode = regexp.MustCompile("`([^`]+)`")
 	reBoldStar   = regexp.MustCompile(`\*\*([^*]+)\*\*`)
 	reBoldUnder  = regexp.MustCompile(`__([^_]+)__`)
+	reStrike     = regexp.MustCompile(`~~([^~]+)~~`)
 	reItalicStar = regexp.MustCompile(`\*([^*]+)\*`)
 	reLink       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	reBullet     = regexp.MustCompile(`^(\s*)[-*+]\s+(.*)$`)
@@ -83,7 +83,7 @@ func renderMarkdown(src string, width int) string {
 			continue
 		}
 		if inCode {
-			out.WriteString(aGray + "│ " + aReset + aYellow + line + aReset + "\n")
+			out.WriteString(aYellow + line + aReset + "\n")
 			continue
 		}
 
@@ -142,11 +142,12 @@ func inline(s string) string {
 	var codes []string
 	s = reInlineCode.ReplaceAllStringFunc(s, func(m string) string {
 		body := strings.Trim(m, "`")
-		codes = append(codes, aCodeBG+" "+body+" "+aReset)
+		codes = append(codes, aBlue+" "+body+" "+aReset)
 		return fmt.Sprintf("\x00%d\x00", len(codes)-1)
 	})
 
 	s = reLink.ReplaceAllString(s, aUnderline+aBlue+"$1"+aReset+aGray+" ($2)"+aReset)
+	s = reStrike.ReplaceAllString(s, aStrikethrough+"$1"+aReset)
 	s = reBoldStar.ReplaceAllString(s, aBold+"$1"+aReset)
 	s = reBoldUnder.ReplaceAllString(s, aBold+"$1"+aReset)
 	s = reItalicStar.ReplaceAllString(s, aItalic+"$1"+aReset)

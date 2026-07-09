@@ -27,23 +27,32 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tsize "github.com/kopoli/go-terminal-size"
 	toroid "github.com/yashbonde/toroid-kernel"
 )
 
+var (
+	reasoningActive       bool
+	reasoningNeedsNewline bool
+)
+
 type config struct {
-	model    string
-	workdir  string
-	thinking toroid.Thinking
-	maxIter  int
-	save     bool
-	trim     int
+	model     string
+	workdir   string
+	thinking  toroid.Thinking
+	maxIter   int
+	save      bool
+	trim      int
+	pricingOK bool // whether cfg.model resolves to a pricing.json entry
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
@@ -59,9 +68,18 @@ func loadConfig() (config, string) {
 		disableColor()
 	}
 
+	wd, err := os.Getwd()
+	if err != nil {
+		wd = "."
+	}
+	absWd, err := filepath.Abs(wd)
+	if err != nil {
+		absWd = wd
+	}
+
 	c := config{
 		model:    envOr("TOROID_MODEL", "anthropic/claude-haiku-4-5"),
-		workdir:  ".",
+		workdir:  absWd,
 		thinking: toroid.Thinking(*thinking),
 		save:     *save,
 		trim:     120,
@@ -76,6 +94,11 @@ func loadConfig() (config, string) {
 			c.trim = n
 		}
 	}
+	// Probe pricing availability once so the turn footer and /cost can report
+	// "pricing unavailable" instead of a misleading $0.000000 for models the
+	// bundled pricing.json doesn't know (e.g. gateway-routed models).
+	_, perr := toroid.GetModelPricing(c.model)
+	c.pricingOK = perr == nil
 	return c, os.Getenv("TOROID_LLM_TOKEN")
 }
 
@@ -162,6 +185,10 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 	// Tool call begins: compact one-liner, args trimmed to the configured width.
 	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
+			if reasoningActive && reasoningNeedsNewline {
+				fmt.Println()
+				reasoningNeedsNewline = false
+			}
 			fmt.Printf("  %s⚙ %s%s%s %s\n", aBlue, aBold, p.Name, aReset, dimArgs(p.Args, cfg.trim))
 		}
 		return nil
@@ -169,20 +196,32 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 	// Tool call result: a short preview, or the error in red.
 	k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			fmt.Printf("  %s└→%s %s\n", aGray, aReset, trimOneLine(p.Result, cfg.trim))
+			if reasoningActive && reasoningNeedsNewline {
+				fmt.Println()
+				reasoningNeedsNewline = false
+			}
+			fmt.Printf("  %s→ %s%s\n", aDim, trimOneLine(p.Result, cfg.trim), aReset)
 		}
 		return nil
 	})
 	k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			fmt.Printf("  %s└→ error: %s%s\n", aRed, trimOneLine(p.Error, cfg.trim), aReset)
+			if reasoningActive && reasoningNeedsNewline {
+				fmt.Println()
+				reasoningNeedsNewline = false
+			}
+			fmt.Printf("  %s→ error: %s%s\n", aRed, trimOneLine(p.Error, cfg.trim), aReset)
 		}
 		return nil
 	})
-	// Reasoning/thinking, when enabled, shown dimmed inline.
 	k.On(toroid.EventReasoning, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ReasoningPayload); ok {
+			if !reasoningActive {
+				reasoningActive = true
+				fmt.Println(aGray + strings.Repeat("—", termWidth()) + aReset)
+			}
 			fmt.Print(aGray + aItalic + p.Text + aReset)
+			reasoningNeedsNewline = !strings.HasSuffix(p.Text, "\n")
 		}
 		return nil
 	})
@@ -192,15 +231,62 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 // ask drives one turn: run the prompt (blocking), then render the Markdown answer
 // and the running cost. Tool activity streams live via the hooks above.
 func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
-	out, _, err := k.Run(ctx, prompt)
+	width := termWidth()
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	// Put terminal in cbreak mode so ESC is readable immediately.
+	fd := int(os.Stdin.Fd())
+	oldState, err := enableCBreak(fd)
+	if err == nil {
+		done := make(chan struct{})
+		go watchEsc(ctx, fd, cancel, done)
+		// cancel() must happen, and watchEsc must have observed it and
+		// stopped touching fd, before we hand stdin back to the REPL's
+		// line-buffered scanner — otherwise both read the same fd at once.
+		defer func() {
+			cancel()
+			<-done
+			restoreCBreak(fd, oldState)
+		}()
+	} else {
+		defer cancel()
+	}
+
+	start := time.Now()
+	out, usage, err := k.Run(ctx, prompt)
+	elapsed := time.Since(start)
+	if reasoningActive {
+		if reasoningNeedsNewline {
+			fmt.Println()
+		}
+		fmt.Println(aGray + strings.Repeat("—", width) + aReset)
+		reasoningActive = false
+		reasoningNeedsNewline = false
+	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		fmt.Fprintf(os.Stderr, "%srun error: %v%s\n", aRed, err, aReset)
 		return
 	}
-	width := termWidth()
 	fmt.Printf("\n%s%s ◂%s\n", aMagenta+aBold, shortModel(cfg.model), aReset)
 	fmt.Print(renderMarkdown(out, width))
-	fmt.Printf("%s  cost so far: $%.6f%s\n", aGray, k.RunningCostUSD(), aReset)
+
+	// Turn footer: running cost (or a clear "pricing unavailable" when the model
+	// isn't in pricing.json, so we never show a misleading $0.000000) plus output
+	// throughput. EventStop's UsagePayload carries the session's per-turn usage,
+	// keyed by session ID.
+	if cfg.pricingOK {
+		fmt.Printf("%s  cost so far: $%.6f%s", aGray, k.RunningCostUSD(), aReset)
+	} else {
+		fmt.Printf("%s  cost so far: pricing unavailable for %s%s", aGray, cfg.model, aReset)
+	}
+	if outTokens := usage.Tokens[k.SessionID()].Output; outTokens > 0 && elapsed.Seconds() > 0 {
+		fmt.Printf("%s  ·  %d out tok in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
+	}
+	fmt.Println()
 }
 
 // dimArgs renders tool args as compact dim text, trimmed. Tool args are JSON;
@@ -219,10 +305,14 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 	case "/clear":
 		fmt.Print("\x1b[2J\x1b[H")
 	case "/cost":
-		fmt.Printf("%scost so far: $%.6f%s\n", aYellow, k.RunningCostUSD(), aReset)
+		if cfg.pricingOK {
+			fmt.Printf("%scost so far: $%.6f%s\n", aYellow, k.RunningCostUSD(), aReset)
+		} else {
+			fmt.Printf("%scost so far: pricing unavailable for %s%s\n", aYellow, cfg.model, aReset)
+		}
 	case "/model":
 		fmt.Printf("%smodel: %s | workdir: %s | thinking: %s%s\n",
-			aYellow, cfg.model, cfg.workdir, cfg.thinking, aReset)
+			aYellow, cfg.model, displayWorkdir(cfg.workdir), cfg.thinking, aReset)
 	case "/help", "/?":
 		printHelp()
 	default:
@@ -234,7 +324,7 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 func banner(cfg config) {
 	fmt.Printf("%s┌─────────────────────────────────────────────%s\n", aCyan, aReset)
 	fmt.Printf("%s│ toroid-repl%s  %s%s%s\n", aCyan+aBold, aReset, aGray, shortModel(cfg.model), aReset)
-	fmt.Printf("%s│%s thinking=%s save=%v workdir=%s\n", aCyan, aReset, cfg.thinking, cfg.save, cfg.workdir)
+	fmt.Printf("%s│%s thinking=%s save=%v workdir=%s\n", aCyan, aReset, cfg.thinking, cfg.save, displayWorkdir(cfg.workdir))
 	fmt.Printf("%s└ %stype a message, or /help · /exit%s\n", aCyan, aGray, aReset)
 }
 
@@ -250,6 +340,18 @@ func printHelp() {
 config via env:   TOROID_MODEL, TOROID_LLM_TOKEN, TOROID_MAX_ITER, TOROID_TRIM
 config via flags: --save, --thinking (none|low|high), --no-colour
 ` + aReset)
+}
+
+// displayWorkdir returns a path relative to the home directory when possible.
+func displayWorkdir(wd string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return wd
+	}
+	if strings.HasPrefix(wd, home) {
+		return "~" + strings.TrimPrefix(wd, home)
+	}
+	return wd
 }
 
 // shortModel drops the provider prefix for a tidier label.
