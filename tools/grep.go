@@ -26,7 +26,7 @@ func NewGrepTool(a Agent, desc string) *ToolDef {
 			return fantasy.ToolResponse{Type: "text", Content: "No matches found."}, nil
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: string(out)}, nil
+		return fantasy.ToolResponse{Type: "text", Content: TruncateToolOutput(string(out))}, nil
 	})
 
 	return &ToolDef{

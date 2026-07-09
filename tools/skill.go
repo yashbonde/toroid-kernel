@@ -34,7 +34,7 @@ func NewSkillTool(a Agent, desc string) *ToolDef {
 		if err != nil {
 			return fantasy.NewTextErrorResponse(fmt.Sprintf("Error: %v", err)), nil
 		}
-		return fantasy.NewTextResponse(string(b)), nil
+		return fantasy.NewTextResponse(TruncateToolOutput(string(b))), nil
 	})
 
 	return &ToolDef{

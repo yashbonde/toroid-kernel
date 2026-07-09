@@ -201,5 +201,5 @@ func mcpResultToResponse(res *mcp.CallToolResult) fantasy.ToolResponse {
 			sb.WriteString(tc.Text)
 		}
 	}
-	return fantasy.ToolResponse{Type: "text", Content: sb.String(), IsError: res.IsError}
+	return fantasy.ToolResponse{Type: "text", Content: TruncateToolOutput(sb.String()), IsError: res.IsError}
 }

@@ -40,8 +40,8 @@ func NewLsTool(a Agent, desc string) *ToolDef {
 		}
 		sort.Strings(names)
 
-		content := fmt.Sprintf("<path>%s</path>\n<entries>\n%s\n</entries>",
-			path, strings.Join(names, "\n"))
+		content := TruncateToolOutput(fmt.Sprintf("<path>%s</path>\n<entries>\n%s\n</entries>",
+			path, strings.Join(names, "\n")))
 		return fantasy.ToolResponse{Type: "text", Content: content}, nil
 	})
 

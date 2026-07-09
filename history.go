@@ -10,7 +10,9 @@ import (
 // Only events after the last compaction are replayed, so the returned history is exactly what
 // the kernel would have in memory for a resumed session.
 //
-// systemPrompt is prepended as a system message when non-empty.
+// systemPrompt is prepended as a system message when non-empty. Prefer leaving
+// it empty: the live kernel injects system via Fantasy WithSystemPrompt so
+// History should not also carry a system message (double bill + cache bust).
 // If spanID is non-empty only events from that span are used; otherwise events from all spans
 // under the trace are combined in span order (useful for subagent traces).
 // workDir resolves any relative image refs in stored prompts (persisted refs are

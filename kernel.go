@@ -17,6 +17,7 @@ import (
 	"github.com/yashbonde/toroid-kernel/tools"
 
 	"charm.land/fantasy"
+	"charm.land/fantasy/providers/anthropic"
 	"charm.land/fantasy/providers/google"
 )
 
@@ -38,6 +39,7 @@ type Kernel struct {
 	Cfg              Config
 	Provider         fantasy.Provider
 	LM               fantasy.LanguageModel
+	SmallerLM        fantasy.LanguageModel // optional; used for compact + subagents when set
 	Hooks            *HookRegistry
 	Tools            *tools.Registry
 	Store            *Store
@@ -73,15 +75,23 @@ type Kernel struct {
 
 // Config holds all options for creating a Kernel.
 type Config struct {
-	Provider       fantasy.Provider `json:"provider,omitempty" description:"llm provider"`
-	Model          string           `json:"model" description:"llm model name" default:"anthropic/claude-haiku-4-5"`
-	APIKey         string           `json:"api_key,omitempty" description:"API key for the provider"`
-	SessionID      string           `json:"session_id,omitempty" description:"unique identifier for the session"`
-	WorkDir        string           `json:"work_dir" description:"working directory" default:"current directory"`
-	MaxIter        int              `json:"max_iter" description:"max tool-call iterations" default:"50"`
-	MaxRepeatCalls int              `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
-	Thinking       Thinking         `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
-	ThinkingWriter io.Writer        `json:"-"`
+	Provider fantasy.Provider `json:"provider,omitempty" description:"llm provider"`
+	// Model is the primary agent model (provider/model form).
+	Model string `json:"model" description:"primary llm model name" default:"anthropic/claude-haiku-4-5"`
+	// SmallerModel is an optional cheaper model for cost-sensitive work:
+	// conversation compaction and subagents (sync + async). Empty means those
+	// paths use Model. Prefer the same provider (or llmgateway) as Model so the
+	// single APIKey authenticates both.
+	SmallerModel   string    `json:"smaller_model,omitempty" description:"cheaper model for compaction and subagents; empty = use Model"`
+	APIKey         string    `json:"api_key,omitempty" description:"API key for the provider"`
+	SessionID      string    `json:"session_id,omitempty" description:"unique identifier for the session"`
+	WorkDir        string    `json:"work_dir" description:"working directory" default:"current directory"`
+	// MaxIter caps tool-call steps per turn. Kept intentionally modest so a
+	// thrashing model cannot burn dozens of full-context steps by default.
+	MaxIter        int       `json:"max_iter" description:"max tool-call iterations" default:"25"`
+	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
+	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
+	ThinkingWriter io.Writer `json:"-"`
 
 	// Tools
 	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
@@ -108,10 +118,18 @@ type Config struct {
 	// Session management
 	Resume bool `json:"resume" description:"if true, load existing session history and continue" default:"false"`
 
-	// compaction
-	CompactionBufferSize int `json:"compaction_buffer_size" description:"buffer size for history compaction" default:"30000"`
-	ToolCallPrunedSize   int `json:"tool_call_prune" description:"token limit for tool call after pruning" default:"40000"`
-	TotalContextSize     int `json:"total_context_size" description:"total context window size" default:"300000"`
+	// compaction / context hygiene — defaults favour earlier prune and a
+	// modest effective window so long agentic turns do not re-pay max context
+	// every step until the 300k ceiling.
+	CompactionBufferSize int `json:"compaction_buffer_size" description:"tokens reserved below TotalContextSize before auto-compact fires" default:"50000"`
+	ToolCallPrunedSize   int `json:"tool_call_prune" description:"token budget of recent tool history kept untrimmed" default:"20000"`
+	TotalContextSize     int `json:"total_context_size" description:"total context window size" default:"200000"`
+
+	// PromptCache requests provider prompt caching when supported (Anthropic
+	// ephemeral cache_control breakpoints on the system message, last tool
+	// definition, and recent messages). Default true. No-op for providers that
+	// ignore these options (OpenAI often auto-caches; Google uses a different API).
+	PromptCache *bool `json:"prompt_cache,omitempty" description:"request provider prompt caching when supported" default:"true"`
 
 	// logging flags
 	AttachLoggerHooks *bool `json:"attach_logger_hooks,omitempty" description:"automatically attach logger hooks" default:"false"`
@@ -152,10 +170,16 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// rejects ("prompt can't be empty when the last message is not a user or tool
 	// message") — breaking structured-generation runs outright.
 	if cfg.TotalContextSize <= 0 {
-		cfg.TotalContextSize = 300000
+		cfg.TotalContextSize = 200000
 	}
 	if cfg.CompactionBufferSize <= 0 {
-		cfg.CompactionBufferSize = 30000
+		cfg.CompactionBufferSize = 50000
+	}
+	if cfg.ToolCallPrunedSize <= 0 {
+		cfg.ToolCallPrunedSize = 20000
+	}
+	if cfg.MaxIter <= 0 {
+		cfg.MaxIter = 25
 	}
 
 	// Open the shared SQLite DB only when persistence is requested.
@@ -260,14 +284,14 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		}
 	}
 
-	// Load system prompt
-	systemPrompt, err := buildSystemPrompt(cfg.WorkDir, skills)
+	// Load system prompt (includes SmallerModel routing note when set)
+	systemPrompt, err := buildSystemPrompt(cfg.WorkDir, skills, cfg.Model, cfg.SmallerModel)
 	if err != nil {
 		return nil, err
 	}
 	k.SystemPrompt = systemPrompt
 
-	// Load the model
+	// Load the primary model
 	if cfg.Provider == nil {
 		p, err := NewProviderFromLLMId(cfg.Model, cfg.APIKey)
 		if err != nil {
@@ -275,21 +299,31 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		}
 		cfg.Provider = p
 	}
-	// Strip the "provider/" prefix before passing to LanguageModel
-	modelName := cfg.Model
-	if _, after, ok := strings.Cut(cfg.Model, "/"); ok {
-		modelName = after
-	}
-	model, err := cfg.Provider.LanguageModel(ctx, modelName)
+	model, err := languageModel(ctx, cfg.Provider, cfg.Model)
 	if err != nil {
 		return nil, err
 	}
 	k.LM = model
+	k.Provider = cfg.Provider
+
+	// Optional cheaper model for compaction + subagents
+	if cfg.SmallerModel != "" && cfg.SmallerModel != cfg.Model {
+		smallLM, err := resolveLanguageModel(ctx, cfg.APIKey, cfg.SmallerModel)
+		if err != nil {
+			return nil, fmt.Errorf("failed to initialize SmallerModel %q: %w", cfg.SmallerModel, err)
+		}
+		k.SmallerLM = smallLM
+	}
 
 	// Build Fantasy Tools
 	var fTools []fantasy.AgentTool
 	for _, t := range k.Tools.Tools() {
 		fTools = append(fTools, t.AgentTool)
+	}
+	// Anthropic: mark the last tool with ephemeral cache_control so the tools
+	// block can participate in the cached prefix (max 4 breakpoints total).
+	if promptCacheEnabled(cfg) && len(fTools) > 0 {
+		fTools[len(fTools)-1].SetProviderOptions(anthropicEphemeralCacheOptions())
 	}
 
 	// Default AttachLoggerHooks if nil
@@ -304,10 +338,16 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	// Initialize Fantasy Agent
+	// System prompt is owned by Fantasy (WithSystemPrompt only) — History must
+	// not also carry a system message or every step double-bills the system text
+	// and busts a stable cache prefix.
 	opts := []fantasy.AgentOption{
 		fantasy.WithSystemPrompt(systemPrompt),
 		fantasy.WithTools(fTools...),
 		fantasy.WithMaxRetries(5),
+	}
+	if promptCacheEnabled(cfg) {
+		opts = append(opts, fantasy.WithPrepareStep(preparePromptCacheStep))
 	}
 
 	// Loop guards. MaxIter caps the absolute number of tool-call steps;
@@ -362,11 +402,104 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		}))
 	}
 	k.FantasyAgentOpts = opts
+	k.Cfg = cfg
 
 	return k, nil
 }
 
-func buildSystemPrompt(workDir string, skills []SkillMeta) (string, error) {
+// languageModel resolves a LanguageModel from an already-built provider and a
+// provider/model id (strips the provider/ prefix for the API call).
+func languageModel(ctx context.Context, p fantasy.Provider, modelID string) (fantasy.LanguageModel, error) {
+	name := modelID
+	if _, after, ok := strings.Cut(modelID, "/"); ok {
+		name = after
+	}
+	return p.LanguageModel(ctx, name)
+}
+
+// resolveLanguageModel builds a provider + language model for modelID using apiKey.
+func resolveLanguageModel(ctx context.Context, apiKey, modelID string) (fantasy.LanguageModel, error) {
+	p, err := NewProviderFromLLMId(modelID, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	return languageModel(ctx, p, modelID)
+}
+
+func promptCacheEnabled(cfg Config) bool {
+	return cfg.PromptCache == nil || *cfg.PromptCache
+}
+
+func anthropicEphemeralCacheOptions() fantasy.ProviderOptions {
+	return fantasy.ProviderOptions{
+		anthropic.Name: &anthropic.ProviderCacheControlOptions{
+			CacheControl: anthropic.CacheControl{Type: "ephemeral"},
+		},
+	}
+}
+
+// preparePromptCacheStep stamps Anthropic ephemeral cache_control breakpoints
+// on the stable system message and the last two messages of each step. Fantasy's
+// own provider tests use this pattern; non-Anthropic providers ignore the option.
+// Anthropic allows at most four breakpoints — system + last 2 leaves room for
+// the last-tool breakpoint set at agent construction.
+func preparePromptCacheStep(ctx context.Context, options fantasy.PrepareStepFunctionOptions) (context.Context, fantasy.PrepareStepResult, error) {
+	msgs := make([]fantasy.Message, len(options.Messages))
+	copy(msgs, options.Messages)
+	for i := range msgs {
+		msgs[i].ProviderOptions = nil
+	}
+	cacheOpts := anthropicEphemeralCacheOptions()
+
+	lastSystem := -1
+	for i, msg := range msgs {
+		if msg.Role == fantasy.MessageRoleSystem {
+			lastSystem = i
+		}
+	}
+	if lastSystem >= 0 {
+		msgs[lastSystem].ProviderOptions = cacheOpts
+	}
+	// Last two messages (often the growing tail) get breakpoints so incremental
+	// turns can still hit a recent cached prefix within Anthropic's limit of 4.
+	for i := range msgs {
+		if i > len(msgs)-3 {
+			msgs[i].ProviderOptions = cacheOpts
+		}
+	}
+	return ctx, fantasy.PrepareStepResult{Messages: msgs}, nil
+}
+
+// cheapLM returns the language model for cost-sensitive work (compact, etc.).
+func (k *Kernel) cheapLM() fantasy.LanguageModel {
+	if k.SmallerLM != nil {
+		return k.SmallerLM
+	}
+	return k.LM
+}
+
+// cheapModelID returns the model id used for cost-sensitive work and its pricing.
+func (k *Kernel) cheapModelID() string {
+	if k.Cfg.SmallerModel != "" {
+		return k.Cfg.SmallerModel
+	}
+	return k.Cfg.Model
+}
+
+// recordUsage adds a single LLM call's usage to session cost accounting.
+func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
+	runningCost := k.UpdateUse(u, "")
+	if k.Store != nil {
+		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
+	}
+	_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
+		TurnUsage:    u,
+		TurnCostUSD:  u.Cost,
+		TotalCostUSD: runningCost,
+	})
+}
+
+func buildSystemPrompt(workDir string, skills []SkillMeta, model, smallerModel string) (string, error) {
 	raw, err := readPrompt("system.tmpl")
 	if err != nil {
 		return "", err
@@ -378,9 +511,11 @@ func buildSystemPrompt(workDir string, skills []SkillMeta) (string, error) {
 
 	var buf strings.Builder
 	err = tmpl.Execute(&buf, map[string]any{
-		"WorkDir": workDir,
-		"Date":    time.Now().Format("2006-01-02 15:04:05"),
-		"Skills":  skills,
+		"WorkDir":      workDir,
+		"Date":         time.Now().Format("2006-01-02 15:04:05"),
+		"Skills":       skills,
+		"Model":        model,
+		"SmallerModel": smallerModel,
 	})
 	return buf.String(), err
 }
@@ -565,12 +700,10 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	for _, o := range opts {
 		o(&ro)
 	}
-	// Fire session start only once
+	// Fire session start only once. System prompt is injected by Fantasy via
+	// WithSystemPrompt — do not also put it in History (double bill + cache bust).
 	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
-		if k.SystemPrompt != "" {
-			k.History = append(k.History, fantasy.NewSystemMessage(k.SystemPrompt))
-		}
 	}
 
 	// Auto-compact if approaching context limit; important to do this before adding user prompt
@@ -588,59 +721,20 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	k.History = append(k.History, userMsg)
 	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt})
 
-	// history validation
-	if len(k.History) > 0 {
-		if k.SystemPrompt != "" && k.History[0].Role != fantasy.MessageRoleSystem {
-			k.LogErr("Kernel provided with system prompt. SysPrompt should be first item in history, found: '%s'", k.History[len(k.History)-1].Role)
-			panic("Kernel provided with system prompt. SysPrompt should be first item in history")
+	// history validation — last message must be the user turn we just appended.
+	if len(k.History) == 0 || k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
+		role := fantasy.MessageRole("")
+		if len(k.History) > 0 {
+			role = k.History[len(k.History)-1].Role
 		}
-		if k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
-			k.LogErr("Last item (%d) is 'user' message. Got: '%s'", len(k.History)-1, k.History[len(k.History)-1].Role)
-			panic("Last item is 'user' message.")
-		}
-
-		// Walk StepUsage backwards, accumulating tokens. Steps whose cumulative
-		// token total exceeds ToolCallPrunedSize get their history messages trimmed:
-		// tool call args are cleared, tool results are truncated to 30 chars.
-		if len(k.StepUsage) > 0 && len(k.StepHistoryStart) == len(k.StepUsage) {
-			var accumulated int
-			for i := len(k.StepUsage) - 1; i >= 0; i-- {
-				u := k.StepUsage[i]
-				accumulated += int(u.Input + u.Output)
-				if accumulated <= k.Cfg.ToolCallPrunedSize {
-					continue
-				}
-				// This step is beyond the budget — trim its history messages.
-				start := k.StepHistoryStart[i]
-				end := len(k.History)
-				if i+1 < len(k.StepHistoryStart) {
-					end = k.StepHistoryStart[i+1]
-				}
-				for j := start; j < end; j++ {
-					msg := &k.History[j]
-					for p, part := range msg.Content {
-						switch msg.Role {
-						case fantasy.MessageRoleAssistant:
-							if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
-								tc.Input = "{}"
-								msg.Content[p] = tc
-							}
-						case fantasy.MessageRoleTool:
-							if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
-								if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
-									if len(txt.Text) > 800 {
-										txt.Text = txt.Text[:800] + "… [trimmed]"
-										tr.Output = txt
-										msg.Content[p] = tr
-									}
-								}
-							}
-						}
-					}
-				}
-			}
-		}
+		k.LogErr("Last history item must be a user message. Got: '%s'", role)
+		panic("Last item is not a user message.")
 	}
+
+	// Walk StepUsage backwards, accumulating tokens. Steps whose cumulative
+	// token total exceeds ToolCallPrunedSize get their history messages trimmed:
+	// tool call args are cleared, tool results are truncated.
+	k.pruneOldToolCalls()
 
 	// When schema is set, discard the free-text output from the agent loop;
 	// only the structured JSON from GenerateObject goes to the caller's writer.
@@ -776,16 +870,8 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 			OnStepFinish: func(step fantasy.StepResult) error {
 				u := Usage{}
 				u.FromFantasyUsage(step.Usage, k.Cfg.Model)
-				runningCost := k.UpdateUse(u, "")
 				k.StepUsage = append(k.StepUsage, u)
-				if k.Store != nil {
-					_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
-				}
-				_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
-					TurnUsage:    u,
-					TurnCostUSD:  u.Cost,
-					TotalCostUSD: runningCost,
-				})
+				k.recordUsage(ctx, u)
 
 				// Check queue at this safe step boundary. We set a flag and let
 				// the stream finish naturally so all steps are collected before
@@ -952,11 +1038,78 @@ func (k *Kernel) Close() error {
 	return nil
 }
 
+// pruneOldToolCalls walks StepUsage backwards and trims history for steps whose
+// cumulative token total exceeds ToolCallPrunedSize.
+func (k *Kernel) pruneOldToolCalls() {
+	if len(k.StepUsage) == 0 || len(k.StepHistoryStart) != len(k.StepUsage) {
+		return
+	}
+	var accumulated int
+	for i := len(k.StepUsage) - 1; i >= 0; i-- {
+		u := k.StepUsage[i]
+		accumulated += int(u.Input + u.Output)
+		if accumulated <= k.Cfg.ToolCallPrunedSize {
+			continue
+		}
+		start := k.StepHistoryStart[i]
+		end := len(k.History)
+		if i+1 < len(k.StepHistoryStart) {
+			end = k.StepHistoryStart[i+1]
+		}
+		k.trimHistoryRange(start, end, 800)
+	}
+}
+
+// trimHistoryRange clears tool-call args and truncates tool results in [start, end).
+func (k *Kernel) trimHistoryRange(start, end, maxResultChars int) {
+	if maxResultChars <= 0 {
+		maxResultChars = 800
+	}
+	if start < 0 {
+		start = 0
+	}
+	if end > len(k.History) {
+		end = len(k.History)
+	}
+	for j := start; j < end; j++ {
+		msg := &k.History[j]
+		for p, part := range msg.Content {
+			switch msg.Role {
+			case fantasy.MessageRoleAssistant:
+				if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
+					tc.Input = "{}"
+					msg.Content[p] = tc
+				}
+			case fantasy.MessageRoleTool:
+				if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
+					if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
+						if len(txt.Text) > maxResultChars {
+							txt.Text = txt.Text[:maxResultChars] + "… [trimmed]"
+							tr.Output = txt
+							msg.Content[p] = tr
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// trimAllToolResults caps every tool result in history. Used before Compact so
+// the summary call is not dominated by a single unbounded grep/MCP dump.
+func (k *Kernel) trimAllToolResults(maxResultChars int) {
+	k.trimHistoryRange(0, len(k.History), maxResultChars)
+}
+
 // Compact summarizes the current history and resets it.
 func (k *Kernel) Compact(ctx context.Context) error {
 	if len(k.History) == 0 {
 		return nil
 	}
+
+	// Shrink fat tool results before paying for a full-history summarize call.
+	// Age-based prune may not have touched the recent (largest) dumps yet.
+	k.trimAllToolResults(2000)
 
 	messagesBefore := len(k.History)
 	tokensBefore := k.currentTokens
@@ -970,8 +1123,12 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return err
 	}
 
-	// 1. Generate summary by calling the LLM
-	agent := fantasy.NewAgent(k.LM, fantasy.WithMaxRetries(5))
+	// Prefer SmallerModel when configured — summarization is cheaper work.
+	agentOpts := []fantasy.AgentOption{fantasy.WithMaxRetries(5)}
+	if k.SystemPrompt != "" {
+		agentOpts = append(agentOpts, fantasy.WithSystemPrompt(k.SystemPrompt))
+	}
+	agent := fantasy.NewAgent(k.cheapLM(), agentOpts...)
 	result, err := agent.Generate(ctx, fantasy.AgentCall{
 		Prompt:   string(prompt),
 		Messages: k.History,
@@ -981,15 +1138,16 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	}
 	summary := result.Response.Content.Text()
 
-	// 2. Reset history
-	if k.SystemPrompt != "" {
-		k.History = []fantasy.Message{fantasy.NewSystemMessage(k.SystemPrompt)}
-	} else {
-		k.History = []fantasy.Message{}
+	// Bill the compact call (previously invisible to runningCostUSD).
+	var u Usage
+	u.FromFantasyUsage(result.TotalUsage, k.cheapModelID())
+	k.recordUsage(ctx, u)
+
+	// Reset history. System stays out of History — Fantasy re-injects it via
+	// WithSystemPrompt on the main agent.
+	k.History = []fantasy.Message{
+		fantasy.NewUserMessage("Tell me the summary of our conversation."),
 	}
-	k.History = append(k.History, fantasy.NewUserMessage(
-		"Tell me the summary of our conversation.",
-	))
 	msg := fantasy.NewUserMessage(
 		"Here is a summary of our previous interaction for your reference:\n\n" + summary,
 	)
@@ -1019,11 +1177,17 @@ func (k *Kernel) Compact(ctx context.Context) error {
 
 // RunSubagent runs a subagent synchronously and returns its output.
 func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
-	// Inherit provider, model, and key from parent, but clean up
+	// Inherit config from parent; pin the child to SmallerModel when set so
+	// exploratory side work does not burn the primary model.
 	subCfg := k.Cfg
-	subCfg.SessionID = NewSessionID()     // new session ID
-	subCfg.TraceID = k.Cfg.TraceID        // inherit trace
-	subCfg.ParentSpanID = k.Cfg.SessionID // parent span = current session
+	subCfg.SessionID = NewSessionID()
+	subCfg.TraceID = k.Cfg.TraceID
+	subCfg.ParentSpanID = k.Cfg.SessionID
+	if k.Cfg.SmallerModel != "" {
+		subCfg.Model = k.Cfg.SmallerModel
+		// Force provider re-resolve for the cheaper model (may differ in prefix).
+		subCfg.Provider = nil
+	}
 
 	// Create an independent Kernel instance for the subagent
 	subKernel, err := NewKernel(ctx, subCfg)
@@ -1047,6 +1211,19 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 		Output:       output,
 		UsagePayload: usage,
 	})
+
+	// Roll child spend into the parent total so RunningCostUSD is honest.
+	// Per-session breakdown remains in usage.Tokens / SubagentStop payload.
+	for sid, childU := range usage.Tokens {
+		k.usageMu.Lock()
+		k.Sessions[sid] = childU
+		k.runningCostUSD += childU.Cost
+		total := k.runningCostUSD
+		k.usageMu.Unlock()
+		if k.Store != nil {
+			_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, childU.Cost, total)
+		}
+	}
 
 	if err != nil {
 		return "", fmt.Errorf("subagent failed: %w", err)
@@ -1139,9 +1316,7 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	if len(k.History) == 0 && k.SystemPrompt != "" {
-		k.History = append(k.History, fantasy.NewSystemMessage(k.SystemPrompt))
-	}
+	// System prompt is Fantasy-owned; only inject the queued user messages.
 	for _, m := range msgs {
 		k.History = append(k.History, fantasy.NewUserMessage(m))
 	}

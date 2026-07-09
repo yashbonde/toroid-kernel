@@ -30,7 +30,7 @@ func NewGlobTool(a Agent, desc string) *ToolDef {
 			}
 		}
 
-		content := fmt.Sprintf("<matches>\n%s\n</matches>", strings.Join(filtered, "\n"))
+		content := TruncateToolOutput(fmt.Sprintf("<matches>\n%s\n</matches>", strings.Join(filtered, "\n")))
 		return fantasy.ToolResponse{Type: "text", Content: content}, nil
 	})
 

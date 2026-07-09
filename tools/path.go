@@ -1,10 +1,26 @@
 package tools
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+// MaxToolOutputChars is the shared hard cap for tool result text returned to
+// the model. Unbounded grep/MCP dumps otherwise re-enter the next prompt at
+// full size. ~20k chars ≈ 5k tokens; bash already used this budget.
+const MaxToolOutputChars = 20_000
+
+// TruncateToolOutput clips s to MaxToolOutputChars and appends a short note
+// when truncated so the model knows more content was omitted.
+func TruncateToolOutput(s string) string {
+	if len(s) <= MaxToolOutputChars {
+		return s
+	}
+	omitted := len(s) - MaxToolOutputChars
+	return s[:MaxToolOutputChars] + fmt.Sprintf("\n… [truncated %d bytes]", omitted)
+}
 
 // ResolvePath expands a leading "~/" to the user's home directory and makes
 // relative paths absolute against workDir. The result is always cleaned. It is

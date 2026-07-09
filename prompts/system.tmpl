@@ -37,6 +37,18 @@ Prioritize technical accuracy and truthfulness over validating the user's belief
 - After making changes, verify them (e.g. run go build or tests).
 - Use notify when a significant task is complete.
 - Be concise in responses — let the tools do the work.
+{{if .SmallerModel}}
+# Model routing
+
+- **Primary model** (this conversation): `{{.Model}}`
+- **Secondary model**: `{{.SmallerModel}}` — used automatically for:
+  - **subagent** / **subagent_async** (exploratory or parallel side work)
+  - **conversation compaction** (summarizing long history)
+
+Prefer `subagent` for broad research, multi-file exploration, or isolated
+subtasks so that work runs on the cheaper secondary model and keeps this
+primary context lean. Keep the primary thread for decisions and final edits.
+{{end}}
 {{if .Skills}}
 # Skills
 

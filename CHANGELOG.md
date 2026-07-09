@@ -3,6 +3,41 @@
 All notable changes to toroid-kernel are documented here. This project follows
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **`Config.SmallerModel`.** Optional cheaper `provider/model` used for
+  conversation compaction and subagents (sync + async). When set, the system
+  prompt documents primary vs secondary model routing so the agent prefers
+  `subagent` for exploratory work. Nested subagents stay on the secondary tier.
+- **`Config.PromptCache` (default true).** Requests Anthropic-style ephemeral
+  `cache_control` breakpoints via Fantasy `PrepareStep` (system + last two
+  messages) and on the last registered tool definition. No-op for providers
+  that ignore the option.
+- **Shared tool output cap (`tools.MaxToolOutputChars` = 20k).** `grep`,
+  `glob`, `ls`, `skill`, MCP results, and `bash` all pass through
+  `TruncateToolOutput` so one fat result cannot dominate the next prompt.
+
+### Changed
+
+- **Tighter cost defaults.** `MaxIter` 50→25, `ToolCallPrunedSize` 40k→20k,
+  `TotalContextSize` 300k→200k, `CompactionBufferSize` 30k→50k (earlier
+  auto-compact). Zero values in `NewKernel` now apply these same floors.
+
+### Fixed
+
+- **Double system prompt.** System text is owned only by Fantasy
+  `WithSystemPrompt`; it is no longer also appended into `History` (which was
+  double-billing every step and busting a stable cache prefix).
+- **Compaction cost accounting.** Compact LLM calls now run through
+  `recordUsage` (and prefer `SmallerModel` when set). Fat tool results are
+  trimmed before the summarize call.
+- **Subagent cost rollup.** Child session costs are added into the parent
+  `runningCostUSD` after `RunSubagent` returns.
+- **Unbounded tool results.** Broad `grep`/`glob`/`ls`/MCP/`skill` outputs
+  were previously unlimited and re-entered context at full size.
+
 ## v0.4.0
 
 Adds two extensibility primitives — on-demand Skills and an MCP client — plus
