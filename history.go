@@ -16,8 +16,9 @@ import (
 // If spanID is non-empty only events from that span are used; otherwise events from all spans
 // under the trace are combined in span order (useful for subagent traces).
 // workDir resolves any relative image refs in stored prompts (persisted refs are
-// already ~-rooted, so it normally only matters for legacy data).
-func ReconstructHistory(traceID, spanID, systemPrompt, workDir string) ([]fantasy.Message, error) {
+// already ~-rooted, so it normally only matters for legacy data). model gates
+// image inlining on replay via the catalog's capability check (M8).
+func ReconstructHistory(traceID, spanID, systemPrompt, workDir, model string) ([]fantasy.Message, error) {
 	td, err := LoadTraceData(traceID)
 	if err != nil {
 		return nil, err
@@ -84,7 +85,10 @@ func ReconstructHistory(traceID, spanID, systemPrompt, workDir string) ([]fantas
 			if err := json.Unmarshal(raw, &p); err != nil || p.Prompt == "" {
 				continue
 			}
-			msg, _ := parseUserMessage(p.Prompt, workDir)
+			// Replay reconstructs history from persisted prompts; media caps and
+			// capability were already enforced when the prompt was first submitted,
+			// so warnings here are not re-surfaced.
+			msg, _, _ := parseUserMessage(p.Prompt, workDir, ResolveModel(model))
 			history = append(history, msg)
 
 		case EventAssistantTurn:

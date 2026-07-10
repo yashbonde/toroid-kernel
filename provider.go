@@ -53,7 +53,9 @@ func randomHex(n int) string {
 // traceTransport stamps a W3C traceparent (stable trace id from the request
 // context + a fresh span id per request) plus a matching x-litellm-session-id on
 // every outgoing gateway request, so all turns of one chat nest under a single
-// upstream/Langfuse trace.
+// upstream/Langfuse trace. It also captures LiteLLM's per-call cost header on the
+// response so non-streaming llm-steps can prefer gateway truth over the local
+// estimate (Phase C; see costcapture.go).
 type traceTransport struct{ base http.RoundTripper }
 
 func (t *traceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -62,13 +64,18 @@ func (t *traceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		base = http.DefaultTransport
 	}
 	traceID := gatewayTraceID(req.Context())
-	if traceID == "" {
-		return base.RoundTrip(req)
+	if traceID != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("traceparent", "00-"+traceID+"-"+randomHex(8)+"-01")
+		req.Header.Set("x-litellm-session-id", traceID)
 	}
-	req = req.Clone(req.Context())
-	req.Header.Set("traceparent", "00-"+traceID+"-"+randomHex(8)+"-01")
-	req.Header.Set("x-litellm-session-id", traceID)
-	return base.RoundTrip(req)
+	resp, err := base.RoundTrip(req)
+	if err == nil && resp != nil {
+		// Present on non-streaming responses; absent/zero while streaming, in
+		// which case the capture is a no-op and the local estimate stands.
+		captureGatewayCost(req.Context(), resp.Header.Get(litellmResponseCostHeader))
+	}
+	return resp, err
 }
 
 // GatewayBaseURLEnv is the environment variable holding the OpenAI-compatible

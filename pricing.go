@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 
 	"charm.land/fantasy"
 )
@@ -38,22 +39,34 @@ type USDToLocalCurrency struct {
 	Date string  `json:"date"`
 }
 
-// GetModelPricing returns the singleton pricing instance.
-func GetModelPricing(modelID string) (ModelPricing, error) {
-	type Pricing struct {
-		table map[string]ModelPricing
-	}
+// pricingTableOnce guards a single parse of pricing.json. The table is static
+// for the process lifetime, so parsing it on every llm-step (the previous
+// behaviour) was wasted work on a hot path — cost is recorded once per LLM call.
+var (
+	pricingTableOnce sync.Once
+	pricingTableData map[string]ModelPricing
+)
 
-	p := &Pricing{
-		table: make(map[string]ModelPricing),
-	}
-	data, err := readAssets("pricing.json")
-	if err != nil {
-		log.Fatal("Failed to read pricing.json: ", err)
-	}
-	if err := json.Unmarshal(data, &p.table); err != nil {
-		log.Fatal("Failed to unmarshal pricing.json: ", err)
-	}
+// pricingTable returns the parsed pricing.json table, loading it exactly once.
+func pricingTable() map[string]ModelPricing {
+	pricingTableOnce.Do(func() {
+		pricingTableData = make(map[string]ModelPricing)
+		data, err := readAssets("pricing.json")
+		if err != nil {
+			log.Fatal("Failed to read pricing.json: ", err)
+		}
+		if err := json.Unmarshal(data, &pricingTableData); err != nil {
+			log.Fatal("Failed to unmarshal pricing.json: ", err)
+		}
+	})
+	return pricingTableData
+}
+
+// GetModelPricing resolves a model id to its per-token rates. A non-nil error
+// means the model is absent from the pricing table — callers must treat that as
+// "pricing unavailable", never as a free ($0) model. See Usage.PricingOK.
+func GetModelPricing(modelID string) (ModelPricing, error) {
+	table := pricingTable()
 
 	// Model pricing lookup.
 	id := strings.ToLower(modelID)
@@ -84,7 +97,7 @@ func GetModelPricing(modelID string) (ModelPricing, error) {
 			if hasProvider && pfx != "" {
 				continue // don't double-prefix "anthropic/anthropic/..."
 			}
-			if pricing, ok := p.table[pfx+name]; ok {
+			if pricing, ok := table[pfx+name]; ok {
 				return pricing, nil
 			}
 		}
@@ -94,7 +107,7 @@ func GetModelPricing(modelID string) (ModelPricing, error) {
 	// falls back to its base model (e.g. "claude-opus-4.8.1" -> "claude-opus-4.8").
 	// Kept for backwards compatibility.
 	for _, candidate := range nameVariants {
-		for k, pricing := range p.table {
+		for k, pricing := range table {
 			if strings.HasPrefix(candidate, k) || strings.HasPrefix(k, candidate) {
 				return pricing, nil
 			}
@@ -170,6 +183,12 @@ type Usage struct {
 	CacheRead  int64
 	CacheWrite int64
 	Cost       float64
+	// PricingOK reports whether Cost was computed from a real pricing-table row.
+	// When false, the model id had no entry in pricing.json and Cost is a
+	// meaningless 0 — surfaces must show "pricing unavailable" rather than a
+	// misleading free ($0). A legitimately free model (rates present but 0)
+	// still reports PricingOK == true. See standard_pricing.md.
+	PricingOK bool
 }
 
 func (u *Usage) FromFantasyUsage(usage fantasy.Usage, model string) {
@@ -178,5 +197,10 @@ func (u *Usage) FromFantasyUsage(usage fantasy.Usage, model string) {
 	u.Reasoning = usage.ReasoningTokens
 	u.CacheRead = usage.CacheReadTokens
 	u.CacheWrite = usage.CacheCreationTokens
-	u.Cost, _ = CalculateCost(model, *u, "USD") // here we can ignore error because string is hardcoded
+	// Distinguish a real (possibly $0) price from a missing model: a lookup
+	// error means the model is absent from the table, so leave Cost at 0 but
+	// flag pricing as unavailable so callers never read it as free.
+	cost, err := CalculateCost(model, *u, "USD")
+	u.Cost = cost
+	u.PricingOK = err == nil
 }

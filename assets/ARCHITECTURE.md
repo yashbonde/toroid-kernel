@@ -111,9 +111,24 @@ sequenceDiagram
 
 On every `OnStepFinish` the step's Fantasy usage is converted to a `Usage` (with USD cost from [`pricing.go`](../pricing.go)), accumulated into `runningCostUSD`, appended to `StepUsage`, persisted via `AppendCost`, and emitted as an `EventTurnCost`. The same callback is the **safe interruption point** where the message queue is drained and context pressure is re-checked.
 
+`Usage` carries a `PricingOK` flag: when the model id has no row in `pricing.json`, `Cost` stays `0` **and** `PricingOK` is `false`, so a surface can show "pricing unavailable" rather than a misleading free `$0`. The pricing table is parsed once (cached), not per llm-step.
+
 ### Structured output
 
-`Run`/`Stream` accept a [`WithSchema(schema, name, description)`](../kernel.go#L483) option. When set, the free-text loop output is discarded; after the agentic loop the kernel appends a "return your findings in the required JSON format" user turn and calls `LanguageModel.GenerateObject`, writing the validated JSON to the caller's writer instead of prose.
+`Run`/`Stream` accept a [`WithSchema(schema, name, description)`](../kernel.go) option. When set, the free-text loop output is discarded; after the agentic loop the kernel appends a "return your findings in the required JSON format" user turn and runs one structured-output **llm-step** through the Step layer (`Step.CompleteObject`), **billing its usage** via `recordUsage` and writing the validated JSON to the caller's writer instead of prose.
+
+### The Step layer
+
+A **Step** performs exactly one LLM call — one product *llm-step* (see [terminology.md](./terminology.md)). It never runs the tool loop; the kernel owns turns, tools, compaction, and subagents and drives a Step per call. The interface ([`step.go`](../step.go)) is `Complete` / `Stream` / `CompleteObject` over a caller-owned `Context` (single system blob + messages + tools).
+
+| Type | Role |
+|------|------|
+| [`FantasyStep`](../fantasystep.go) | Default backend: maps one llm-step onto a single Fantasy `Generate`/`Stream`/`GenerateObject` call. Prices usage from the catalog; on non-stream calls prefers the gateway's `x-litellm-response-cost` over the local estimate. |
+| [`FauxStep`](../fauxstep.go) | In-memory, network-free backend for tests: scripted assistant messages (incl. tool calls) and fake usage. |
+
+Today the Step layer backs the schema pass and compaction. The **preferred kernel-owned tool loop** ([`steploop.go`](../steploop.go)) drives each turn's LLM call through `Step.Complete` — executing tools in the kernel and preserving MaxIter, the repeat-call loop guard, queue interrupts, mid-turn compaction, tool events, and per-turn cost. It is opt-in via `Config.UseStepLoop`; the Fantasy `Agent.Stream` path remains the production default until validated against a live gateway.
+
+The model catalog ([`model.go`](../model.go), `ResolveModel`) is the "model as data" row — id, provider, wire `api`, context window, per-token cost, reasoning, and input modalities (used by the multimodal path's vision check).
 
 ## 4. Tools and the registry
 
@@ -140,7 +155,9 @@ User prompts go through [`parseUserMessage`](../multimodal.go#L22), which scans 
 
 ## 5. Providers
 
-[`NewProviderFromLLMId`](../provider.go#L22) maps the prefix of a `provider/model` ID to a Fantasy provider. `google` (and the empty default) and `anthropic` use native providers; `openai` and `llmgateway` both use the OpenAI-compatible provider — the gateway variant just points it at a self-hosted base URL (e.g. a LiteLLM proxy) from `LLM_GATEWAY_BASE_URL` and authenticates with a bearer token.
+[`NewProviderFromLLMId`](../provider.go) maps the prefix of a `provider/model` ID to a Fantasy provider. `google` (and the empty default) and `anthropic` use native providers; `openai` and `llmgateway` both use the OpenAI-compatible provider — the gateway variant just points it at a self-hosted base URL (e.g. a LiteLLM proxy) from `LLM_GATEWAY_BASE_URL` and authenticates with a bearer token. The **`llmgateway/*` (OpenAI-compatible LiteLLM) path is the supported target** for the LLM-step port; native prefixes remain but are not invested in.
+
+The gateway transport ([`traceTransport`](../provider.go)) stamps a per-chat `traceparent` + `x-litellm-session-id` so a chat's turns nest under one upstream trace, and captures `x-litellm-response-cost` on non-streaming responses into a context-carried sink ([`costcapture.go`](../costcapture.go)) so those llm-steps can bill the gateway's authoritative cost. Streaming responses omit that header by design and stay on the local estimate.
 
 ## 6. Persistence: one SQLite store
 
@@ -352,10 +369,17 @@ This is the SDK's most load-bearing missing contract: an embeddable kernel must 
 - [`events.go`](../events.go) — event kinds, payloads, and the canonical `OTEL()` projection
 - [`store.go`](../store.go) — single SQLite store, schema, trace/span graph, `OTELSpans`
 - [`otlp.go`](../otlp.go) — OTLP/HTTP-JSON exporter and `LangfuseOTLP`
-- [`provider.go`](../provider.go) — provider resolution from `provider/model` IDs
-- [`multimodal.go`](../multimodal.go) — inline-image handling in user prompts
+- [`provider.go`](../provider.go) — provider resolution + gateway transport (trace headers, cost-header capture)
+- [`multimodal.go`](../multimodal.go) — inline-image handling in user prompts (size cap + vision-capability gate)
 - [`utils.go`](../utils.go) — Snowflake IDs and OTEL ID derivation
-- [`pricing.go`](../pricing.go) — per-model USD cost accounting
+- [`pricing.go`](../pricing.go) — per-model USD cost accounting + `PricingOK` honesty
+- [`model.go`](../model.go) — model catalog (`ResolveModel`): cost + context window + modalities
+- [`step.go`](../step.go) — the Step interface (one llm-step): `Complete` / `Stream` / `CompleteObject`
+- [`fantasystep.go`](../fantasystep.go) — default Step backend over a Fantasy `LanguageModel`
+- [`fauxstep.go`](../fauxstep.go) — in-memory, network-free Step for tests
+- [`steploop.go`](../steploop.go) — opt-in kernel-owned tool loop over the Step layer
+- [`costcapture.go`](../costcapture.go) — gateway `x-litellm-response-cost` capture (non-stream)
+- [`handoff.go`](../handoff.go) — cross-model handoff transform (`TransformForHandoff`)
 - [`history.go`](../history.go) — history reconstruction helpers
 - [`tools/`](../tools) — built-in tool implementations
 - [`examples/`](../examples) — runnable usage patterns

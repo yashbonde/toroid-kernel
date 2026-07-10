@@ -40,6 +40,8 @@ type Kernel struct {
 	Provider         fantasy.Provider
 	LM               fantasy.LanguageModel
 	SmallerLM        fantasy.LanguageModel // optional; used for compact + subagents when set
+	Step             Step                  // one-llm-step backend (Phase B); defaults to FantasyStep over LM
+
 	Hooks            *HookRegistry
 	Tools            *tools.Registry
 	Store            *Store
@@ -90,8 +92,21 @@ type Config struct {
 	// thrashing model cannot burn dozens of full-context steps by default.
 	MaxIter        int       `json:"max_iter" description:"max tool-call iterations" default:"25"`
 	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
+	// UseStepLoop opts into the kernel-owned tool loop that drives each turn's
+	// LLM call through the Step layer (one llm-step per turn) instead of Fantasy
+	// Agent.Stream. Preserves MaxIter, loop guard, queue interrupt, mid-turn
+	// compaction, tool events, and per-turn cost. Off by default: the Fantasy
+	// Agent path remains the production default until this is proven against a
+	// live gateway. See steploop.go.
+	UseStepLoop bool `json:"use_step_loop" description:"drive the tool loop via the Step layer instead of Fantasy Agent.Stream" default:"false"`
 	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
+
+	// OnPayload, when set, receives a debug view of each outbound llm-step the
+	// kernel issues through the Step layer (structured-output pass and
+	// compaction today). Lets a host inspect the request body — tools, schema,
+	// single-system-prompt invariant — without capturing raw provider bytes (M10).
+	OnPayload func(PayloadDebug) `json:"-"`
 
 	// Tools
 	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
@@ -275,7 +290,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 			})
 		} else {
 			// Restore conversation history by replaying stored events (post-last-compaction only).
-			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir); err2 == nil && len(msgs) > 0 {
+			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir, cfg.Model); err2 == nil && len(msgs) > 0 {
 				k.History = msgs
 				k.Logf("[resume] reconstructed %d history messages from events for trace %s", len(msgs), cfg.TraceID)
 			} else if err2 != nil {
@@ -305,6 +320,10 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 	k.LM = model
 	k.Provider = cfg.Provider
+	// Step is the one-llm-step backend (Phase B). Defaults to wrapping the same
+	// Fantasy model; tests may replace it with a FauxStep. The kernel still owns
+	// the tool loop — Step performs individual LLM calls (e.g. the schema pass).
+	k.Step = NewFantasyStep(model)
 
 	// Optional cheaper model for compaction + subagents
 	if cfg.SmallerModel != "" && cfg.SmallerModel != cfg.Model {
@@ -476,6 +495,22 @@ func (k *Kernel) cheapLM() fantasy.LanguageModel {
 		return k.SmallerLM
 	}
 	return k.LM
+}
+
+// cheapStep returns the Step used for cost-sensitive one-shot llm-steps
+// (compaction). When a SmallerModel is configured it wraps that model; otherwise
+// it reuses k.Step so a test-injected FauxStep still applies.
+func (k *Kernel) cheapStep() Step {
+	if k.SmallerLM != nil {
+		return NewFantasyStep(k.SmallerLM)
+	}
+	return k.Step
+}
+
+// stepOptions builds the per-call StepOptions the kernel applies to every
+// Step call it issues (currently just the host's OnPayload debug hook).
+func (k *Kernel) stepOptions() StepOptions {
+	return StepOptions{OnPayload: k.Cfg.OnPayload}
 }
 
 // cheapModelID returns the model id used for cost-sensitive work and its pricing.
@@ -717,9 +752,15 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// append user message; important to do this before history validation.
 	// parseUserMessage inlines any markdown image refs as file parts and returns
 	// the portable (~-rooted) prompt to persist for cross-process resume.
-	userMsg, storedPrompt := parseUserMessage(prompt, k.Cfg.WorkDir)
+	userMsg, storedPrompt, mediaWarnings := parseUserMessage(prompt, k.Cfg.WorkDir, ResolveModel(k.Cfg.Model))
 	k.History = append(k.History, userMsg)
 	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt})
+	// Surface any media that could not be inlined (unsupported model, oversized)
+	// so a dropped image is visible rather than silently missing (M8).
+	for _, w := range mediaWarnings {
+		k.LogErr("multimodal: %s", w)
+		_ = k.FireTraceLog(ctx, "warn", "multimodal: "+w)
+	}
 
 	// history validation — last message must be the user turn we just appended.
 	if len(k.History) == 0 || k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
@@ -747,20 +788,23 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	}
 
 	if ro.schema != nil {
-		// GenerateObject requires the last message to be user/tool role.
-		// After the agentic loop the last message is assistant, so append a
-		// user turn that asks the model to emit structured output.
-		historyForSchema := append(k.History, fantasy.NewUserMessage("Now return your findings in the required JSON format."))
-		resp, err := k.LM.GenerateObject(ctx, fantasy.ObjectCall{
-			Prompt:            historyForSchema,
-			Schema:            *ro.schema,
-			SchemaName:        ro.schemaName,
-			SchemaDescription: ro.schemaDescription,
-		})
+		// The structured-output pass is one more llm-step in the SAME chat (M7).
+		// GenerateObject requires the last message to be user/tool role; after the
+		// agentic loop the last message is assistant, so append a user turn asking
+		// the model to emit structured output. Run it through the Step layer so its
+		// usage is priced and billed like any other llm-step — previously this call
+		// bypassed cost accounting entirely, under-reporting schema chats.
+		schemaMsgs := append(k.History, fantasy.NewUserMessage("Now return your findings in the required JSON format."))
+		res, err := k.Step.CompleteObject(ctx, ResolveModel(k.Cfg.Model), Context{
+			System:   k.SystemPrompt,
+			Messages: schemaMsgs,
+		}, *ro.schema, ro.schemaName, ro.schemaDescription, k.stepOptions())
 		if err != nil {
 			return err
 		}
-		b, err := json.Marshal(resp.Object)
+		// Bill the object llm-step and roll it into transcript totals (M7).
+		k.recordUsage(ctx, res.Usage)
+		b, err := json.Marshal(res.Object)
 		if err != nil {
 			return err
 		}
@@ -847,6 +891,12 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	k.running.Store(true)
 	k.lastWriter = w
 	defer k.running.Store(false)
+
+	// Opt-in: drive the tool loop through the Step layer (one llm-step per turn)
+	// instead of Fantasy Agent.Stream. Default path below is unchanged.
+	if k.Cfg.UseStepLoop {
+		return k.streamViaStep(ctx, w)
+	}
 
 	// Build Agent and handle streaming and events.
 	// The loop restarts agent.Stream() whenever queued messages are injected
@@ -1123,25 +1173,27 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return err
 	}
 
-	// Prefer SmallerModel when configured — summarization is cheaper work.
-	agentOpts := []fantasy.AgentOption{fantasy.WithMaxRetries(5)}
-	if k.SystemPrompt != "" {
-		agentOpts = append(agentOpts, fantasy.WithSystemPrompt(k.SystemPrompt))
-	}
-	agent := fantasy.NewAgent(k.cheapLM(), agentOpts...)
-	result, err := agent.Generate(ctx, fantasy.AgentCall{
-		Prompt:   string(prompt),
-		Messages: k.History,
-	})
+	// Summarization is one llm-step on the cost-sensitive model. Run it through
+	// the Step layer so it is billed and (on non-stream) prefers the gateway cost
+	// header. Cross-model handoff (M9): when the compact model differs from the
+	// main chat model, adapt history for the target's wire API — a no-op while all
+	// in-scope models share openai-completions.
+	mainModel := ResolveModel(k.Cfg.Model)
+	compactModel := ResolveModel(k.cheapModelID())
+	histForCompact := TransformForHandoff(k.History, mainModel, compactModel)
+	compactMsgs := append(histForCompact, fantasy.NewUserMessage(string(prompt)))
+
+	res, err := k.cheapStep().Complete(ctx, compactModel, Context{
+		System:   k.SystemPrompt,
+		Messages: compactMsgs,
+	}, k.stepOptions())
 	if err != nil {
 		return err
 	}
-	summary := result.Response.Content.Text()
+	summary := res.Text()
 
-	// Bill the compact call (previously invisible to runningCostUSD).
-	var u Usage
-	u.FromFantasyUsage(result.TotalUsage, k.cheapModelID())
-	k.recordUsage(ctx, u)
+	// Bill the compact llm-step (previously invisible to runningCostUSD).
+	k.recordUsage(ctx, res.Usage)
 
 	// Reset history. System stays out of History — Fantasy re-injects it via
 	// WithSystemPrompt on the main agent.
