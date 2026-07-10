@@ -208,7 +208,6 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		k.Tools.Register(tools.NewBashTool(k, getDescription("bash")))
 		k.Tools.Register(tools.NewEditTool(k, getDescription("edit")))
 		k.Tools.Register(tools.NewGlobTool(k, getDescription("glob")))
-		k.Tools.Register(tools.NewGrepTool(k, getDescription("grep")))
 		k.Tools.Register(tools.NewMultiEditTool(k, getDescription("multiedit")))
 		k.Tools.Register(tools.NewNotifyTool(k, getDescription("notify")))
 		k.Tools.Register(tools.NewSubagentTool(k, getDescription("subagent")))

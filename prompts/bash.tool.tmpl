@@ -6,5 +6,5 @@ Each call runs in a fresh shell in the working directory — no state persists
 between calls, so avoid `cd`; use paths relative to the working directory or
 absolute paths. Output over 20k chars is truncated; the full output is saved to
 a file whose path is given in the result, so you can read or grep it there.
-Use this for terminal work (git, build, test, run); prefer the read/edit/write/
-grep/glob tools for file operations.
+Use this for terminal work (git, build, test, run) and for searching (grep/rg,
+find); prefer the read/edit/write tools for file contents.
