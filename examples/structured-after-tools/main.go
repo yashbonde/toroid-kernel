@@ -4,7 +4,7 @@
 // then does a final GenerateObject pass over the accumulated history to
 // coerce the result into the requested schema.
 //
-//	export LLM_GATEWAY_BASE_URL=https://llm-gateway.razorpay.com/v1
+//	export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
 //	export LLM_GATEWAY_KEY=sk-...
 //	go run ./examples/structured-after-tools
 package main
@@ -19,9 +19,8 @@ import (
 	"reflect"
 	"strings"
 
-	"charm.land/fantasy"
-	fantasyschema "charm.land/fantasy/schema"
 	toroid "github.com/yashbonde/toroid-kernel"
+	"github.com/yashbonde/toroid-kernel/llm"
 	tools "github.com/yashbonde/toroid-kernel/tools"
 )
 
@@ -62,20 +61,20 @@ func main() {
 	k.Tools.Register(&tools.ToolDef{
 		Name:        "get_user",
 		Description: "Fetch a random user profile from randomuser.me",
-		AgentTool: fantasy.NewAgentTool(
+		Handler: llm.NewTool(
 			"get_user",
 			"Fetch a random user profile from randomuser.me",
-			func(ctx context.Context, args GetUserArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			func(ctx context.Context, args GetUserArgs) (llm.ToolResult, error) {
 				resp, err := http.Get("https://randomuser.me/api/?inc=name,email,location,dob")
 				if err != nil {
-					return fantasy.ToolResponse{}, err
+					return llm.ToolResult{}, err
 				}
 				defer resp.Body.Close()
 				body, err := io.ReadAll(resp.Body)
 				if err != nil {
-					return fantasy.ToolResponse{}, err
+					return llm.ToolResult{}, err
 				}
-				return fantasy.ToolResponse{Type: "text", Content: string(body)}, nil
+				return llm.NewTextResult(string(body)), nil
 			}),
 	})
 
@@ -96,14 +95,16 @@ func main() {
 		return nil
 	})
 
-	schema := fantasyschema.Generate(reflect.TypeOf(UserSummary{}))
-
 	fmt.Println("Running agent with tool calls + structured output...")
 	var buf strings.Builder
 	err = k.Stream(ctx,
 		"Fetch a random user profile and summarise it.",
 		&buf,
-		toroid.WithSchema(schema, "user_summary", "A structured summary of the fetched user"),
+		toroid.WithSchema(
+			toroid.GenerateSchema(reflect.TypeOf(UserSummary{})),
+			"user_summary",
+			"A structured summary of the fetched user",
+		),
 	)
 	if err != nil {
 		panic(err)

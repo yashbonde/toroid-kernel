@@ -7,6 +7,89 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ### Added
 
+- **`anthropic/` provider (native messages API).** An `anthropic/<model>` id
+  talks to `api.anthropic.com/v1/messages` (`ANTHROPIC_API_KEY`) via a native
+  wire in the llm package (`AnthropicClient`, sharing the `Chat` interface and
+  retry logic with the OpenAI-compatible client): system as a top-level block,
+  tool results inside user messages, tool_use blocks, consecutive-role
+  merging, image/document blocks, thinking via `budget_tokens`, and SSE
+  streaming. Explicit `cache_control` prompt caching is wired and brutally
+  live-verified (cache write turn 2 → read turn 3 → cross-Run read of 11.8k
+  tokens at 3 fresh input tokens). Anthropic's OpenAI-compat endpoint was
+  rejected because it hides cache accounting entirely.
+- **In-code price table.** Per-token rates for the Claude and GPT-5 families
+  are cached in `model.go` (`Model.Price`) and price any llm-step the gateway
+  did not (direct provider routes, streaming). Providers expose no pricing
+  API, so the table is code — unknown families stay honestly unpriced.
+- **`openai/` provider.** An `openai/<model>` id talks straight to the OpenAI
+  API (`OPENAI_API_KEY`, base `https://api.openai.com/v1`) — same
+  OpenAI-compatible wire, no gateway required. Live-verified with
+  `openai/gpt-5.4-mini`: tool loop, structured output, SSE streaming, and
+  image input. Cost is unknown on this route (only LiteLLM reports the
+  per-call cost header); token usage stays exact and unbilled steps are logged.
+
+### Changed
+
+- **Adversarial cost audit + fixes** (report:
+  `assets/adversarial-cost-review.md`, all 15 findings resolved). Highlights:
+  prompt-cache breakpoints (`cache_control`) on Claude-family loop steps
+  (live-verified: later turns read the whole prefix at cache price); per-turn
+  history pruning removed (it rewrote already-sent messages and busted the
+  cache prefix every turn — trimming now happens only at compaction, which also
+  strips media and reasoning); per-session usage is summed, fixing subagent
+  cost rollup that previously counted only the child's last llm-step; read-tool
+  media capped at 5 MiB and text output truncated like every other tool;
+  subagent output capped; tool-result media never sent to text-only models;
+  media bytes no longer persisted into SQLite event payloads; loop-guard
+  signatures hashed; unbilled llm-steps logged; system-prompt date is
+  day-granular.
+
+- **Gateway-truth cost only.** The local pricing model (`pricing.go`,
+  `assets/pricing.json`, `assets/usd_x.json`, `GetModelPricing`,
+  `CalculateCost`, currency conversion) is deleted. Every non-streaming
+  llm-step bills the gateway's `x-litellm-response-cost`; `Usage.PricingOK`
+  now means "the gateway reported this cost". `Model` no longer carries rates.
+- **OnPayload removed.** `Config.OnPayload` / `StepOptions.OnPayload` /
+  `PayloadDebug` are gone; the kernel fires an `EventLLMStep` event
+  (`LLMStepPayload`: model, message count, tool names, schema) before each
+  outbound llm-step instead.
+- **Client retries.** `llm.Client` retries transient failures (network errors,
+  429, 5xx) up to three times with exponential backoff — previously a mid-chat
+  gateway 502 killed the whole run.
+- **Shallow-function purge.** Inlined or deleted single-use micro-helpers
+  across the kernel, client, and examples (`cheapStep`, `cheapModelID`,
+  `stepOptions`, `windowTokens`, `setWindowTokens`, `trimAllToolResults`,
+  `FireTraceLog`, `pathToTilde`, `parseCostHeader`, `hasFiles`, `scanSSE`,
+  `apiKeyEnvFor`, custom `trimSpace`, …); fixed a double window-gauge update
+  per turn in the step loop.
+- Runners (`toroid-cli`, `toroid-repl`) default to
+  `llmgateway/claude-haiku-4-5` and authenticate with `LLM_GATEWAY_KEY` only.
+
+- **Fantasy removed; in-repo `llm` package is the only wire.** The
+  `charm.land/fantasy` dependency (and its provider zoo: Anthropic, Google,
+  OpenAI SDKs, AWS/Bedrock, genai, …) is gone. The new `llm/` package owns the
+  data model (`Message`/`Part`), the OpenAI-compatible chat-completions client
+  (LiteLLM gateway only: SSE streaming with usage-in-stream, tool calls,
+  multimodal content blocks, `x-litellm-response-cost` capture, traceparent /
+  session headers), tool abstraction (`ToolHandler`, reflection JSON-schema
+  generation), and JSON round-tripping for history persistence.
+  - The kernel-owned step loop (`steploop.go`) is now the only chat loop —
+    `Config.UseStepLoop` and `Config.Provider`/`PromptCache` are gone; caching
+    is gateway/upstream-managed.
+  - `FantasyStep` is replaced by `GatewayStep` over `llm.Client`; `FauxStep`
+    stays as the scripted test backend. Structured output (`WithSchema`, now
+    `toroid.Schema` = JSON-schema map + `toroid.GenerateSchema`) runs as a
+    forced tool call, which works across LiteLLM upstreams including
+    Bedrock-backed Anthropic.
+  - `Config.Thinking` maps to gateway `reasoning_effort` (low/high); reasoning
+    tokens are billed and split out in `Usage`.
+  - Tool results can carry media (`llm.ToolResult.Files`): the read tool
+    returns images/PDFs as content blocks a vision model can see.
+  - Defaults are gateway-first: `Model` defaults to
+    `llmgateway/claude-haiku-4-5`, `APIKey` falls back to `$LLM_GATEWAY_KEY`.
+
+### Added
+
 - **`Config.SmallerModel`.** Optional cheaper `provider/model` used for
   conversation compaction and subagents (sync + async). When set, the system
   prompt documents primary vs secondary model routing so the agent prefers

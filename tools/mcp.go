@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -121,6 +121,9 @@ func finishConnection(
 	return c, nil
 }
 
+// newMCPToolDef adapts one MCP tool into a ToolDef. An MCP tool's input schema
+// is discovered at runtime (from the server), not known as a Go type at compile
+// time, so it uses llm.RawTool with the server-provided schema.
 func newMCPToolDef(c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef {
 	name := t.Name
 	if serverName != "" {
@@ -135,63 +138,39 @@ func newMCPToolDef(c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef 
 	if required == nil {
 		required = []string{}
 	}
-
-	agentTool := &mcpAgentTool{
-		info: fantasy.ToolInfo{
-			Name:        name,
-			Description: t.Description,
-			Parameters:  properties,
-			Required:    required,
-		},
-		call: func(ctx context.Context, args map[string]any) (fantasy.ToolResponse, error) {
-			res, err := c.CallTool(ctx, mcp.CallToolRequest{
-				Params: mcp.CallToolParams{Name: t.Name, Arguments: args},
-			})
-			if err != nil {
-				return fantasy.NewTextErrorResponse(fmt.Sprintf("Error: %v", err)), nil
-			}
-			return mcpResultToResponse(res), nil
-		},
+	params := map[string]any{
+		"type":       "object",
+		"properties": properties,
+		"required":   required,
 	}
+
+	h := llm.RawTool(name, t.Description, params, func(ctx context.Context, argumentsJSON string) (llm.ToolResult, error) {
+		var args map[string]any
+		if argumentsJSON != "" {
+			if err := json.Unmarshal([]byte(argumentsJSON), &args); err != nil {
+				return llm.NewErrorResult(fmt.Sprintf("invalid parameters: %v", err)), nil
+			}
+		}
+		res, err := c.CallTool(ctx, mcp.CallToolRequest{
+			Params: mcp.CallToolParams{Name: t.Name, Arguments: args},
+		})
+		if err != nil {
+			return llm.NewErrorResult(fmt.Sprintf("Error: %v", err)), nil
+		}
+		return mcpResultToResult(res), nil
+	})
 
 	return &ToolDef{
 		Name:        name,
 		Description: t.Description,
-		AgentTool:   agentTool,
+		Handler:     h,
 	}
 }
 
-// mcpAgentTool adapts one MCP tool to fantasy.AgentTool. It's implemented by
-// hand rather than via fantasy.NewAgentTool because an MCP tool's input
-// schema is discovered at runtime (from the server), not known as a Go type
-// at compile time for reflection-based schema generation.
-type mcpAgentTool struct {
-	info            fantasy.ToolInfo
-	call            func(ctx context.Context, args map[string]any) (fantasy.ToolResponse, error)
-	providerOptions fantasy.ProviderOptions
-}
-
-func (t *mcpAgentTool) Info() fantasy.ToolInfo { return t.info }
-
-func (t *mcpAgentTool) Run(ctx context.Context, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
-	var args map[string]any
-	if call.Input != "" {
-		if err := json.Unmarshal([]byte(call.Input), &args); err != nil {
-			return fantasy.NewTextErrorResponse(fmt.Sprintf("invalid parameters: %v", err)), nil
-		}
-	}
-	return t.call(ctx, args)
-}
-
-func (t *mcpAgentTool) ProviderOptions() fantasy.ProviderOptions { return t.providerOptions }
-
-func (t *mcpAgentTool) SetProviderOptions(opts fantasy.ProviderOptions) { t.providerOptions = opts }
-
-// mcpResultToResponse flattens an MCP CallToolResult's text content into a
-// single tool response. Non-text content (images, embedded resources) is
-// dropped for now — toroid's tool response type doesn't yet support
-// multi-part media from an arbitrary MCP result.
-func mcpResultToResponse(res *mcp.CallToolResult) fantasy.ToolResponse {
+// mcpResultToResult flattens an MCP CallToolResult's text content into a
+// single tool result. Non-text content (images, embedded resources) is
+// dropped for now.
+func mcpResultToResult(res *mcp.CallToolResult) llm.ToolResult {
 	var sb strings.Builder
 	for _, c := range res.Content {
 		if tc, ok := c.(mcp.TextContent); ok {
@@ -201,5 +180,5 @@ func mcpResultToResponse(res *mcp.CallToolResult) fantasy.ToolResponse {
 			sb.WriteString(tc.Text)
 		}
 	}
-	return fantasy.ToolResponse{Type: "text", Content: TruncateToolOutput(sb.String()), IsError: res.IsError}
+	return llm.ToolResult{Content: TruncateToolOutput(sb.String()), IsError: res.IsError}
 }

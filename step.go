@@ -2,19 +2,16 @@ package toroid
 
 import (
 	"context"
+	"reflect"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
-// Step layer (Phase B). A Step performs exactly one LLM call — one product
-// "llm-step" (see assets/terminology.md). It never runs the tool loop: the
-// kernel owns turns, tools, compaction, and subagents and drives a Step once per
-// turn. This is the architectural split the port targets — a thin step API under
-// the existing chat loop — while Fantasy remains the first backend (FantasyStep).
-//
-// Only the OpenAI-compatible LiteLLM gateway is in scope; a Step implementation
-// is deliberately protocol-agnostic so a future openai-completions client
-// (Phase C) can replace FantasyStep without touching the kernel.
+// Step layer. A Step performs exactly one LLM call — one product "llm-step"
+// (see assets/terminology.md). It never runs the tool loop: the kernel owns
+// turns, tools, compaction, and subagents and drives a Step once per turn.
+// The production implementation is GatewayStep over the in-repo llm client;
+// FauxStep is the scripted in-memory backend for tests.
 
 // StopReason is the product-facing reason an llm-step ended. It normalizes the
 // backend's finish reason to a stable, small vocabulary.
@@ -27,16 +24,16 @@ const (
 	StopReasonOther   = "other"   // anything else (content filter, unknown)
 )
 
-// stopReasonFromFinish maps a Fantasy finish reason to a product StopReason.
-func stopReasonFromFinish(fr fantasy.FinishReason) string {
+// stopReasonFromFinish maps an llm finish reason to a product StopReason.
+func stopReasonFromFinish(fr llm.FinishReason) string {
 	switch fr {
-	case fantasy.FinishReasonStop:
+	case llm.FinishStop:
 		return StopReasonStop
-	case fantasy.FinishReasonToolCalls:
+	case llm.FinishToolCalls:
 		return StopReasonToolUse
-	case fantasy.FinishReasonLength:
+	case llm.FinishLength:
 		return StopReasonLength
-	case fantasy.FinishReasonError:
+	case llm.FinishError:
 		return StopReasonError
 	default:
 		// content-filter, other, unknown, and the empty reason all collapse here.
@@ -44,29 +41,40 @@ func stopReasonFromFinish(fr fantasy.FinishReason) string {
 	}
 }
 
-// Context is the caller-owned input to one llm-step (M3): a single system blob,
-// the message list (which must NOT duplicate the system prompt), and the tools
+// Schema is a JSON-Schema object (as a map) describing a structured-output
+// shape. Build one by hand or from a Go type via GenerateSchema.
+type Schema = map[string]any
+
+// GenerateSchema builds a Schema from a Go type's reflection info (json tags,
+// description tags). Convenience re-export of llm.GenerateSchema for hosts.
+func GenerateSchema(t reflect.Type) Schema { return llm.GenerateSchema(t) }
+
+// Context is the caller-owned input to one llm-step: a single system blob, the
+// message list (which must NOT duplicate the system prompt), and the tools
 // available for this call. Keeping system out of Messages preserves a stable
 // cache prefix and avoids double-billing the system text.
 type Context struct {
 	System   string
-	Messages []fantasy.Message
-	Tools    []fantasy.AgentTool
+	Messages []llm.Message
+	Tools    []llm.Tool
 }
 
 // AssistantMessage is the result of one non-streaming llm-step: the assistant
-// content, its billed Usage (tokens + Cost + PricingOK, M2), and why it stopped.
+// content, its Usage (tokens + gateway-reported cost), and why it stopped.
 type AssistantMessage struct {
-	Content    fantasy.ResponseContent
+	Content    []llm.Part
 	Usage      Usage
 	StopReason string
 }
 
 // Text returns the assistant text of the message.
-func (m *AssistantMessage) Text() string { return m.Content.Text() }
+func (m *AssistantMessage) Text() string { return llm.TextOf(m.Content) }
 
-// ObjectResult is the result of one structured-output llm-step (M7): the parsed
-// object, its raw JSON text, and billed Usage — so a schema pass is a first-class,
+// ToolCalls returns the tool calls in the message.
+func (m *AssistantMessage) ToolCalls() []llm.ToolCallPart { return llm.ToolCallsOf(m.Content) }
+
+// ObjectResult is the result of one structured-output llm-step: the parsed
+// object, its raw JSON text, and Usage — a schema pass is a first-class,
 // costed llm-step rather than an invisible extra call.
 type ObjectResult struct {
 	Object     any
@@ -75,28 +83,15 @@ type ObjectResult struct {
 	StopReason string
 }
 
-// PayloadDebug is a redaction-friendly view of an outbound llm-step request,
-// handed to StepOptions.OnPayload for inspection/logging (M10). It intentionally
-// omits raw provider bytes; it is enough to verify tools, schema, and the
-// single-system-prompt invariant on the wire.
-type PayloadDebug struct {
-	Model    string
-	Provider string
-	API      string
-	System   string
-	Messages []fantasy.Message
-	Tools    []string // tool names attached to the call
-	Schema   string   // schema name for object calls; "" otherwise
-	Stream   bool
-}
-
 // StepOptions carry per-call knobs shared by every Step method.
 type StepOptions struct {
 	MaxOutputTokens *int64
 	Thinking        Thinking
-	// OnPayload, when set, is invoked with a debug view of the request just
-	// before it is sent (M10). Best-effort and synchronous; keep it cheap.
-	OnPayload func(PayloadDebug)
+	// DisablePromptCache skips cache_control breakpoints for this call. Set on
+	// one-shot llm-steps (compaction, the schema pass): their tool set differs
+	// from the loop's, so the prefix cannot hit the loop's cache, and stamping
+	// breakpoints would pay the cache-write premium for a prefix never re-read.
+	DisablePromptCache bool
 }
 
 // StreamDelta is one incremental chunk of a streaming llm-step.
@@ -107,7 +102,7 @@ type StreamDelta struct {
 
 // StreamResult is a live streaming llm-step. Callers range over Deltas until it
 // closes, then call Final for the assembled AssistantMessage (partial content is
-// preserved when the context was cancelled mid-step, M11).
+// preserved when the context was cancelled mid-step).
 type StreamResult struct {
 	Deltas <-chan StreamDelta
 	// Final blocks until the stream is fully drained and returns the assembled
@@ -122,17 +117,5 @@ type Step interface {
 	// Stream runs one streaming llm-step, delivering deltas as they arrive.
 	Stream(ctx context.Context, model Model, c Context, opts StepOptions) (*StreamResult, error)
 	// CompleteObject runs one structured-output llm-step against a schema.
-	CompleteObject(ctx context.Context, model Model, c Context, schema fantasy.Schema, schemaName, schemaDescription string, opts StepOptions) (*ObjectResult, error)
-}
-
-// toolNames extracts the display names of a call's tools for PayloadDebug.
-func toolNames(tools []fantasy.AgentTool) []string {
-	if len(tools) == 0 {
-		return nil
-	}
-	names := make([]string, 0, len(tools))
-	for _, t := range tools {
-		names = append(names, t.Info().Name)
-	}
-	return names
+	CompleteObject(ctx context.Context, model Model, c Context, schema Schema, schemaName, schemaDescription string, opts StepOptions) (*ObjectResult, error)
 }

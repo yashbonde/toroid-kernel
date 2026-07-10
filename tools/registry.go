@@ -2,16 +2,15 @@ package tools
 
 import (
 	"context"
-	"fmt"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type ToolDef struct {
 	Name        string
 	Description string // short (discovery) — shown to LLM in tool schema
 	Template    string // name of the .tool.tmpl file (full documentation)
-	AgentTool   fantasy.AgentTool
+	Handler     llm.ToolHandler
 }
 
 type Agent interface {
@@ -42,6 +41,11 @@ func (r *Registry) Tools() map[string]*ToolDef {
 	return r.tools
 }
 
-func (r *Registry) Execute(ctx context.Context, name string, args any) (any, error) {
-	return nil, fmt.Errorf("direct execution not implemented for Fantasy tools")
+// Execute runs a registered tool by name with raw JSON arguments.
+func (r *Registry) Execute(ctx context.Context, name string, argumentsJSON string) (llm.ToolResult, error) {
+	t, ok := r.tools[name]
+	if !ok || t.Handler == nil {
+		return llm.NewErrorResult("tool not found: " + name), nil
+	}
+	return t.Handler.Run(ctx, argumentsJSON)
 }

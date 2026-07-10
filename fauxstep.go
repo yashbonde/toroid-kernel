@@ -2,39 +2,38 @@ package toroid
 
 import (
 	"context"
+	"strings"
 	"sync"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
-// FauxStep is an in-memory Step for tests: no network, no gateway (M12). It
-// replays scripted assistant messages in order and can report fake usage
-// (including cache tokens) so loop, cost, and abort behaviour can be exercised
-// deterministically. Each call to Complete/Stream/CompleteObject consumes the
-// next scripted reply.
+// FauxStep is an in-memory Step for tests: no network, no gateway. It replays
+// scripted assistant messages in order — each Complete/Stream/CompleteObject
+// call consumes the next scripted reply — so loop, cost, and abort behaviour
+// can be exercised deterministically.
 type FauxStep struct {
 	// Replies are returned in order, one per Complete/Stream call. When exhausted
 	// the last reply is repeated (so a stuck loop still terminates on StopReason).
 	Replies []FauxReply
 	// Object is returned by CompleteObject.
 	Object FauxObject
-	// OnPayload-style capture: every call appends its PayloadDebug here.
-	Payloads []PayloadDebug
 
 	mu   sync.Mutex
 	next int
 }
 
 // FauxReply scripts one assistant message plus its fake usage and stop reason.
+// Cost stands in for the gateway-reported per-call cost.
 type FauxReply struct {
 	Text       string
 	ToolCalls  []FauxToolCall // when set, the assistant content includes these tool calls
-	Usage      fantasy.Usage  // token counts; Cost is priced from the model like real usage
-	StopReason string         // defaults to StopReasonStop when empty
+	Usage      llm.Usage
+	Cost       float64
+	StopReason string // defaults by content: toolUse when ToolCalls set, else stop
 }
 
-// FauxToolCall scripts one tool call in a FauxReply, so the kernel-owned Step
-// loop can be tested end-to-end (LLM asks for a tool, kernel runs it).
+// FauxToolCall scripts one tool call in a FauxReply.
 type FauxToolCall struct {
 	ID    string
 	Name  string
@@ -45,7 +44,8 @@ type FauxToolCall struct {
 type FauxObject struct {
 	Object  any
 	RawText string
-	Usage   fantasy.Usage
+	Usage   llm.Usage
+	Cost    float64
 }
 
 var _ Step = (*FauxStep)(nil)
@@ -65,15 +65,24 @@ func (f *FauxStep) take() FauxReply {
 	return f.Replies[i]
 }
 
-func (f *FauxStep) record(p PayloadDebug) {
-	f.mu.Lock()
-	f.Payloads = append(f.Payloads, p)
-	f.mu.Unlock()
+func fauxUsage(wire llm.Usage, cost float64) Usage {
+	return Usage{
+		Input:      wire.Input,
+		Output:     wire.Output,
+		Reasoning:  wire.Reasoning,
+		CacheRead:  wire.CacheRead,
+		CacheWrite: wire.CacheWrite,
+		Cost:       cost,
+		PricingOK:  cost > 0,
+	}
 }
 
-func (f *FauxStep) assistant(model Model, r FauxReply) *AssistantMessage {
-	var u Usage
-	u.FromFantasyUsage(r.Usage, model.ID)
+// Complete returns the next scripted assistant message.
+func (f *FauxStep) Complete(ctx context.Context, model Model, c Context, opts StepOptions) (*AssistantMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r := f.take()
 	reason := r.StopReason
 	if reason == "" {
 		if len(r.ToolCalls) > 0 {
@@ -82,43 +91,19 @@ func (f *FauxStep) assistant(model Model, r FauxReply) *AssistantMessage {
 			reason = StopReasonStop
 		}
 	}
-	content := fantasy.ResponseContent{}
+	var content []llm.Part
 	if r.Text != "" {
-		content = append(content, fantasy.TextContent{Text: r.Text})
+		content = append(content, llm.TextPart{Text: r.Text})
 	}
 	for _, tc := range r.ToolCalls {
-		content = append(content, fantasy.ToolCallContent{
-			ToolCallID: tc.ID,
-			ToolName:   tc.Name,
-			Input:      tc.Input,
-		})
+		content = append(content, llm.ToolCallPart{ID: tc.ID, Name: tc.Name, Arguments: tc.Input})
 	}
-	return &AssistantMessage{
-		Content:    content,
-		Usage:      u,
-		StopReason: reason,
-	}
+	return &AssistantMessage{Content: content, Usage: fauxUsage(r.Usage, r.Cost), StopReason: reason}, nil
 }
 
-// Complete returns the next scripted assistant message.
-func (f *FauxStep) Complete(ctx context.Context, model Model, c Context, opts StepOptions) (*AssistantMessage, error) {
-	f.record(PayloadDebug{Model: model.ID, Provider: model.Provider, API: model.API, System: c.System, Messages: c.Messages, Tools: toolNames(c.Tools)})
-	if opts.OnPayload != nil {
-		firePayload(model, c, opts, "", false)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return f.assistant(model, f.take()), nil
-}
-
-// Stream streams the next scripted assistant message one rune-chunk at a time,
-// honouring cancellation (partial text + StopReasonAborted) for M11 tests.
+// Stream streams the next scripted assistant message one word-chunk at a time,
+// honouring cancellation (partial text + StopReasonAborted).
 func (f *FauxStep) Stream(ctx context.Context, model Model, c Context, opts StepOptions) (*StreamResult, error) {
-	f.record(PayloadDebug{Model: model.ID, Provider: model.Provider, API: model.API, System: c.System, Messages: c.Messages, Tools: toolNames(c.Tools), Stream: true})
-	if opts.OnPayload != nil {
-		firePayload(model, c, opts, "", true)
-	}
 	reply := f.take()
 
 	deltas := make(chan StreamDelta)
@@ -131,21 +116,22 @@ func (f *FauxStep) Stream(ctx context.Context, model Model, c Context, opts Step
 		defer close(deltas)
 		var sent string
 		aborted := false
-		// Emit the scripted text as whitespace-delimited word chunks so a test can
-		// cancel partway and observe partial content.
-		for _, word := range splitWords(reply.Text) {
+		// Emit the scripted text word by word so a test can cancel partway and
+		// observe partial content.
+		words := reply.Text
+		for len(words) > 0 && !aborted {
+			chunk := words
+			if i := strings.IndexByte(words, ' '); i >= 0 {
+				chunk = words[:i+1]
+			}
+			words = words[len(chunk):]
 			select {
 			case <-ctx.Done():
 				aborted = true
-			case deltas <- StreamDelta{Text: word}:
-				sent += word
-			}
-			if aborted {
-				break
+			case deltas <- StreamDelta{Text: chunk}:
+				sent += chunk
 			}
 		}
-		var u Usage
-		u.FromFantasyUsage(reply.Usage, model.ID)
 		reason := reply.StopReason
 		if reason == "" {
 			reason = StopReasonStop
@@ -155,8 +141,8 @@ func (f *FauxStep) Stream(ctx context.Context, model Model, c Context, opts Step
 			finalErr = ctx.Err()
 		}
 		final = AssistantMessage{
-			Content:    fantasy.ResponseContent{fantasy.TextContent{Text: sent}},
-			Usage:      u,
+			Content:    []llm.Part{llm.TextPart{Text: sent}},
+			Usage:      fauxUsage(reply.Usage, reply.Cost),
 			StopReason: reason,
 		}
 	}()
@@ -171,39 +157,14 @@ func (f *FauxStep) Stream(ctx context.Context, model Model, c Context, opts Step
 }
 
 // CompleteObject returns the scripted object result.
-func (f *FauxStep) CompleteObject(ctx context.Context, model Model, c Context, sch fantasy.Schema, schemaName, schemaDescription string, opts StepOptions) (*ObjectResult, error) {
-	f.record(PayloadDebug{Model: model.ID, Provider: model.Provider, API: model.API, System: c.System, Messages: c.Messages, Tools: toolNames(c.Tools), Schema: schemaName})
-	if opts.OnPayload != nil {
-		firePayload(model, c, opts, schemaName, false)
-	}
+func (f *FauxStep) CompleteObject(ctx context.Context, model Model, c Context, sch Schema, schemaName, schemaDescription string, opts StepOptions) (*ObjectResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	var u Usage
-	u.FromFantasyUsage(f.Object.Usage, model.ID)
 	return &ObjectResult{
 		Object:     f.Object.Object,
 		RawText:    f.Object.RawText,
-		Usage:      u,
+		Usage:      fauxUsage(f.Object.Usage, f.Object.Cost),
 		StopReason: StopReasonStop,
 	}, nil
-}
-
-// splitWords breaks text into space-preserving chunks for streaming emulation.
-func splitWords(s string) []string {
-	if s == "" {
-		return nil
-	}
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ' ' {
-			out = append(out, s[start:i+1]) // include the trailing space
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
 }

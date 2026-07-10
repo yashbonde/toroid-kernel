@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 // OTLP/HTTP JSON wire types — the minimal subset of the OpenTelemetry trace
@@ -116,26 +116,25 @@ type turnView struct {
 }
 
 // summarizeTurn pulls assistant text, reasoning, and tool calls out of the
-// serialized []fantasy.Message captured for an assistant turn.
+// serialized []llm.Message captured for an assistant turn.
 func summarizeTurn(raw json.RawMessage) turnView {
 	var tv turnView
-	var msgs []fantasy.Message
+	var msgs []llm.Message
 	if err := json.Unmarshal(raw, &msgs); err != nil {
 		return tv
 	}
 	for _, m := range msgs {
-		if m.Role != fantasy.MessageRoleAssistant {
+		if m.Role != llm.RoleAssistant {
 			continue
 		}
-		for _, part := range m.Content {
-			if tp, ok := fantasy.AsMessagePart[fantasy.TextPart](part); ok {
-				tv.Text += tp.Text
-			}
-			if rp, ok := fantasy.AsMessagePart[fantasy.ReasoningPart](part); ok {
-				tv.Reasoning += rp.Text
-			}
-			if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
-				tv.ToolCalls = append(tv.ToolCalls, map[string]any{"name": tc.ToolName, "input": tc.Input})
+		for _, part := range m.Parts {
+			switch p := part.(type) {
+			case llm.TextPart:
+				tv.Text += p.Text
+			case llm.ReasoningPart:
+				tv.Reasoning += p.Text
+			case llm.ToolCallPart:
+				tv.ToolCalls = append(tv.ToolCalls, map[string]any{"name": p.Name, "input": p.Arguments})
 			}
 		}
 	}

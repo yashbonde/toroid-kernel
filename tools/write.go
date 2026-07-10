@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type WriteArgs struct {
@@ -15,27 +15,27 @@ type WriteArgs struct {
 }
 
 func NewWriteTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("write", desc, func(ctx context.Context, args WriteArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("write", desc, func(ctx context.Context, args WriteArgs) (llm.ToolResult, error) {
 		path := args.Path
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(a.WorkDir(), path)
 		}
 
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return llm.NewTextResult(fmt.Sprintf("Error: %v", err)), nil
 		}
 
 		if err := os.WriteFile(path, []byte(args.Content), 0644); err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return llm.NewTextResult(fmt.Sprintf("Error: %v", err)), nil
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: "File written successfully."}, nil
+		return llm.NewTextResult("File written successfully."), nil
 	})
 
 	return &ToolDef{
 		Name:        "write",
 		Description: desc,
 		Template:    "write.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

@@ -2,7 +2,7 @@
 
 > An embeddable Go kernel for tool-using LLM agents.
 
-Source: [github.com/yashbonde/toroid-kernel](https://github.com/yashbonde/toroid-kernel) · ~3,200 LOC Go · built on [charm.land/fantasy](https://charm.land/fantasy) · reflects the code as of this update (2026-06-23).
+Source: [github.com/yashbonde/toroid-kernel](https://github.com/yashbonde/toroid-kernel) · ~3,200 LOC Go · self-contained (in-repo [llm](../llm) package; no third-party model SDK) · reflects the code as of this update (2026-06-23).
 
 > **What it is in one line.** A library — not a CLI or a TUI — that you `import` into a Go program to run a tool-calling agent loop with streaming, per-step cost accounting, resumable persistence, OpenTelemetry-native tracing, conversation compaction, loop guards, structured output, image input, synchronous *and* background subagents, and a built-in tool registry. The host program owns the UI and the lifecycle; the kernel owns the loop.
 
@@ -12,7 +12,7 @@ This explainer walks the system as built (§1–§12): construction and wiring, 
 
 ## 1. The big picture
 
-A host program constructs a `Kernel` from a `Config` and calls `Run` (buffered) or `Stream` (incremental). The kernel wires a *provider* (Google / Anthropic / OpenAI-compatible / LLM-gateway), a *tool registry*, an *event/hook bus*, and — when `Save` is set — a single embedded *SQLite store* that holds traces, spans, costs, events and memories (the todo table lives in the same database). The agent loop itself is delegated to Fantasy's `Agent.Stream`; the kernel sits around it, translating Fantasy callbacks into kernel *events* and managing history, cost, compaction, loop guards, and the message queue.
+A host program constructs a `Kernel` from a `Config` and calls `Run` (buffered) or `Stream` (incremental). The kernel wires a *provider* (Google / Anthropic / OpenAI-compatible / LLM-gateway), a *tool registry*, an *event/hook bus*, and — when `Save` is set — a single embedded *SQLite store* that holds traces, spans, costs, events and memories (the todo table lives in the same database). The agent loop is kernel-owned (steploop.go): each turn is one llm-step performed by the Step layer over the in-repo OpenAI-compatible gateway client, with the kernel executing tools between steps and managing history, cost, compaction, loop guards, and the message queue.
 
 ```mermaid
 flowchart TB
@@ -25,7 +25,7 @@ flowchart TB
     reg["tools.Registry"]
     queue["messageQueue"]
   end
-  fan["Fantasy Agent.Stream"]
+  fan["Step loop (steploop.go)"]
   prov["Provider<br/>google / anthropic / openai / llmgateway"]
   llm["LLM API"]
   sqlite[("SQLite store<br/>traces · spans · costs<br/>events · memories · todos")]
@@ -56,20 +56,20 @@ flowchart TB
 - **Tools** — when `IncludeComputerTools` is set, `NewKernel` registers the thirteen built-ins; their short descriptions are read from the second line of each `*.tool.tmpl` file. Host-supplied `Config.Tools` are merged in too.
 - **System prompt** — `system.tmpl` is rendered with `WorkDir` and `Date`.
 - **Provider + model** — resolved from the `provider/model` ID, then the `provider/` prefix is stripped before asking for the `LanguageModel`.
-- **Loop guards** — two Fantasy stop conditions are wired: `MaxIter` (default 50) caps the absolute number of tool-call steps via `StepCountIs`, and `MaxRepeatCalls` (default 3) trips a custom `repeatCallGuard` when consecutive steps issue identical tool calls with identical results. Both halt cleanly at a step boundary.
+- **Loop guards** — two kernel-owned guards are wired into the step loop: `MaxIter` (default 25) caps the absolute number of tool-call turns, and `MaxRepeatCalls` (default 3) trips when consecutive steps issue identical tool calls with identical results. Both halt cleanly at a step boundary.
 - **Thinking** — when `Thinking` is not `none`, a Google thinking-budget/level config is added (`low`≈1k, `high`≈8k tokens; gemini-3 uses thinking *levels*), and reasoning deltas can stream to `ThinkingWriter`.
-- **Agent options** — system prompt, tools, `MaxRetries(5)`, stop conditions, and the optional thinking config are assembled into `FantasyAgentOpts`, reused on every turn.
+- **Agent options** — system prompt, tools, and the optional thinking budget (gateway `reasoning_effort`) are applied per llm-step via `StepOptions`.
 
 ## 3. The turn: `Stream`
 
-[`Stream`](../kernel.go#L503) runs one user turn: it fires `SessionStart` on the first turn, auto-compacts if near the limit, appends the (image-aware) user message, prunes old tool calls past budget, and then hands off to [`streamCurrent`](../kernel.go#L690), which owns the agent loop. The real subtlety lives in `streamCurrent`'s **restart loop**: the kernel lets Fantasy stream to a natural stop, but if messages were enqueued *or* the context crossed the compaction threshold at a step boundary, it appends the collected steps, injects what is needed (queued messages, or a fresh compaction summary), and restarts the stream — this is how mid-run input and mid-turn context overflow are absorbed without corrupting history. The loop is serialized by `runMu` so `Stream` and `Wake` (§9) never mutate history concurrently.
+[`Stream`](../kernel.go#L503) runs one user turn: it fires `SessionStart` on the first turn, auto-compacts if near the limit, appends the (image-aware) user message, prunes old tool calls past budget, and then hands off to [`streamCurrent`](../kernel.go#L690), which owns the agent loop. Inside the loop, queued messages are injected and context pressure handled at each turn boundary: after a turn's tools run, the kernel drains the queue (appending queued user messages and continuing the same chat) or compacts when the window crosses the threshold — this is how mid-run input and mid-turn context overflow are absorbed without corrupting history. The loop is serialized by `runMu` so `Stream` and `Wake` (§9) never mutate history concurrently.
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant H as Host
   participant K as Kernel.Stream / streamCurrent
-  participant F as Fantasy Agent
+  participant F as Step loop
   participant L as LLM
   participant B as Hooks / Store
 
@@ -109,9 +109,9 @@ sequenceDiagram
 
 ### Per-step cost accounting
 
-On every `OnStepFinish` the step's Fantasy usage is converted to a `Usage` (with USD cost from [`pricing.go`](../pricing.go)), accumulated into `runningCostUSD`, appended to `StepUsage`, persisted via `AppendCost`, and emitted as an `EventTurnCost`. The same callback is the **safe interruption point** where the message queue is drained and context pressure is re-checked.
+After every llm-step the wire usage plus the gateway-reported dollar cost (`x-litellm-response-cost`, present on non-streaming responses) is converted to a `Usage`, accumulated into `runningCostUSD`, appended to `StepUsage`, persisted via `AppendCost`, and emitted as an `EventTurnCost`. The turn boundary after tool execution is the **safe interruption point** where the message queue is drained and context pressure is re-checked.
 
-`Usage` carries a `PricingOK` flag: when the model id has no row in `pricing.json`, `Cost` stays `0` **and** `PricingOK` is `false`, so a surface can show "pricing unavailable" rather than a misleading free `$0`. The pricing table is parsed once (cached), not per llm-step.
+`Usage` carries a `PricingOK` flag: it is `true` only when the gateway reported an authoritative cost for the call. There is no client-side pricing table — when the gateway does not report a cost, `Cost` stays `0` and `PricingOK` is `false`, so a surface can show "cost unknown" rather than a misleading free `$0`.
 
 ### Structured output
 
@@ -123,16 +123,16 @@ A **Step** performs exactly one LLM call — one product *llm-step* (see [termin
 
 | Type | Role |
 |------|------|
-| [`FantasyStep`](../fantasystep.go) | Default backend: maps one llm-step onto a single Fantasy `Generate`/`Stream`/`GenerateObject` call. Prices usage from the catalog; on non-stream calls prefers the gateway's `x-litellm-response-cost` over the local estimate. |
+| [`GatewayStep`](../gatewaystep.go) | Default backend: maps one llm-step onto a single OpenAI-compatible chat completion via the in-repo `llm.Client`. Prices usage from the catalog; on non-stream calls prefers the gateway's `x-litellm-response-cost` over the local estimate. |
 | [`FauxStep`](../fauxstep.go) | In-memory, network-free backend for tests: scripted assistant messages (incl. tool calls) and fake usage. |
 
-Today the Step layer backs the schema pass and compaction. The **preferred kernel-owned tool loop** ([`steploop.go`](../steploop.go)) drives each turn's LLM call through `Step.Complete` — executing tools in the kernel and preserving MaxIter, the repeat-call loop guard, queue interrupts, mid-turn compaction, tool events, and per-turn cost. It is opt-in via `Config.UseStepLoop`; the Fantasy `Agent.Stream` path remains the production default until validated against a live gateway.
+The Step layer backs every LLM call: the chat loop, the schema pass, and compaction. The **kernel-owned tool loop** ([`steploop.go`](../steploop.go)) drives each turn's LLM call through `Step.Complete` — executing tools in the kernel and preserving MaxIter, the repeat-call loop guard, queue interrupts, mid-turn compaction, tool events, and per-turn cost. It is the only chat loop; the former Fantasy `Agent.Stream` path is gone.
 
 The model catalog ([`model.go`](../model.go), `ResolveModel`) is the "model as data" row — id, provider, wire `api`, context window, per-token cost, reasoning, and input modalities (used by the multimodal path's vision check).
 
 ## 4. Tools and the registry
 
-Each tool is a `ToolDef` pairing a `fantasy.AgentTool` (the executable, schema-bearing function) with a `*.tool.tmpl` documentation file. The registry is a name-keyed map. The thirteen built-ins cover file/shell/search/planning/notification/delegation:
+Each tool is a `ToolDef` pairing an `llm.ToolHandler` (the executable, schema-bearing function) with a `*.tool.tmpl` documentation file. The registry is a name-keyed map. The thirteen built-ins cover file/shell/search/planning/notification/delegation:
 
 | Tool | Purpose | Notable behavior |
 |------|---------|------------------|
@@ -151,13 +151,13 @@ Each tool is a `ToolDef` pairing a `fantasy.AgentTool` (the executable, schema-b
 
 ### Image input
 
-User prompts go through [`parseUserMessage`](../multimodal.go#L22), which scans for markdown image refs `![alt](path)`, loads each readable model-supported media file as a `fantasy.FilePart`, and splices it into the user turn as text→image→text parts. The persisted form of the prompt rewrites the path to a `~`-rooted absolute path so a session resumed from any directory still resolves the same file. Unresolvable refs are left as literal text.
+User prompts go through [`parseUserMessage`](../multimodal.go#L22), which scans for markdown image refs `![alt](path)`, loads each readable model-supported media file as an `llm.FilePart`, and splices it into the user turn as text→image→text parts. The persisted form of the prompt rewrites the path to a `~`-rooted absolute path so a session resumed from any directory still resolves the same file. Unresolvable refs are left as literal text.
 
 ## 5. Providers
 
-[`NewProviderFromLLMId`](../provider.go) maps the prefix of a `provider/model` ID to a Fantasy provider. `google` (and the empty default) and `anthropic` use native providers; `openai` and `llmgateway` both use the OpenAI-compatible provider — the gateway variant just points it at a self-hosted base URL (e.g. a LiteLLM proxy) from `LLM_GATEWAY_BASE_URL` and authenticates with a bearer token. The **`llmgateway/*` (OpenAI-compatible LiteLLM) path is the supported target** for the LLM-step port; native prefixes remain but are not invested in.
+Every model is reached through one wire: the in-repo [`llm.Client`](../llm/client.go), an OpenAI-compatible chat-completions client pointed at the LiteLLM gateway (`LLM_GATEWAY_BASE_URL`, bearer token from `Config.APIKey` / `LLM_GATEWAY_KEY`). Model ids of the form `llmgateway/<name>` have the prefix stripped on the wire; other ids pass through verbatim for the gateway to route. There are no native provider SDKs in the module.
 
-The gateway transport ([`traceTransport`](../provider.go)) stamps a per-chat `traceparent` + `x-litellm-session-id` so a chat's turns nest under one upstream trace, and captures `x-litellm-response-cost` on non-streaming responses into a context-carried sink ([`costcapture.go`](../costcapture.go)) so those llm-steps can bill the gateway's authoritative cost. Streaming responses omit that header by design and stay on the local estimate.
+The client stamps a per-chat `traceparent` + `x-litellm-session-id` on every request (trace id carried in the context via `WithGatewayTrace`) so a chat's turns nest under one upstream trace, and reads `x-litellm-response-cost` from non-streaming responses so every llm-step bills the gateway's authoritative cost. Streaming responses omit that header by design; their `Usage` carries tokens only. Transient failures (network, 429, 5xx) retry up to three times with backoff.
 
 ## 6. Persistence: one SQLite store
 
@@ -282,7 +282,7 @@ flowchart LR
   nk --> ready["Kernel ready"]
   ready -->|"Run / Stream"| turn["Turn"]
   turn --> compact["maybe compact + prune"]
-  compact --> agent["Fantasy agent loop"]
+  compact --> agent["Step loop"]
   agent --> tools["tool calls"]
   tools --> agent
   agent --> events["events + cost"]
@@ -372,13 +372,13 @@ This is the SDK's most load-bearing missing contract: an embeddable kernel must 
 - [`provider.go`](../provider.go) — provider resolution + gateway transport (trace headers, cost-header capture)
 - [`multimodal.go`](../multimodal.go) — inline-image handling in user prompts (size cap + vision-capability gate)
 - [`utils.go`](../utils.go) — Snowflake IDs and OTEL ID derivation
-- [`pricing.go`](../pricing.go) — per-model USD cost accounting + `PricingOK` honesty
+- [`usage.go`](../usage.go) — `Usage`: tokens + gateway-reported cost (`PricingOK` honesty)
 - [`model.go`](../model.go) — model catalog (`ResolveModel`): cost + context window + modalities
 - [`step.go`](../step.go) — the Step interface (one llm-step): `Complete` / `Stream` / `CompleteObject`
-- [`fantasystep.go`](../fantasystep.go) — default Step backend over a Fantasy `LanguageModel`
+- [`gatewaystep.go`](../gatewaystep.go) — default Step backend over the in-repo `llm.Client`
 - [`fauxstep.go`](../fauxstep.go) — in-memory, network-free Step for tests
 - [`steploop.go`](../steploop.go) — opt-in kernel-owned tool loop over the Step layer
-- [`costcapture.go`](../costcapture.go) — gateway `x-litellm-response-cost` capture (non-stream)
+- [`gateway.go`](../gateway.go) — gateway env vars + per-chat trace context
 - [`handoff.go`](../handoff.go) — cross-model handoff transform (`TransformForHandoff`)
 - [`history.go`](../history.go) — history reconstruction helpers
 - [`tools/`](../tools) — built-in tool implementations

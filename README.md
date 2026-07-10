@@ -1,24 +1,51 @@
 # toroid-kernel
 
-`toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, model-cost accounting, and a built-in tool registry.
+`toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, gateway-truth cost accounting, and a built-in tool registry.
+
+**~6,250 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
+
+**Runner binaries** (built with `-trimpath -ldflags="-s -w"`; linux is amd64):
+
+| runner | macOS (arm64) | Linux (amd64) | Linux + upx |
+|---|---|---|---|
+| `examples/toroid-cli` | 13.3 MB | 13.6 MB | 4.4 MB |
+| `examples/toroid-repl` | 13.3 MB | 13.7 MB | 4.2 MB |
 
 ## Features
 
-- Agent kernel built on `charm.land/fantasy`
-- Provider selection from `provider/model` IDs
-- Single-file SQLite persistence (traces, costs, events, todos) with OpenTelemetry-compatible trace/span IDs
-- Conversation compaction and history reconstruction
-- Built-in filesystem, shell, search, notification, and subagent tools
+- Self-contained LLM layer (in-repo `llm/` package) speaking OpenAI-compatible chat completions to a [LiteLLM](https://github.com/BerriAI/litellm) gateway — SSE streaming, tool calls, multimodal content blocks, retries on 429/5xx
+- Kernel-owned tool loop: one llm-step per turn via the `Step` interface
+- **Gateway-truth cost**: every non-streaming llm-step carries the gateway's authoritative `x-litellm-response-cost`; there is no local pricing table to drift out of date. `Usage.PricingOK` is true only when the gateway reported a cost
+- Structured output (`WithSchema`) as a forced tool call — works across upstreams, including Bedrock-backed Anthropic
+- Multimodal input: images and PDFs inline in prompts (`![](path)`, 5 MiB cap, capability-gated per model) and as tool-result media (the `read` tool returns images a vision model can see)
+- Single-file SQLite persistence (traces, costs, events, todos) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
+- Conversation compaction, tool-output pruning, loop guards (MaxIter + repeat-call), and history reconstruction for resume
+- Built-in filesystem, shell, search, notification, and subagent tools; MCP client for remote tool servers
 - Background agents — async subagents that wake an idle kernel on completion
-- Platform-agnostic, pluggable notifications
+
+## Verified models
+
+Live-verified (tool loop, structured output, SSE streaming, billed cost, OTEL
+store round-trip, plus image and PDF input where the model supports vision):
+
+| model | tools | schema | stream | cost | image input | document (PDF) input |
+|---|---|---|---|---|---|---|
+| `llmgateway/claude-haiku-4-5` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `llmgateway/gpt-5.4-mini` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `llmgateway/kimi-k2p6` | ✅ | ✅ | ✅ | ✅ | n/a (text-only) | n/a |
+| `llmgateway/glm-5p1` | ✅ | ✅ | ✅ | ✅ | n/a (text-only) | n/a |
+| `llmgateway/minimax-m2p7` | ✅ | ✅ | ✅ | ✅ | n/a (text-only) | n/a |
+| `openai/gpt-5.4-mini` | ✅ | ✅ | ✅ | ✅ (cached rates) | ✅ | ✅ |
+| `anthropic/claude-haiku-4-5` | ✅ | ✅ | ✅ | ✅ (cached rates) | ✅ | ✅ |
+
+Text-only models never receive media: an inline `![](path)` ref is left as text
+and a warning is surfaced, so nothing is silently dropped or paid for.
 
 ## Architecture
 
-For a deep dive into how the kernel is wired — construction, the turn loop,
-tools, the single SQLite store, OTEL-native telemetry, context management,
-sub/background agents, and the roadmap — see the
-[architecture explainer](assets/ARCHITECTURE.md). It links directly to the
-relevant source files.
+Host → Kernel (turns, tools, compaction, events, store) → `Step` (one LLM call = one llm-step) → `llm.Client` (OpenAI-compatible wire to the gateway).
+
+For the deep dive — construction, the turn loop, tools, the SQLite store, OTEL telemetry, context management, sub/background agents — see the [architecture explainer](assets/ARCHITECTURE.md).
 
 ## Install
 
@@ -27,6 +54,30 @@ go get github.com/yashbonde/toroid-kernel
 ```
 
 Requires Go `1.26.4` or newer.
+
+## Providers
+
+The model id prefix picks the provider; the key comes from that provider's env var:
+
+| prefix | wire | key env | cost source |
+|---|---|---|---|
+| `llmgateway/<name>` (default) | OpenAI-compatible chat completions to a LiteLLM gateway (`LLM_GATEWAY_BASE_URL`, including `/v1`) | `LLM_GATEWAY_KEY` | gateway `x-litellm-response-cost` header (authoritative) |
+| `openai/<name>` | OpenAI API direct (same wire) | `OPENAI_API_KEY` | cached in-code rates (`Model.Price`) |
+| `anthropic/<name>` | **native Anthropic messages API** (`/v1/messages`) | `ANTHROPIC_API_KEY` | cached in-code rates (`Model.Price`) |
+
+Neither OpenAI nor Anthropic expose pricing via API, so per-token rates for
+their families are cached in the kernel code and used whenever the gateway
+cost header is absent. Unknown families stay honestly unpriced
+(`Usage.PricingOK == false`, warning logged) — never assumed free.
+
+The Anthropic route implements Anthropic's explicit prompt caching (they have
+no automatic caching): `cache_control` breakpoints on the system prompt and
+the last user message every loop step. Brutally verified live on
+`anthropic/claude-haiku-4-5`: turn 2 wrote 6,643 tokens to cache, turn 3 read
+them back, and a follow-up `Run` on the same kernel read 11,837 cached tokens
+with only 3 fresh input tokens. Tool loop, structured output (native forced
+tool), SSE streaming, mid-stream abort (partial kept), thinking
+(`budget_tokens`), image, and PDF input all pass on the native wire.
 
 ## Quick Start
 
@@ -45,8 +96,8 @@ func main() {
 	ctx := context.Background()
 
 	kernel, err := toroid.NewKernel(ctx, toroid.Config{
-		Model:   "google/gemini-3-flash-preview",
-		APIKey:  os.Getenv("GEMINI_TOKEN"),
+		Model:   "llmgateway/claude-haiku-4-5",
+		APIKey:  os.Getenv("LLM_GATEWAY_KEY"),
 		WorkDir: ".",
 		Save:    true,
 	})
@@ -55,100 +106,74 @@ func main() {
 	}
 	defer kernel.Close()
 
-	out, usage, err := kernel.Run(ctx, "Summarize the repository and point out release blockers.")
+	out, _, err := kernel.Run(ctx, "Summarize the repository and point out release blockers.")
 	if err != nil {
 		panic(err)
 	}
 
 	fmt.Println(out)
-	fmt.Printf("usage sessions: %d\n", len(usage.Tokens))
+	fmt.Printf("cost: $%.6f\n", kernel.RunningCostUSD())
 }
+```
+
+## Runners
+
+The two production runners live in `examples/`:
+
+- **`toroid-cli`** — one-shot: drive the kernel from the command line, emitting every kernel event as NDJSON on stdout (the bridge for hosts in other languages; `-plain` prints just the final answer).
+- **`toroid-repl`** — interactive terminal chat with live tool-call display, cost footer, `/cost`, `/model`, `/reset`.
+
+```bash
+export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
+export LLM_GATEWAY_KEY=sk-...
+
+go run ./examples/toroid-cli -plain 'what files are in this directory?'
+go run ./examples/toroid-repl
 ```
 
 ## Examples
 
 The [`examples/`](examples/) directory has small, focused, runnable programs —
-one per usage pattern (running blocking/streaming, delegation to subagents and
-background agents with OpenTelemetry export, and events/notifications). Start with
-[`examples/README.md`](examples/README.md), which indexes every pattern and the
-APIs it uses.
+one per usage pattern. Start with [`examples/README.md`](examples/README.md).
 
 > **If you are an AI agent**, read [`examples/README.md`](examples/README.md)
 > and the per-directory `main.go` files first — they are the canonical,
 > up-to-date reference for how to use this library.
 
 ```bash
-export ANTHROPIC_API_KEY=your_api_key
-go run ./examples/running      # blocking Run + token streaming
-go run ./examples/delegation   # subagents, background agents, OpenTelemetry export
-go run ./examples/events       # lifecycle observability + notification sinks
+go run ./examples/running                 # blocking Run + streaming + multimodal + structured output
+go run ./examples/structured-after-tools  # tool calls, then schema-coerced JSON
+go run ./examples/guardrails              # loop guards, no network needed (scripted FauxStep)
+go run ./examples/delegation              # subagents, background agents
+go run ./examples/events                  # lifecycle observability + notification sinks
+go run ./examples/langfuse                # push a persisted trace to Langfuse over OTLP
 ```
 
-## Provider Examples
+## Cost accounting
 
-`toroid` currently supports `google`, `anthropic`, `openai`, and `llmgateway` model prefixes.
+The kernel's turn loop is non-streaming per llm-step, so every step gets the
+gateway's `x-litellm-response-cost` header — the number LiteLLM actually bills.
+Per-step costs land in `EventTurnCost`, roll up into `RunningCostUSD()`
+(subagent spend included), and persist to SQLite with the trace. There is no
+client-side price table; if the gateway does not report a cost
+(`Usage.PricingOK == false`), the cost is *unknown*, never assumed free, and a
+warning is logged.
 
-### Google
-
-```go
-kernel, err := toroid.NewKernel(ctx, toroid.Config{
-	Model:   "google/gemini-3-flash-preview",
-	APIKey:  os.Getenv("GEMINI_TOKEN"),
-	WorkDir: ".",
-})
-```
-
-### Anthropic
-
-```go
-kernel, err := toroid.NewKernel(ctx, toroid.Config{
-	Model:   "anthropic/claude-sonnet-4-5",
-	APIKey:  os.Getenv("ANTHROPIC_API_KEY"),
-	WorkDir: ".",
-})
-```
-
-### OpenAI
-
-```go
-kernel, err := toroid.NewKernel(ctx, toroid.Config{
-	Model:   "openai/gpt-5",
-	APIKey:  os.Getenv("OPENAI_API_KEY"),
-	WorkDir: ".",
-})
-```
-
-### LLM Gateway
-
-Use the `llmgateway` prefix to talk to any OpenAI-compatible gateway (for
-example a self-hosted [LiteLLM](https://github.com/BerriAI/litellm) proxy that
-fronts many model families behind a single bearer-authenticated endpoint). The
-gateway speaks the OpenAI `/v1/chat/completions` protocol, including streaming
-and tool calls, so the full agentic loop works unchanged.
-
-Set `LLM_GATEWAY_BASE_URL` to the gateway's OpenAI-compatible base, including
-the `/v1` segment. The model name after the prefix is whatever the gateway routes — e.g. `claude-sonnet-4-6`,
-`gpt-5.4-mini`, `kimi-k2p6`.
-
-```go
-// export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
-kernel, err := toroid.NewKernel(ctx, toroid.Config{
-	Model:   "llmgateway/claude-sonnet-4-6",
-	APIKey:  os.Getenv("LLM_GATEWAY_KEY"),
-	WorkDir: ".",
-})
-```
-
-Each provider uses the same `toroid.Config` shape. The only required changes are the `Model` prefix and the API key you pass in.
+Prompt caching: Claude-family models get `cache_control` breakpoints (system +
+last user/tool message) on every loop step, so each turn re-reads the prior
+conversation at cache-read price. History is never mutated mid-chat (that would
+bust the cache prefix); trimming happens only at compaction. The full token/cost
+audit and its resolutions live in
+[assets/adversarial-cost-review.md](assets/adversarial-cost-review.md).
 
 ## Persistence & telemetry
 
 When `Save: true`, traces, spans, costs, events, and todos are written to a
 single SQLite database at `~/.toroid/sql.db`. Span IDs are time-ordered
 [Snowflake](https://en.wikipedia.org/wiki/Snowflake_ID) IDs and the
-trace/span/parent graph maps directly onto OpenTelemetry — `toroid.OTELSpans(traceID)`
-returns spec-valid OTEL-shaped spans you can feed to any OTLP exporter. Call
-`kernel.Close()` when done to checkpoint the store.
+trace/span/parent graph maps directly onto OpenTelemetry —
+`toroid.LangfuseOTLP(ctx, traceID, …)` projects a stored trace into OTLP spans
+and pushes it to Langfuse. Call `kernel.Close()` when done to checkpoint the store.
 
 ## Background agents
 
@@ -168,19 +193,12 @@ additional sinks (webhook, Slack, a peer kernel) with `tools.RegisterNotifySink`
 When `Config.LoadSkills` is unset or `true` (the default), the kernel scans
 `~/.toroid/skills/*.md` at startup and reads only each file's frontmatter
 (`name` + `description`) into the system prompt — the full body is not loaded.
-The kernel registers a `skill` tool that takes a file path and returns that
-file's full contents; the model calls it once a listed skill looks relevant,
-or a user can just name a skill file directly in their prompt and the model
-will load it the same way. This keeps the token cost proportional to how many
-skills are actually used, not how many exist on disk. Set `LoadSkills` to
-`false` to disable scanning and skip registering the tool entirely.
+The kernel registers a `skill` tool that loads a skill's full contents on
+demand, so token cost is proportional to the skills actually used, not how many
+exist on disk. Set `LoadSkills` to `false` to disable.
 
 ## Release Notes
 
 - The module path is `github.com/yashbonde/toroid-kernel`.
-- Embedded prompts live in `prompts/` and pricing assets live in `assets/`.
+- Embedded prompts live in `prompts/`.
 - Runtime state is stored under `~/.toroid/` (single SQLite DB at `sql.db`).
-
-## Status
-
-This repository currently ships as a library package. A license file is not included yet, so choose and add one before publishing a public release.

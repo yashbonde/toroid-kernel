@@ -73,7 +73,7 @@ You are measuring harness cost. Complete this checklist with tools (no subagents
 
 1. Use ls on the tools/ directory.
 2. Use grep to search the repo for the pattern "EventTurnCost" (path .).
-3. Use grep to search for the pattern "charm.land/fantasy" under tools/ and kernel.go if needed.
+3. Use grep to search for the pattern "toroid-kernel/llm" under tools/ and kernel.go if needed.
 4. Use glob for "**/*.go" under tools/ (or find Go files there).
 5. Read the first ~80 lines of kernel.go.
 6. Reply with a short bullet list: how many tool steps you took, one sentence on what EventTurnCost is, and the names of 3 tools you used.

@@ -2,15 +2,10 @@ package toroid
 
 import "strings"
 
-// Model as data (M1). A catalog row describing one runnable model: how to reach
-// it (provider + wire api), its limits (context window, input modalities), and
-// its cost. This is the "model as data" contract the LLM-step layer will consume
-// so cost and capability decisions are made from a table, never guessed inline.
-//
-// Only the OpenAI-compatible LiteLLM gateway ("llmgateway/*", api
-// "openai-completions") is in scope for this port; native Anthropic/Google/
-// OpenAI rows may resolve but are not a supported target here. See
-// assets/llm-step-port-scope.md.
+// Model is a catalog row describing one runnable model: how to reach it
+// (provider + wire api) and its capabilities (context window, input
+// modalities, reasoning). Dollar cost is NOT part of the catalog — the gateway
+// reports authoritative cost per call (see Usage).
 type Model struct {
 	// ID is the full model id as the host uses it, e.g. "llmgateway/kimi-k2p6".
 	ID string
@@ -20,17 +15,31 @@ type Model struct {
 	API string
 	// ContextWindow is the model's max context in tokens, or 0 when unknown.
 	ContextWindow int
-	// Cost holds per-token USD rates. Meaningful only when PricingOK is true.
-	Cost ModelPricing
-	// PricingOK reports whether Cost came from a real pricing.json row. When
-	// false the model is absent from the table and Cost must be treated as
-	// "unavailable", never as free. Mirrors Usage.PricingOK (M2).
-	PricingOK bool
 	// Reasoning reports whether the model emits (and bills) reasoning tokens.
 	Reasoning bool
+	// PromptCache reports whether the model needs explicit cache_control
+	// breakpoints to cache the prompt prefix (Anthropic-style opt-in caching).
+	// OpenAI-family routes auto-cache and stay false.
+	PromptCache bool
+	// Price holds fallback per-token USD rates for when the gateway does not
+	// report an authoritative cost (direct provider routes, streaming). Nil when
+	// the family is unknown — cost then stays honestly unknown.
+	Price *ModelPrice
 	// Input lists supported input modalities, e.g. ["text"] or ["text","image"].
 	Input []string
 }
+
+// versionDotReplacer normalizes dash-separated version suffixes in model IDs
+// to the dotted form used in the metadata tables (e.g. "claude-sonnet-4-6" ->
+// "claude-sonnet-4.6"). Intentionally conservative — only literal
+// single-digit/single-digit pairs are rewritten, so param-size suffixes like
+// "gemma-4-26b" are left untouched.
+var versionDotReplacer = strings.NewReplacer(
+	"-4-8", "-4.8", "-4-7", "-4.7", "-4-6", "-4.6", "-4-5", "-4.5", "-4-1", "-4.1",
+	"-3-5", "-3.5", "-3-1", "-3.1",
+	"-2-5", "-2.5", "-2-0", "-2.0",
+	"-5-5", "-5.5", "-5-4", "-5.4", "-5-3", "-5.3", "-5-2", "-5.2", "-5-1", "-5.1",
+)
 
 // Wire API identifiers.
 const (
@@ -45,14 +54,26 @@ const (
 	InputImage = "image"
 )
 
-// modelMeta carries the non-pricing facts about a model that pricing.json does
-// not encode (context window, vision, reasoning). It is intentionally small and
-// explicit: we seed only what we can state truthfully and default the rest,
-// rather than guessing capabilities from the name.
+// ModelPrice is USD per token for one model family. Used ONLY as a fallback
+// when the gateway does not report an authoritative per-call cost (direct
+// openai/ and anthropic/ routes, and streaming). Rates are cached in code
+// because neither provider exposes pricing via API.
+type ModelPrice struct {
+	In         float64
+	Out        float64
+	CacheRead  float64
+	CacheWrite float64
+}
+
+// modelMeta carries the facts about a model that no API exposes: context
+// window, modalities, cache behaviour, and fallback token rates. Intentionally
+// small and explicit — we seed only what we can state truthfully.
 type modelMeta struct {
 	contextWindow int
 	vision        bool
 	reasoning     bool
+	promptCache   bool // needs explicit cache_control breakpoints (Anthropic-style)
+	price         *ModelPrice
 }
 
 // modelMetaTable maps a normalized (provider-stripped, dotted) model name to its
@@ -79,12 +100,25 @@ var modelMetaFamilies = []struct {
 	prefix string
 	meta   modelMeta
 }{
-	// Anthropic Claude (200K context, vision).
-	{"claude-opus", modelMeta{contextWindow: 200_000, vision: true}},
-	{"claude-sonnet", modelMeta{contextWindow: 200_000, vision: true}},
-	{"claude-haiku", modelMeta{contextWindow: 200_000, vision: true}},
-	// OpenAI GPT-5 family (400K context, vision).
-	{"gpt-5", modelMeta{contextWindow: 400_000, vision: true}},
+	// Anthropic Claude (200K context, vision). Rates: published per-MTok prices;
+	// cache read = 0.1x input, cache write = 1.25x input.
+	{"claude-opus", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
+		price: &ModelPrice{In: 5e-06, Out: 2.5e-05, CacheRead: 5e-07, CacheWrite: 6.25e-06}}},
+	{"claude-sonnet", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
+		price: &ModelPrice{In: 3e-06, Out: 1.5e-05, CacheRead: 3e-07, CacheWrite: 3.75e-06}}},
+	{"claude-haiku", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
+		price: &ModelPrice{In: 1e-06, Out: 5e-06, CacheRead: 1e-07, CacheWrite: 1.25e-06}}},
+	// OpenAI GPT-5 family (400K context, vision). Most-specific prefix first.
+	{"gpt-5.4-nano", modelMeta{contextWindow: 400_000, vision: true,
+		price: &ModelPrice{In: 2e-07, Out: 1.25e-06, CacheRead: 2e-08}}},
+	{"gpt-5.4-mini", modelMeta{contextWindow: 400_000, vision: true,
+		price: &ModelPrice{In: 7.5e-07, Out: 4.5e-06, CacheRead: 7.5e-08}}},
+	{"gpt-5.4-pro", modelMeta{contextWindow: 400_000, vision: true,
+		price: &ModelPrice{In: 3e-05, Out: 1.8e-04}}},
+	{"gpt-5.4", modelMeta{contextWindow: 400_000, vision: true,
+		price: &ModelPrice{In: 2.5e-06, Out: 1.5e-05, CacheRead: 2.5e-07}}},
+	{"gpt-5", modelMeta{contextWindow: 400_000, vision: true,
+		price: &ModelPrice{In: 1.25e-06, Out: 1e-05, CacheRead: 1.25e-07}}},
 	{"gpt-4.1", modelMeta{contextWindow: 1_000_000, vision: true}},
 	{"gpt-4o", modelMeta{contextWindow: 128_000, vision: true}},
 	// OpenAI reasoning models (o-series): large context, vision, reasoning.
@@ -101,6 +135,7 @@ var modelMetaFamilies = []struct {
 	{"glm", modelMeta{contextWindow: 200_000}},
 	{"deepseek", modelMeta{contextWindow: 128_000, reasoning: true}},
 	{"qwen", modelMeta{contextWindow: 128_000}},
+	{"minimax", modelMeta{contextWindow: 200_000, reasoning: true}},
 }
 
 // lookupModelMeta resolves metadata for a normalized name: an exact override
@@ -145,10 +180,9 @@ func apiForProvider(provider string) string {
 	}
 }
 
-// ResolveModel builds a Model catalog row for a model id, merging pricing.json
-// rates (M2 honesty preserved via PricingOK) with known capability metadata.
-// It never errors: an unpriced or unknown model still yields a usable row with
-// PricingOK=false and conservative text-only defaults.
+// ResolveModel builds a Model catalog row for a model id from the capability
+// metadata tables. It never errors: an unknown model yields a usable row with
+// conservative text-only defaults.
 func ResolveModel(id string) Model {
 	provider, _, _ := strings.Cut(id, "/")
 	if !strings.Contains(id, "/") {
@@ -162,15 +196,6 @@ func ResolveModel(id string) Model {
 		Input:    []string{InputText},
 	}
 
-	if pricing, err := GetModelPricing(id); err == nil {
-		m.Cost = pricing
-		m.PricingOK = true
-		// A non-zero reasoning rate means the model bills reasoning tokens.
-		if pricing.Reasoning > 0 {
-			m.Reasoning = true
-		}
-	}
-
 	if meta, ok := lookupModelMeta(normalizeModelName(id)); ok {
 		m.ContextWindow = meta.contextWindow
 		if meta.vision {
@@ -179,6 +204,8 @@ func ResolveModel(id string) Model {
 		if meta.reasoning {
 			m.Reasoning = true
 		}
+		m.PromptCache = meta.promptCache
+		m.Price = meta.price
 	}
 
 	return m

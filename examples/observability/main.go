@@ -23,7 +23,7 @@ import (
 	"runtime"
 	"time"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 	toroid "github.com/yashbonde/toroid-kernel"
 )
 
@@ -72,16 +72,16 @@ func main() {
 	ev := func(span string, seq uint64, ts int64, kind toroid.EventKind, payload any) {
 		must(st.AppendEvent(trace, span, toroid.Event{Kind: kind, TraceID: trace, SpanID: span, EmitTS: ts, Seq: seq, Payload: payload}))
 	}
-	assistant := func(text, reasoning string, calls ...fantasy.ToolCallPart) toroid.AssistantTurnPayload {
-		content := []fantasy.MessagePart{}
+	assistant := func(text, reasoning string, calls ...llm.ToolCallPart) toroid.AssistantTurnPayload {
+		content := []llm.Part{}
 		if reasoning != "" {
-			content = append(content, fantasy.ReasoningPart{Text: reasoning})
+			content = append(content, llm.ReasoningPart{Text: reasoning})
 		}
-		content = append(content, fantasy.TextPart{Text: text})
+		content = append(content, llm.TextPart{Text: text})
 		for _, c := range calls {
 			content = append(content, c)
 		}
-		b, _ := json.Marshal([]fantasy.Message{{Role: fantasy.MessageRoleAssistant, Content: content}})
+		b, _ := json.Marshal([]llm.Message{{Role: llm.RoleAssistant, Parts: content}})
 		return toroid.AssistantTurnPayload{Messages: b}
 	}
 
@@ -97,7 +97,7 @@ func main() {
 	ev(trace, 7, now+1850*ms, toroid.EventAssistantTurn, assistant(
 		"Found the duplication; fixing it, then delegating the test run.",
 		"wrapInLogWidth and PrettyPrintHistory both re-pad — they can share one indent helper.",
-		fantasy.ToolCallPart{ToolCallID: "c3", ToolName: "subagent_async", Input: `{"task":"run the test suite and report failures"}`},
+		llm.ToolCallPart{ID: "c3", Name: "subagent_async", Arguments: `{"task":"run the test suite and report failures"}`},
 	))
 	ev(trace, 8, now+2900*ms, toroid.EventSubagentStart, toroid.SubagentPayload{SessionID: sub, Prompt: "run the test suite and report failures"})
 

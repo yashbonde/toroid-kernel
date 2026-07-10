@@ -165,7 +165,7 @@ llm-step.cost    = CalculateCost(usage) or gateway header when available
 | turn | Tool name(s), tool latency, step $ |
 | llm-step | Model id, usage breakdown, cache hit, `litellm_request` / call id |
 
-See also [standard_pricing.md](./standard_pricing.md) for how dollars are
+See also the README's "Cost accounting" section for how dollars are
 estimated per llm-step.
 
 ---

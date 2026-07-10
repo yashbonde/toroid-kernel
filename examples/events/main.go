@@ -11,7 +11,7 @@
 // your own sink to route notifications to a webhook, Slack, or a peer kernel —
 // the tool itself stays platform-agnostic.
 //
-//	export ANTHROPIC_API_KEY=your_api_key
+//	export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
 //	go run ./examples/events
 package main
 
@@ -29,11 +29,7 @@ func main() {
 	apiKey := os.Getenv("LLM_GATEWAY_KEY")
 	model := "llmgateway/claude-haiku-4-5"
 	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-		model = "anthropic/claude-haiku-4-5"
-	}
-	if apiKey == "" {
-		fmt.Println("set LLM_GATEWAY_KEY or ANTHROPIC_API_KEY to run this example")
+		fmt.Println("set LLM_GATEWAY_KEY to run this example")
 		return
 	}
 	// Allow overriding the model via env to run the example across providers.

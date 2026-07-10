@@ -4,7 +4,7 @@ import (
 	"context"
 	"os/exec"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type BashArgs struct {
@@ -12,21 +12,21 @@ type BashArgs struct {
 }
 
 func NewBashTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("bash", desc, func(ctx context.Context, args BashArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("bash", desc, func(ctx context.Context, args BashArgs) (llm.ToolResult, error) {
 		cmd := exec.CommandContext(ctx, "bash", "-c", args.Command)
 		cmd.Dir = a.WorkDir()
 		out, err := cmd.CombinedOutput()
 		outStr := TruncateToolOutput(string(out))
 		if err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: outStr + "\nError: " + err.Error()}, nil
+			return llm.NewTextResult(outStr + "\nError: " + err.Error()), nil
 		}
-		return fantasy.ToolResponse{Type: "text", Content: outStr}, nil
+		return llm.NewTextResult(outStr), nil
 	})
 
 	return &ToolDef{
 		Name:        "bash",
 		Description: desc,
 		Template:    "bash.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"sync"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 // memTodoStore is an in-memory fallback used when Save=false (no SQLite).
@@ -56,7 +56,7 @@ func ensureTodosTable(db *sql.DB) error {
 }
 
 func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("todo_write", desc, func(ctx context.Context, args TodoWriteArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("todo_write", desc, func(ctx context.Context, args TodoWriteArgs) (llm.ToolResult, error) {
 		sessionID := a.SessionID()
 
 		if db == nil {
@@ -92,11 +92,11 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 					})
 				}
 			}
-			return fantasy.ToolResponse{Type: "text", Content: "ok"}, nil
+			return llm.NewTextResult("ok"), nil
 		}
 
 		if err := ensureTodosTable(db); err != nil {
-			return fantasy.ToolResponse{}, fmt.Errorf("todo table: %w", err)
+			return llm.ToolResult{}, fmt.Errorf("todo table: %w", err)
 		}
 
 		// Load existing tasks to preserve order and merge
@@ -104,7 +104,7 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 			`SELECT id, title, status, details, position FROM todos WHERE session_id = ? ORDER BY position`,
 			sessionID)
 		if err != nil {
-			return fantasy.ToolResponse{}, err
+			return llm.ToolResult{}, err
 		}
 		existing := map[string]Task{}
 		order := []string{}
@@ -114,7 +114,7 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 			var pos int
 			if err := rows.Scan(&t.ID, &t.Title, &t.Status, &t.Details, &pos); err != nil {
 				rows.Close()
-				return fantasy.ToolResponse{}, err
+				return llm.ToolResult{}, err
 			}
 			existing[t.ID] = t
 			order = append(order, t.ID)
@@ -137,7 +137,7 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 					`INSERT INTO todos (session_id, id, title, status, details, position) VALUES (?, ?, ?, ?, ?, ?)`,
 					sessionID, cur.ID, "", "pending", "", maxPos)
 				if err != nil {
-					return fantasy.ToolResponse{}, err
+					return llm.ToolResult{}, err
 				}
 			}
 			if tm.Title != "" {
@@ -155,7 +155,7 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 				`UPDATE todos SET title = ?, status = ?, details = ? WHERE session_id = ? AND id = ?`,
 				cur.Title, cur.Status, cur.Details, sessionID, cur.ID)
 			if err != nil {
-				return fantasy.ToolResponse{}, err
+				return llm.ToolResult{}, err
 			}
 
 			if cur.Status == "completed" {
@@ -167,19 +167,19 @@ func NewTodoWriteTool(a Agent, db *sql.DB, desc string) *ToolDef {
 			}
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: "ok"}, nil
+		return llm.NewTextResult("ok"), nil
 	})
 
 	return &ToolDef{
 		Name:        "todo_write",
 		Description: desc,
 		Template:    "todowrite.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }
 
 func NewTodoReadTool(a Agent, db *sql.DB, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("todo_read", desc, func(ctx context.Context, args TodoReadArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("todo_read", desc, func(ctx context.Context, args TodoReadArgs) (llm.ToolResult, error) {
 		sessionID := a.SessionID()
 
 		if db == nil {
@@ -191,18 +191,18 @@ func NewTodoReadTool(a Agent, db *sql.DB, desc string) *ToolDef {
 				tasks = append(tasks, ms.tasks[id])
 			}
 			b, _ := json.Marshal(tasks)
-			return fantasy.ToolResponse{Type: "text", Content: string(b)}, nil
+			return llm.NewTextResult(string(b)), nil
 		}
 
 		if err := ensureTodosTable(db); err != nil {
-			return fantasy.ToolResponse{}, fmt.Errorf("todo table: %w", err)
+			return llm.ToolResult{}, fmt.Errorf("todo table: %w", err)
 		}
 
 		rows, err := db.QueryContext(ctx,
 			`SELECT id, title, status, details FROM todos WHERE session_id = ? ORDER BY position`,
 			a.SessionID())
 		if err != nil {
-			return fantasy.ToolResponse{}, err
+			return llm.ToolResult{}, err
 		}
 		defer rows.Close()
 
@@ -210,7 +210,7 @@ func NewTodoReadTool(a Agent, db *sql.DB, desc string) *ToolDef {
 		for rows.Next() {
 			var t Task
 			if err := rows.Scan(&t.ID, &t.Title, &t.Status, &t.Details); err != nil {
-				return fantasy.ToolResponse{}, err
+				return llm.ToolResult{}, err
 			}
 			tasks = append(tasks, t)
 		}
@@ -218,13 +218,13 @@ func NewTodoReadTool(a Agent, db *sql.DB, desc string) *ToolDef {
 			tasks = []Task{}
 		}
 		b, _ := json.Marshal(tasks)
-		return fantasy.ToolResponse{Type: "text", Content: string(b)}, nil
+		return llm.NewTextResult(string(b)), nil
 	})
 
 	return &ToolDef{
 		Name:        "todo_read",
 		Description: desc,
 		Template:    "todoread.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

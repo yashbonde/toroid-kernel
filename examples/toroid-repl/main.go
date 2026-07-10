@@ -10,7 +10,7 @@
 // Configuration is split between environment variables (the "what to talk to"
 // knobs) and command-line flags (the per-run toggles):
 //
-//	env  TOROID_MODEL      provider/model id      (default anthropic/claude-haiku-4-5)
+//	env  TOROID_MODEL      provider/model id      (default llmgateway/claude-haiku-4-5)
 //	env  TOROID_LLM_TOKEN  API key for the provider (required)
 //	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 50)
 //	env  TOROID_TRIM       max chars per tool arg/result line (default 120)
@@ -52,7 +52,6 @@ type config struct {
 	maxIter   int
 	save      bool
 	trim      int
-	pricingOK bool // whether cfg.model resolves to a pricing.json entry
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
@@ -78,7 +77,7 @@ func loadConfig() (config, string) {
 	}
 
 	c := config{
-		model:    envOr("TOROID_MODEL", "anthropic/claude-haiku-4-5"),
+		model:    envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5"),
 		workdir:  absWd,
 		thinking: toroid.Thinking(*thinking),
 		save:     *save,
@@ -94,12 +93,7 @@ func loadConfig() (config, string) {
 			c.trim = n
 		}
 	}
-	// Probe pricing availability once so the turn footer and /cost can report
-	// "pricing unavailable" instead of a misleading $0.000000 for models the
-	// bundled pricing.json doesn't know (e.g. gateway-routed models).
-	_, perr := toroid.GetModelPricing(c.model)
-	c.pricingOK = perr == nil
-	return c, os.Getenv("TOROID_LLM_TOKEN")
+	return c, os.Getenv("TOROID_LLM_TOKEN") // optional override; NewKernel resolves per-provider env otherwise
 }
 
 func envOr(key, def string) string {
@@ -117,11 +111,10 @@ func termWidth() int {
 }
 
 func main() {
+	// apiKey may be empty: NewKernel resolves the key per provider prefix
+	// (LLM_GATEWAY_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY); TOROID_LLM_TOKEN
+	// is an explicit override.
 	cfg, apiKey := loadConfig()
-	if apiKey == "" {
-		fmt.Fprintf(os.Stderr, "set TOROID_LLM_TOKEN to run (model is %s)\n", cfg.model)
-		os.Exit(1)
-	}
 
 	ctx := context.Background()
 	k, err := newKernel(ctx, cfg, apiKey)
@@ -274,15 +267,9 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	fmt.Printf("\n%s%s ◂%s\n", aMagenta+aBold, shortModel(cfg.model), aReset)
 	fmt.Print(renderMarkdown(out, width))
 
-	// Turn footer: running cost (or a clear "pricing unavailable" when the model
-	// isn't in pricing.json, so we never show a misleading $0.000000) plus output
-	// throughput. EventStop's UsagePayload carries the session's per-turn usage,
-	// keyed by session ID.
-	if cfg.pricingOK {
-		fmt.Printf("%s  cost so far: $%.6f%s", aGray, k.RunningCostUSD(), aReset)
-	} else {
-		fmt.Printf("%s  cost so far: pricing unavailable for %s%s", aGray, cfg.model, aReset)
-	}
+	// Turn footer: running cost (gateway-reported) plus output throughput.
+	// EventStop's UsagePayload carries the session's per-turn usage by session ID.
+	fmt.Printf("%s  cost so far: $%.6f%s", aGray, k.RunningCostUSD(), aReset)
 	if outTokens := usage.Tokens[k.SessionID()].Output; outTokens > 0 && elapsed.Seconds() > 0 {
 		fmt.Printf("%s  ·  %d out tok in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
 	}
@@ -305,11 +292,7 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 	case "/clear":
 		fmt.Print("\x1b[2J\x1b[H")
 	case "/cost":
-		if cfg.pricingOK {
-			fmt.Printf("%scost so far: $%.6f%s\n", aYellow, k.RunningCostUSD(), aReset)
-		} else {
-			fmt.Printf("%scost so far: pricing unavailable for %s%s\n", aYellow, cfg.model, aReset)
-		}
+		fmt.Printf("%scost so far: $%.6f%s\n", aYellow, k.RunningCostUSD(), aReset)
 	case "/model":
 		fmt.Printf("%smodel: %s | workdir: %s | thinking: %s%s\n",
 			aYellow, cfg.model, displayWorkdir(cfg.workdir), cfg.thinking, aReset)

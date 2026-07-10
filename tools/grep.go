@@ -4,7 +4,7 @@ import (
 	"context"
 	"os/exec"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type GrepArgs struct {
@@ -13,7 +13,7 @@ type GrepArgs struct {
 }
 
 func NewGrepTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("grep", desc, func(ctx context.Context, args GrepArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("grep", desc, func(ctx context.Context, args GrepArgs) (llm.ToolResult, error) {
 		path := args.Path
 		if path == "" {
 			path = "."
@@ -23,16 +23,16 @@ func NewGrepTool(a Agent, desc string) *ToolDef {
 		cmd.Dir = a.WorkDir()
 		out, err := cmd.CombinedOutput()
 		if err != nil && len(out) == 0 {
-			return fantasy.ToolResponse{Type: "text", Content: "No matches found."}, nil
+			return llm.NewTextResult("No matches found."), nil
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: TruncateToolOutput(string(out))}, nil
+		return llm.NewTextResult(TruncateToolOutput(string(out))), nil
 	})
 
 	return &ToolDef{
 		Name:        "grep",
 		Description: desc,
 		Template:    "grep.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

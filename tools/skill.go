@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type SkillArgs struct {
@@ -24,23 +24,23 @@ func (a SkillArgs) Validate() error {
 // prompt at startup); the full instructions are read from disk — and so only
 // paid for in context — when this tool is actually called.
 func NewSkillTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("skill", desc, func(ctx context.Context, args SkillArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("skill", desc, func(ctx context.Context, args SkillArgs) (llm.ToolResult, error) {
 		if err := args.Validate(); err != nil {
-			return fantasy.NewTextErrorResponse("Error: " + err.Error()), nil
+			return llm.NewErrorResult("Error: " + err.Error()), nil
 		}
 
 		path := ResolvePath(args.Path, a.WorkDir())
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return fantasy.NewTextErrorResponse(fmt.Sprintf("Error: %v", err)), nil
+			return llm.NewErrorResult(fmt.Sprintf("Error: %v", err)), nil
 		}
-		return fantasy.NewTextResponse(TruncateToolOutput(string(b))), nil
+		return llm.NewTextResult(TruncateToolOutput(string(b))), nil
 	})
 
 	return &ToolDef{
 		Name:        "skill",
 		Description: desc,
 		Template:    "skill.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

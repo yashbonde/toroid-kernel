@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type LsArgs struct {
@@ -16,7 +16,7 @@ type LsArgs struct {
 }
 
 func NewLsTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("ls", desc, func(ctx context.Context, args LsArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("ls", desc, func(ctx context.Context, args LsArgs) (llm.ToolResult, error) {
 		path := args.Dir
 		if path == "" {
 			path = "."
@@ -27,7 +27,7 @@ func NewLsTool(a Agent, desc string) *ToolDef {
 
 		entries, err := os.ReadDir(path)
 		if err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return llm.NewTextResult(fmt.Sprintf("Error: %v", err)), nil
 		}
 
 		var names []string
@@ -42,13 +42,13 @@ func NewLsTool(a Agent, desc string) *ToolDef {
 
 		content := TruncateToolOutput(fmt.Sprintf("<path>%s</path>\n<entries>\n%s\n</entries>",
 			path, strings.Join(names, "\n")))
-		return fantasy.ToolResponse{Type: "text", Content: content}, nil
+		return llm.NewTextResult(content), nil
 	})
 
 	return &ToolDef{
 		Name:        "ls",
 		Description: desc,
 		Template:    "ls.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

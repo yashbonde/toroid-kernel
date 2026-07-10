@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"runtime"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type NotifyArgs struct {
@@ -52,7 +52,7 @@ func desktopNotify(ctx context.Context, title, message string) {
 }
 
 func NewNotifyTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("notify", desc, func(ctx context.Context, args NotifyArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("notify", desc, func(ctx context.Context, args NotifyArgs) (llm.ToolResult, error) {
 		title := args.Title
 		message := args.Message
 
@@ -70,13 +70,13 @@ func NewNotifyTool(a Agent, desc string) *ToolDef {
 		// Default local desktop notification — best-effort, never fatal.
 		desktopNotify(ctx, title, message)
 
-		return fantasy.ToolResponse{Type: "text", Content: "ok"}, nil
+		return llm.NewTextResult("ok"), nil
 	})
 
 	return &ToolDef{
 		Name:        "notify",
 		Description: desc,
 		Template:    "notify.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

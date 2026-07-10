@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type Edit struct {
@@ -22,7 +22,7 @@ type MultiEditArgs struct {
 }
 
 func NewMultiEditTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("multiedit", desc, func(ctx context.Context, args MultiEditArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("multiedit", desc, func(ctx context.Context, args MultiEditArgs) (llm.ToolResult, error) {
 		path := args.FilePath
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(a.WorkDir(), path)
@@ -30,7 +30,7 @@ func NewMultiEditTool(a Agent, desc string) *ToolDef {
 
 		b, err := os.ReadFile(path)
 		if err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return llm.NewTextResult(fmt.Sprintf("Error: %v", err)), nil
 		}
 		content := string(b)
 
@@ -41,10 +41,10 @@ func NewMultiEditTool(a Agent, desc string) *ToolDef {
 
 			count := strings.Count(content, oldStr)
 			if count == 0 {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: edit %d: oldString not found", i)}, nil
+				return llm.NewTextResult(fmt.Sprintf("Error: edit %d: oldString not found", i)), nil
 			}
 			if !replaceAll && count > 1 {
-				return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: edit %d: found multiple matches for oldString", i)}, nil
+				return llm.NewTextResult(fmt.Sprintf("Error: edit %d: found multiple matches for oldString", i)), nil
 			}
 
 			n := 1
@@ -55,16 +55,16 @@ func NewMultiEditTool(a Agent, desc string) *ToolDef {
 		}
 
 		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fantasy.ToolResponse{Type: "text", Content: fmt.Sprintf("Error: %v", err)}, nil
+			return llm.NewTextResult(fmt.Sprintf("Error: %v", err)), nil
 		}
 
-		return fantasy.ToolResponse{Type: "text", Content: "Multiple edits applied successfully."}, nil
+		return llm.NewTextResult("Multiple edits applied successfully."), nil
 	})
 
 	return &ToolDef{
 		Name:        "multiedit",
 		Description: desc,
 		Template:    "multiedit.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

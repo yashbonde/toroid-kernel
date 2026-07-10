@@ -25,6 +25,7 @@ const (
 	EventPostCompact        EventKind = "PostCompact"        // after compaction; payload contains the LLM-generated summary
 	EventSessionEnd         EventKind = "SessionEnd"         // after the session ends
 	EventQueueInterrupt     EventKind = "QueueInterrupt"     // fired when queued messages interrupt the stream at a step boundary
+	EventLLMStep            EventKind = "LLMStep"            // before each outbound llm-step; debug view of the request shape
 )
 
 type Event struct {
@@ -67,7 +68,7 @@ func (e Event) OTEL() OTELEvent {
 	return oe
 }
 
-// fantasy event to Swarm Buddy event Map
+// kernel event to Swarm Buddy event Map
 
 const (
 	TraceLogInfo    = "info"
@@ -132,7 +133,7 @@ type CompactSummaryPayload struct {
 }
 
 // AssistantTurnPayload is attached to EventAssistantTurn.
-// Messages is a JSON-serialized []fantasy.Message containing the full structured
+// Messages is a JSON-serialized []llm.Message containing the full structured
 // content blocks (thinking, text, tool_use, tool_result) from all steps of the turn.
 type AssistantTurnPayload struct {
 	Messages json.RawMessage `json:"messages"`
@@ -140,6 +141,16 @@ type AssistantTurnPayload struct {
 
 type StopPayload struct {
 	Reason string `json:"reason"`
+}
+
+// LLMStepPayload is the debug view of one outbound llm-step, fired as
+// EventLLMStep just before the request is sent: enough to verify the model,
+// tool set, schema, and single-system-prompt invariant without raw bytes.
+type LLMStepPayload struct {
+	Model    string   `json:"model"`
+	Messages int      `json:"messages"` // message count (system excluded)
+	Tools    []string `json:"tools,omitempty"`
+	Schema   string   `json:"schema,omitempty"` // schema name for object calls
 }
 
 type PermissionPayload struct {

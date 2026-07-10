@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,52 +13,41 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/yashbonde/toroid-kernel/llm"
 	"github.com/yashbonde/toroid-kernel/tools"
-
-	"charm.land/fantasy"
-	"charm.land/fantasy/providers/anthropic"
-	"charm.land/fantasy/providers/google"
 )
 
 // Thinking controls the model's thinking budget.
 type Thinking string
 
 const (
-	ThinkingNone Thinking = "none" // disable thinking (budget=0)
-	ThinkingLow  Thinking = "low"  // ~1k tokens
-	ThinkingHigh Thinking = "high" // ~8k tokens
+	ThinkingNone Thinking = "none" // disable thinking
+	ThinkingLow  Thinking = "low"  // gateway reasoning_effort=low
+	ThinkingHigh Thinking = "high" // gateway reasoning_effort=high
 )
 
-// errQueueInterrupt is returned from OnStepFinish to abort agent.Stream when
-// queued messages are waiting. It is never propagated to callers.
-var errQueueInterrupt = errors.New("queue interrupt")
-
-// Kernel is the agentic orchestrator powered by Fantasy.
+// Kernel is the agentic orchestrator. It owns the tool loop (turns), history,
+// compaction, subagents, events, and persistence; each turn's LLM call is one
+// llm-step performed by the Step layer against the LiteLLM gateway.
 type Kernel struct {
-	Cfg              Config
-	Provider         fantasy.Provider
-	LM               fantasy.LanguageModel
-	SmallerLM        fantasy.LanguageModel // optional; used for compact + subagents when set
-	Step             Step                  // one-llm-step backend (Phase B); defaults to FantasyStep over LM
+	Cfg  Config
+	Step Step // one-llm-step backend; defaults to GatewayStep over the llm client
 
 	Hooks            *HookRegistry
 	Tools            *tools.Registry
 	Store            *Store
 	seq              atomic.Uint64
-	SystemPrompt     string
-	History          []fantasy.Message
-	StepUsage        []Usage          // per-step token usage, index-aligned with StepHistoryStart
-	StepHistoryStart []int            // history index where each step's messages begin
-	Sessions         map[string]Usage // sessionID -> total tokens used (self + subagents)
+	SystemPrompt string
+	History      []llm.Message
+	Sessions     map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
 	usageMu          sync.Mutex
-	FantasyAgentOpts []fantasy.AgentOption
 	currentTokens    int
 	runningCostUSD   float64
 	todoDB           *sql.DB
 	mcpClients       []io.Closer // open connections to configured MCP servers, closed in Close()
 
 	// message queue — callers enqueue messages that are injected at the next
-	// safe interruption point (OnStepFinish), causing the stream to restart
+	// safe interruption point (turn boundary), causing the loop to continue
 	// with the queued messages appended to history.
 	messageQueue []string
 	queueMu      sync.Mutex
@@ -77,36 +65,24 @@ type Kernel struct {
 
 // Config holds all options for creating a Kernel.
 type Config struct {
-	Provider fantasy.Provider `json:"provider,omitempty" description:"llm provider"`
-	// Model is the primary agent model (provider/model form).
-	Model string `json:"model" description:"primary llm model name" default:"anthropic/claude-haiku-4-5"`
+	// Model is the primary agent model (provider/model form). All models are
+	// reached through the LiteLLM gateway ("llmgateway/<name>"); ids with other
+	// prefixes are passed to the gateway verbatim for it to route.
+	Model string `json:"model" description:"primary llm model name" default:"llmgateway/claude-haiku-4-5"`
 	// SmallerModel is an optional cheaper model for cost-sensitive work:
 	// conversation compaction and subagents (sync + async). Empty means those
-	// paths use Model. Prefer the same provider (or llmgateway) as Model so the
-	// single APIKey authenticates both.
-	SmallerModel   string    `json:"smaller_model,omitempty" description:"cheaper model for compaction and subagents; empty = use Model"`
-	APIKey         string    `json:"api_key,omitempty" description:"API key for the provider"`
-	SessionID      string    `json:"session_id,omitempty" description:"unique identifier for the session"`
-	WorkDir        string    `json:"work_dir" description:"working directory" default:"current directory"`
+	// paths use Model.
+	SmallerModel string `json:"smaller_model,omitempty" description:"cheaper model for compaction and subagents; empty = use Model"`
+	// APIKey is the gateway bearer token. Defaults to $LLM_GATEWAY_KEY.
+	APIKey    string `json:"api_key,omitempty" description:"API key for the gateway"`
+	SessionID string `json:"session_id,omitempty" description:"unique identifier for the session"`
+	WorkDir   string `json:"work_dir" description:"working directory" default:"current directory"`
 	// MaxIter caps tool-call steps per turn. Kept intentionally modest so a
 	// thrashing model cannot burn dozens of full-context steps by default.
-	MaxIter        int       `json:"max_iter" description:"max tool-call iterations" default:"25"`
-	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
-	// UseStepLoop opts into the kernel-owned tool loop that drives each turn's
-	// LLM call through the Step layer (one llm-step per turn) instead of Fantasy
-	// Agent.Stream. Preserves MaxIter, loop guard, queue interrupt, mid-turn
-	// compaction, tool events, and per-turn cost. Off by default: the Fantasy
-	// Agent path remains the production default until this is proven against a
-	// live gateway. See steploop.go.
-	UseStepLoop bool `json:"use_step_loop" description:"drive the tool loop via the Step layer instead of Fantasy Agent.Stream" default:"false"`
-	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
+	MaxIter        int      `json:"max_iter" description:"max tool-call iterations" default:"25"`
+	MaxRepeatCalls int      `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
+	Thinking       Thinking `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
-
-	// OnPayload, when set, receives a debug view of each outbound llm-step the
-	// kernel issues through the Step layer (structured-output pass and
-	// compaction today). Lets a host inspect the request body — tools, schema,
-	// single-system-prompt invariant — without capturing raw provider bytes (M10).
-	OnPayload func(PayloadDebug) `json:"-"`
 
 	// Tools
 	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
@@ -137,14 +113,7 @@ type Config struct {
 	// modest effective window so long agentic turns do not re-pay max context
 	// every step until the 300k ceiling.
 	CompactionBufferSize int `json:"compaction_buffer_size" description:"tokens reserved below TotalContextSize before auto-compact fires" default:"50000"`
-	ToolCallPrunedSize   int `json:"tool_call_prune" description:"token budget of recent tool history kept untrimmed" default:"20000"`
 	TotalContextSize     int `json:"total_context_size" description:"total context window size" default:"200000"`
-
-	// PromptCache requests provider prompt caching when supported (Anthropic
-	// ephemeral cache_control breakpoints on the system message, last tool
-	// definition, and recent messages). Default true. No-op for providers that
-	// ignore these options (OpenAI often auto-caches; Google uses a different API).
-	PromptCache *bool `json:"prompt_cache,omitempty" description:"request provider prompt caching when supported" default:"true"`
 
 	// logging flags
 	AttachLoggerHooks *bool `json:"attach_logger_hooks,omitempty" description:"automatically attach logger hooks" default:"false"`
@@ -153,9 +122,23 @@ type Config struct {
 
 // NewKernel creates and wires up a new Kernel.
 func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
-	// priority cfg defaults
+	// Provider routing: "openai/<model>" talks straight to the OpenAI API,
+	// "anthropic/<model>" to the native Anthropic messages API; everything else
+	// goes through the LiteLLM gateway.
+	baseURL := os.Getenv(GatewayBaseURLEnv)
+	switch {
+	case strings.HasPrefix(cfg.Model, "openai/"):
+		baseURL = OpenAIBaseURL
+		if cfg.APIKey == "" {
+			cfg.APIKey = os.Getenv(OpenAIKeyEnv)
+		}
+	case strings.HasPrefix(cfg.Model, "anthropic/"):
+		if cfg.APIKey == "" {
+			cfg.APIKey = os.Getenv(AnthropicKeyEnv)
+		}
+	}
 	if cfg.APIKey == "" {
-		cfg.APIKey = os.Getenv("GEMINI_TOKEN")
+		cfg.APIKey = os.Getenv(GatewayKeyEnv)
 	}
 	if cfg.SessionID == "" {
 		cfg.SessionID = NewSessionID()
@@ -180,18 +163,12 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// auto-applied, so a caller that omits these leaves them at 0 — which makes
 	// overContextThreshold treat threshold = TotalContextSize-CompactionBufferSize
 	// = 0 and fire on the very first non-empty turn, spuriously compacting and
-	// restarting the agent loop every turn. That restart re-enters agent.Stream
-	// with an assistant-tail history and an empty prompt, which the provider
-	// rejects ("prompt can't be empty when the last message is not a user or tool
-	// message") — breaking structured-generation runs outright.
+	// restarting the loop every turn.
 	if cfg.TotalContextSize <= 0 {
 		cfg.TotalContextSize = 200000
 	}
 	if cfg.CompactionBufferSize <= 0 {
 		cfg.CompactionBufferSize = 50000
-	}
-	if cfg.ToolCallPrunedSize <= 0 {
-		cfg.ToolCallPrunedSize = 20000
 	}
 	if cfg.MaxIter <= 0 {
 		cfg.MaxIter = 25
@@ -306,44 +283,15 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 	k.SystemPrompt = systemPrompt
 
-	// Load the primary model
-	if cfg.Provider == nil {
-		p, err := NewProviderFromLLMId(cfg.Model, cfg.APIKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize provider for %q: %w", cfg.Model, err)
-		}
-		cfg.Provider = p
+	// Step is the one-llm-step backend over the in-repo wire client (OpenAI
+	// chat completions, or native Anthropic messages for anthropic/ ids). Tests
+	// may replace it with a FauxStep. The kernel owns the tool loop — Step
+	// performs individual LLM calls.
+	var wire llm.Chat = llm.NewClient(baseURL, cfg.APIKey)
+	if strings.HasPrefix(cfg.Model, "anthropic/") {
+		wire = llm.NewAnthropicClient(cfg.APIKey)
 	}
-	model, err := languageModel(ctx, cfg.Provider, cfg.Model)
-	if err != nil {
-		return nil, err
-	}
-	k.LM = model
-	k.Provider = cfg.Provider
-	// Step is the one-llm-step backend (Phase B). Defaults to wrapping the same
-	// Fantasy model; tests may replace it with a FauxStep. The kernel still owns
-	// the tool loop — Step performs individual LLM calls (e.g. the schema pass).
-	k.Step = NewFantasyStep(model)
-
-	// Optional cheaper model for compaction + subagents
-	if cfg.SmallerModel != "" && cfg.SmallerModel != cfg.Model {
-		smallLM, err := resolveLanguageModel(ctx, cfg.APIKey, cfg.SmallerModel)
-		if err != nil {
-			return nil, fmt.Errorf("failed to initialize SmallerModel %q: %w", cfg.SmallerModel, err)
-		}
-		k.SmallerLM = smallLM
-	}
-
-	// Build Fantasy Tools
-	var fTools []fantasy.AgentTool
-	for _, t := range k.Tools.Tools() {
-		fTools = append(fTools, t.AgentTool)
-	}
-	// Anthropic: mark the last tool with ephemeral cache_control so the tools
-	// block can participate in the cached prefix (max 4 breakpoints total).
-	if promptCacheEnabled(cfg) && len(fTools) > 0 {
-		fTools[len(fTools)-1].SetProviderOptions(anthropicEphemeralCacheOptions())
-	}
+	k.Step = NewGatewayStep(wire)
 
 	// Default AttachLoggerHooks if nil
 	if cfg.AttachLoggerHooks != nil && *cfg.AttachLoggerHooks {
@@ -356,173 +304,43 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		})
 	}
 
-	// Initialize Fantasy Agent
-	// System prompt is owned by Fantasy (WithSystemPrompt only) — History must
-	// not also carry a system message or every step double-bills the system text
-	// and busts a stable cache prefix.
-	opts := []fantasy.AgentOption{
-		fantasy.WithSystemPrompt(systemPrompt),
-		fantasy.WithTools(fTools...),
-		fantasy.WithMaxRetries(5),
-	}
-	if promptCacheEnabled(cfg) {
-		opts = append(opts, fantasy.WithPrepareStep(preparePromptCacheStep))
-	}
-
-	// Loop guards. MaxIter caps the absolute number of tool-call steps;
-	// MaxRepeatCalls catches a model spinning on the same call before it ever
-	// reaches that cap. Both are wired as fantasy stop conditions so the agent
-	// halts cleanly at a step boundary (history stays consistent).
-	var stops []fantasy.StopCondition
-	if cfg.MaxIter > 0 {
-		stops = append(stops, fantasy.StepCountIs(cfg.MaxIter))
-	}
-	if cfg.MaxRepeatCalls > 0 {
-		stops = append(stops, k.repeatCallGuard(cfg.MaxRepeatCalls))
-	}
-	if len(stops) > 0 {
-		opts = append(opts, fantasy.WithStopConditions(stops...))
-	}
-
-	// Handle thinking
-	if cfg.Thinking != ThinkingNone {
-		if cfg.ThinkingWriter != nil {
-			k.On(EventReasoning, func(_ context.Context, e Event) error {
-				if p, ok := e.Payload.(*ReasoningPayload); ok {
-					_, err := fmt.Fprint(cfg.ThinkingWriter, p.Text)
-					return err
-				}
-				return nil
-			})
-		}
-		budget := int64(1024)
-		if cfg.Thinking == ThinkingHigh {
-			budget = 8192
-		}
-
-		config := &google.ThinkingConfig{
-			IncludeThoughts: fantasy.Opt(true),
-		}
-
-		if strings.Contains(cfg.Model, "gemini-3") {
-			level := google.ThinkingLevelLow
-			if cfg.Thinking == ThinkingHigh {
-				level = google.ThinkingLevelHigh
+	// Live reasoning output for hosts that want it.
+	if cfg.Thinking != ThinkingNone && cfg.ThinkingWriter != nil {
+		k.On(EventReasoning, func(_ context.Context, e Event) error {
+			if p, ok := e.Payload.(*ReasoningPayload); ok {
+				_, err := fmt.Fprint(cfg.ThinkingWriter, p.Text)
+				return err
 			}
-			config.ThinkingLevel = fantasy.Opt(level)
-		} else {
-			config.ThinkingBudget = fantasy.Opt(budget)
-		}
-
-		opts = append(opts, fantasy.WithProviderOptions(fantasy.ProviderOptions{
-			google.Name: &google.ProviderOptions{
-				ThinkingConfig: config,
-			},
-		}))
+			return nil
+		})
 	}
-	k.FantasyAgentOpts = opts
-	k.Cfg = cfg
 
+	k.Cfg = cfg
 	return k, nil
 }
 
-// languageModel resolves a LanguageModel from an already-built provider and a
-// provider/model id (strips the provider/ prefix for the API call).
-func languageModel(ctx context.Context, p fantasy.Provider, modelID string) (fantasy.LanguageModel, error) {
-	name := modelID
-	if _, after, ok := strings.Cut(modelID, "/"); ok {
-		name = after
+// fireLLMStep emits the EventLLMStep debug view of an outbound llm-step just
+// before the kernel issues it: model, message count, tool names, schema name.
+func (k *Kernel) fireLLMStep(ctx context.Context, model string, c Context, schema string) {
+	names := make([]string, 0, len(c.Tools))
+	for _, t := range c.Tools {
+		names = append(names, t.Name)
 	}
-	return p.LanguageModel(ctx, name)
-}
-
-// resolveLanguageModel builds a provider + language model for modelID using apiKey.
-func resolveLanguageModel(ctx context.Context, apiKey, modelID string) (fantasy.LanguageModel, error) {
-	p, err := NewProviderFromLLMId(modelID, apiKey)
-	if err != nil {
-		return nil, err
-	}
-	return languageModel(ctx, p, modelID)
-}
-
-func promptCacheEnabled(cfg Config) bool {
-	return cfg.PromptCache == nil || *cfg.PromptCache
-}
-
-func anthropicEphemeralCacheOptions() fantasy.ProviderOptions {
-	return fantasy.ProviderOptions{
-		anthropic.Name: &anthropic.ProviderCacheControlOptions{
-			CacheControl: anthropic.CacheControl{Type: "ephemeral"},
-		},
-	}
-}
-
-// preparePromptCacheStep stamps Anthropic ephemeral cache_control breakpoints
-// on the stable system message and the last two messages of each step. Fantasy's
-// own provider tests use this pattern; non-Anthropic providers ignore the option.
-// Anthropic allows at most four breakpoints — system + last 2 leaves room for
-// the last-tool breakpoint set at agent construction.
-func preparePromptCacheStep(ctx context.Context, options fantasy.PrepareStepFunctionOptions) (context.Context, fantasy.PrepareStepResult, error) {
-	msgs := make([]fantasy.Message, len(options.Messages))
-	copy(msgs, options.Messages)
-	for i := range msgs {
-		msgs[i].ProviderOptions = nil
-	}
-	cacheOpts := anthropicEphemeralCacheOptions()
-
-	lastSystem := -1
-	for i, msg := range msgs {
-		if msg.Role == fantasy.MessageRoleSystem {
-			lastSystem = i
-		}
-	}
-	if lastSystem >= 0 {
-		msgs[lastSystem].ProviderOptions = cacheOpts
-	}
-	// Last two messages (often the growing tail) get breakpoints so incremental
-	// turns can still hit a recent cached prefix within Anthropic's limit of 4.
-	for i := range msgs {
-		if i > len(msgs)-3 {
-			msgs[i].ProviderOptions = cacheOpts
-		}
-	}
-	return ctx, fantasy.PrepareStepResult{Messages: msgs}, nil
-}
-
-// cheapLM returns the language model for cost-sensitive work (compact, etc.).
-func (k *Kernel) cheapLM() fantasy.LanguageModel {
-	if k.SmallerLM != nil {
-		return k.SmallerLM
-	}
-	return k.LM
-}
-
-// cheapStep returns the Step used for cost-sensitive one-shot llm-steps
-// (compaction). When a SmallerModel is configured it wraps that model; otherwise
-// it reuses k.Step so a test-injected FauxStep still applies.
-func (k *Kernel) cheapStep() Step {
-	if k.SmallerLM != nil {
-		return NewFantasyStep(k.SmallerLM)
-	}
-	return k.Step
-}
-
-// stepOptions builds the per-call StepOptions the kernel applies to every
-// Step call it issues (currently just the host's OnPayload debug hook).
-func (k *Kernel) stepOptions() StepOptions {
-	return StepOptions{OnPayload: k.Cfg.OnPayload}
-}
-
-// cheapModelID returns the model id used for cost-sensitive work and its pricing.
-func (k *Kernel) cheapModelID() string {
-	if k.Cfg.SmallerModel != "" {
-		return k.Cfg.SmallerModel
-	}
-	return k.Cfg.Model
+	_ = k.Fire(ctx, string(EventLLMStep), &LLMStepPayload{
+		Model:    model,
+		Messages: len(c.Messages),
+		Tools:    names,
+		Schema:   schema,
+	})
 }
 
 // recordUsage adds a single LLM call's usage to session cost accounting.
 func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
+	if !u.PricingOK {
+		// The gateway did not report a cost for this step (streamed, or header
+		// missing) — make the unbilled step visible instead of silently $0.
+		k.Logf("llm-step recorded with unknown cost (no gateway cost header)")
+	}
 	runningCost := k.UpdateUse(u, "")
 	if k.Store != nil {
 		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
@@ -547,7 +365,7 @@ func buildSystemPrompt(workDir string, skills []SkillMeta, model, smallerModel s
 	var buf strings.Builder
 	err = tmpl.Execute(&buf, map[string]any{
 		"WorkDir":      workDir,
-		"Date":         time.Now().Format("2006-01-02 15:04:05"),
+		"Date":         time.Now().Format("2006-01-02"),
 		"Skills":       skills,
 		"Model":        model,
 		"SmallerModel": smallerModel,
@@ -582,11 +400,6 @@ func (k *Kernel) LogErr(msg string, args ...any) {
 	LogError("["+k.Cfg.TraceID+"] "+msg, args...)
 }
 
-// FireTraceLog emits an EventTraceLog with the given severity and message.
-func (k *Kernel) FireTraceLog(ctx context.Context, logType, message string) error {
-	return k.Fire(ctx, string(EventTraceLog), &TraceLogPayload{Type: logType, Message: message})
-}
-
 func (k *Kernel) Fire(ctx context.Context, kind string, payload any) error {
 	event := Event{
 		Kind:      EventKind(kind),
@@ -606,26 +419,32 @@ func (k *Kernel) Fire(ctx context.Context, kind string, payload any) error {
 func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 	k.usageMu.Lock()
 	defer k.usageMu.Unlock()
-	if len(key) == 0 {
-		k.Sessions[k.Cfg.SessionID] = u
-	} else {
-		k.Sessions[key] = u
+	id := key
+	if id == "" {
+		id = k.Cfg.SessionID
 	}
+	// Accumulate — a session's entry is the SUM of its llm-steps, not the last
+	// one, so Stop/Run usage payloads and subagent rollups report real totals.
+	s, seen := k.Sessions[id]
+	s.Input += u.Input
+	s.Output += u.Output
+	s.Reasoning += u.Reasoning
+	s.CacheRead += u.CacheRead
+	s.CacheWrite += u.CacheWrite
+	s.Cost += u.Cost
+	if !seen {
+		s.PricingOK = u.PricingOK
+	} else {
+		s.PricingOK = s.PricingOK && u.PricingOK
+	}
+	k.Sessions[id] = s
 	k.runningCostUSD += u.Cost
-	// u is a single step's usage here; its input-side tokens are the size of the
-	// request that step sent (the whole conversation so far), so this is a valid
-	// snapshot of context-window occupancy. See windowTokens.
-	k.currentTokens = windowTokens(u)
+	// u is a single step's usage: its input-side tokens (fresh + cache-read +
+	// cache-write are disjoint slices of the prompt) are the size of the request
+	// that step sent, plus what it generated — a valid snapshot of context-window
+	// occupancy. Never feed a summed multi-step total (double-counts re-reads).
+	k.currentTokens = int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
 	return k.runningCostUSD
-}
-
-// windowTokens estimates how full the context window is from a single request's
-// usage: the input-side tokens (fresh + cache-read + cache-write are disjoint
-// slices of the prompt) plus the tokens generated, which become part of the
-// window on the next turn. It must be fed a single step's usage, never an
-// agent's summed TotalUsage (which double-counts re-read context across steps).
-func windowTokens(u Usage) int {
-	return int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
 }
 
 // overContextThreshold reports whether context-window occupancy has reached the
@@ -646,8 +465,8 @@ func (k *Kernel) overContextThreshold() bool {
 
 // Enqueue adds a message to the kernel's message queue. It is safe to call
 // from any goroutine, including while Stream is running. The message will be
-// injected into the conversation at the next OnStepFinish boundary, causing
-// the current stream to restart with the message appended to history.
+// injected into the conversation at the next turn boundary, causing the loop
+// to continue with the message appended to history.
 func (k *Kernel) Enqueue(msg string) {
 	k.queueMu.Lock()
 	k.messageQueue = append(k.messageQueue, msg)
@@ -687,6 +506,7 @@ func (k *Kernel) OnAll(fn HookFn) {
 		EventPostCompact,
 		EventQueueInterrupt,
 		EventSessionEnd,
+		EventLLMStep,
 	} {
 		k.On(kind, fn)
 	}
@@ -697,7 +517,7 @@ func (k *Kernel) OnAll(fn HookFn) {
 type RunOption func(*runOptions)
 
 type runOptions struct {
-	schema            *fantasy.Schema
+	schema            Schema
 	schemaName        string
 	schemaDescription string
 }
@@ -705,9 +525,9 @@ type runOptions struct {
 // WithSchema enables structured generation for this Run/Stream call.
 // The model will produce a JSON object matching the given schema instead of
 // free text. Run returns the raw JSON; Stream writes it to the writer.
-func WithSchema(schema fantasy.Schema, name, description string) RunOption {
+func WithSchema(schema Schema, name, description string) RunOption {
 	return func(o *runOptions) {
-		o.schema = &schema
+		o.schema = schema
 		o.schemaName = name
 		o.schemaDescription = description
 	}
@@ -735,8 +555,9 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	for _, o := range opts {
 		o(&ro)
 	}
-	// Fire session start only once. System prompt is injected by Fantasy via
-	// WithSystemPrompt — do not also put it in History (double bill + cache bust).
+	// Fire session start only once. System prompt is sent as the single leading
+	// system message by the Step layer — do not also put it in History (double
+	// bill + cache bust).
 	if len(k.History) == 0 {
 		_ = k.Fire(ctx, string(EventSessionStart), nil)
 	}
@@ -759,12 +580,12 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// so a dropped image is visible rather than silently missing (M8).
 	for _, w := range mediaWarnings {
 		k.LogErr("multimodal: %s", w)
-		_ = k.FireTraceLog(ctx, "warn", "multimodal: "+w)
+		_ = k.Fire(ctx, string(EventTraceLog), &TraceLogPayload{Type: "warn", Message: "multimodal: " + w})
 	}
 
 	// history validation — last message must be the user turn we just appended.
-	if len(k.History) == 0 || k.History[len(k.History)-1].Role != fantasy.MessageRoleUser {
-		role := fantasy.MessageRole("")
+	if len(k.History) == 0 || k.History[len(k.History)-1].Role != llm.RoleUser {
+		role := llm.Role("")
 		if len(k.History) > 0 {
 			role = k.History[len(k.History)-1].Role
 		}
@@ -772,13 +593,8 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		panic("Last item is not a user message.")
 	}
 
-	// Walk StepUsage backwards, accumulating tokens. Steps whose cumulative
-	// token total exceeds ToolCallPrunedSize get their history messages trimmed:
-	// tool call args are cleared, tool results are truncated.
-	k.pruneOldToolCalls()
-
 	// When schema is set, discard the free-text output from the agent loop;
-	// only the structured JSON from GenerateObject goes to the caller's writer.
+	// only the structured JSON from the object llm-step goes to the caller's writer.
 	loopWriter := w
 	if ro.schema != nil {
 		loopWriter = io.Discard
@@ -789,16 +605,14 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 
 	if ro.schema != nil {
 		// The structured-output pass is one more llm-step in the SAME chat (M7).
-		// GenerateObject requires the last message to be user/tool role; after the
-		// agentic loop the last message is assistant, so append a user turn asking
-		// the model to emit structured output. Run it through the Step layer so its
-		// usage is priced and billed like any other llm-step — previously this call
-		// bypassed cost accounting entirely, under-reporting schema chats.
-		schemaMsgs := append(k.History, fantasy.NewUserMessage("Now return your findings in the required JSON format."))
+		// After the agentic loop the last message is assistant, so append a user
+		// turn asking the model to emit structured output. Run it through the Step
+		// layer so its usage is priced and billed like any other llm-step.
+		schemaMsgs := append(k.History, llm.NewUserMessage("Now return your findings in the required JSON format."))
 		res, err := k.Step.CompleteObject(ctx, ResolveModel(k.Cfg.Model), Context{
 			System:   k.SystemPrompt,
 			Messages: schemaMsgs,
-		}, *ro.schema, ro.schemaName, ro.schemaDescription, k.stepOptions())
+		}, ro.schema, ro.schemaName, ro.schemaDescription, StepOptions{Thinking: k.Cfg.Thinking})
 		if err != nil {
 			return err
 		}
@@ -815,71 +629,6 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	return nil
 }
 
-// repeatCallGuard returns a stop condition that halts the agent when the last n
-// steps all issued the exact same tool calls (name + input) AND received the
-// exact same results.
-//
-// Keying on the result — not just the arguments — is what keeps legitimate
-// polling alive: a poll that observes changing state (a job that flips from
-// "pending" to "done", a file that grows, a queue that drains) produces a
-// different signature each step and is never tripped. Only a call that repeats
-// with identical args and identical output — i.e. making no progress — counts as
-// a stuck loop. A poll that genuinely needs to wait should yield between checks
-// (sleep/backoff) rather than spin the synchronous agent loop; this guard is the
-// backstop for the spin case.
-func (k *Kernel) repeatCallGuard(n int) fantasy.StopCondition {
-	return func(steps []fantasy.StepResult) bool {
-		if n <= 1 || len(steps) < n {
-			return false
-		}
-		var last string
-		for i := 0; i < n; i++ {
-			sig := stepCallSignature(steps[len(steps)-1-i])
-			if sig == "" {
-				return false // a step with no tool calls isn't a spin
-			}
-			if i == 0 {
-				last = sig
-			} else if sig != last {
-				return false
-			}
-		}
-		k.Logf("loop guard: stopping after %d consecutive identical tool calls with identical results", n)
-		return true
-	}
-}
-
-// stepCallSignature builds a stable signature of every tool call in a step,
-// pairing each call's (name, input) with its result so that progress-making
-// repeats produce distinct signatures. Returns "" if the step made no calls.
-func stepCallSignature(step fantasy.StepResult) string {
-	results := map[string]string{}
-	for _, msg := range step.Messages {
-		if msg.Role != fantasy.MessageRoleTool {
-			continue
-		}
-		for _, part := range msg.Content {
-			if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
-				if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
-					results[tr.ToolCallID] = txt.Text
-				} else {
-					results[tr.ToolCallID] = fmt.Sprintf("%v", tr.Output)
-				}
-			}
-		}
-	}
-	var b strings.Builder
-	for _, tc := range step.Content.ToolCalls() {
-		b.WriteString(tc.ToolName)
-		b.WriteByte('\x00')
-		b.WriteString(tc.Input)
-		b.WriteByte('\x00')
-		b.WriteString(results[tc.ToolCallID])
-		b.WriteByte('\n')
-	}
-	return b.String()
-}
-
 // streamCurrent runs the agent loop over the current in-memory history until it
 // stops (no pending queued messages). Stream prepares history (compaction,
 // appending the user message, pruning) and then calls this; Wake calls it after
@@ -892,153 +641,11 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 	k.lastWriter = w
 	defer k.running.Store(false)
 
-	// Opt-in: drive the tool loop through the Step layer (one llm-step per turn)
-	// instead of Fantasy Agent.Stream. Default path below is unchanged.
-	if k.Cfg.UseStepLoop {
-		return k.streamViaStep(ctx, w)
+	if err := k.streamViaStep(ctx, w); err != nil {
+		return err
 	}
-
-	// Build Agent and handle streaming and events.
-	// The loop restarts agent.Stream() whenever queued messages are injected
-	// at a step boundary. A flag is set in OnStepFinish; the stream is allowed
-	// to finish normally so all step messages are collected before restarting.
-	agent := fantasy.NewAgent(k.LM, k.FantasyAgentOpts...)
-	var result *fantasy.AgentResult
-	for {
-		var shouldInterrupt bool
-		var shouldCompact bool
-		var interruptedWith []string
-
-		var streamErr error
-		result, streamErr = agent.Stream(ctx, fantasy.AgentStreamCall{
-			// The user turn always lives in k.History (appended by Stream, or a
-			// background completion injected by Wake), so Prompt stays empty —
-			// otherwise fantasy would append a duplicate user message.
-			Messages: k.History,
-
-			// Per-step cost accounting
-			OnStepFinish: func(step fantasy.StepResult) error {
-				u := Usage{}
-				u.FromFantasyUsage(step.Usage, k.Cfg.Model)
-				k.StepUsage = append(k.StepUsage, u)
-				k.recordUsage(ctx, u)
-
-				// Check queue at this safe step boundary. We set a flag and let
-				// the stream finish naturally so all steps are collected before
-				// we inject the queued messages and restart.
-				if !shouldInterrupt {
-					if queued := k.drainQueue(); len(queued) > 0 {
-						shouldInterrupt = true
-						interruptedWith = queued
-					}
-				}
-				// Also check context pressure at this boundary. A long agentic turn
-				// can balloon the window far past the limit within a single Stream
-				// call; checking only between Runs lets it overflow. We flag it and
-				// let the stream finish so all step messages are collected, then
-				// compact and restart the loop below.
-				if !shouldInterrupt && !shouldCompact && k.overContextThreshold() {
-					shouldCompact = true
-				}
-				return nil
-			},
-
-			// Live reasoning streaming
-			OnReasoningDelta: func(id, text string) error {
-				return k.Fire(ctx, string(EventReasoning), &ReasoningPayload{Text: text})
-			},
-
-			// Tool call fired the moment the LLM finishes emitting it
-			OnToolCall: func(tc fantasy.ToolCallContent) error {
-				return k.Fire(ctx, string(EventPreToolUse), &ToolUsePayload{
-					CallID: tc.ToolCallID,
-					Name:   tc.ToolName,
-					Args:   tc.Input,
-				})
-			},
-
-			// Tool result fired immediately after execution completes
-			OnToolResult: func(tr fantasy.ToolResultContent) error {
-				resStr := fmt.Sprintf("%v", tr.Result)
-				payload := &ToolUseResultPayload{CallID: tr.ToolCallID, Name: tr.ToolName, Result: resStr}
-				if strings.HasPrefix(resStr, "Error:") {
-					payload.Error = resStr
-					return k.Fire(ctx, string(EventPostToolUseFailure), payload)
-				}
-				return k.Fire(ctx, string(EventPostToolUse), payload)
-			},
-		})
-		if streamErr != nil {
-			return streamErr
-		}
-
-		if shouldInterrupt {
-			// Append this iteration's step messages to history, inject queued
-			// messages, fire the interrupt event, then restart.
-			for _, step := range result.Steps {
-				k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
-				k.History = append(k.History, step.Messages...)
-			}
-			for _, qm := range interruptedWith {
-				k.History = append(k.History, fantasy.NewUserMessage(qm))
-			}
-			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{
-				Messages: interruptedWith,
-			})
-			continue
-		}
-
-		if shouldCompact {
-			// Collect this iteration's step messages into history first so the
-			// summary covers everything generated so far, then compact (which
-			// resets History to the summary) and restart the loop on the smaller
-			// window. A queue interrupt takes precedence and is handled above.
-			for _, step := range result.Steps {
-				k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
-				k.History = append(k.History, step.Messages...)
-			}
-			if err := k.Compact(ctx); err != nil {
-				return err
-			}
-			continue
-		}
-		break
-	}
-
-	// Append final step messages to history and fire EventAssistantTurn.
-	var allStepMsgs []fantasy.Message
-	for _, step := range result.Steps {
-		k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
-		k.History = append(k.History, step.Messages...)
-		allStepMsgs = append(allStepMsgs, step.Messages...)
-	}
-	if len(allStepMsgs) > 0 {
-		if msgBytes, err2 := json.Marshal(allStepMsgs); err2 == nil {
-			_ = k.Fire(ctx, string(EventAssistantTurn), &AssistantTurnPayload{
-				Messages: json.RawMessage(msgBytes),
-			})
-		}
-	}
-
-	// Update Usage (Per-Turn) — update session map and token count without adding to cost again
-	var u Usage
-	u.FromFantasyUsage(result.TotalUsage, k.Cfg.Model)
-	k.usageMu.Lock()
-	k.Sessions[k.Cfg.SessionID] = u
-	// currentTokens must track context-window occupancy, NOT the turn's cumulative
-	// billed tokens. result.TotalUsage sums every step, so in a multi-step turn it
-	// counts each step's re-read of the (cached) context over and over — wildly
-	// over-stating how full the window is. The window occupancy is the last step's
-	// request size (its input-side tokens) plus what it generated.
-	if n := len(result.Steps); n > 0 {
-		var last Usage
-		last.FromFantasyUsage(result.Steps[n-1].Usage, k.Cfg.Model)
-		k.currentTokens = windowTokens(last)
-	}
-	k.usageMu.Unlock()
 
 	if k.Cfg.ShowHistory != nil && *k.Cfg.ShowHistory {
-		// Print history (after usage update so currentTokens is accurate)
 		PrettyPrintHistory(k)
 	}
 
@@ -1061,9 +668,6 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
 			_ = k.Store.SaveTraceMeta(TraceMeta{TraceID: k.Cfg.TraceID, EndedAt: now})
 		}
 	}
-
-	// write response and exit
-	w.Write([]byte(result.Response.Content.Text()))
 
 	// If no background completions are queued, the kernel is now idle.
 	k.queueMu.Lock()
@@ -1088,67 +692,40 @@ func (k *Kernel) Close() error {
 	return nil
 }
 
-// pruneOldToolCalls walks StepUsage backwards and trims history for steps whose
-// cumulative token total exceeds ToolCallPrunedSize.
-func (k *Kernel) pruneOldToolCalls() {
-	if len(k.StepUsage) == 0 || len(k.StepHistoryStart) != len(k.StepUsage) {
-		return
-	}
-	var accumulated int
-	for i := len(k.StepUsage) - 1; i >= 0; i-- {
-		u := k.StepUsage[i]
-		accumulated += int(u.Input + u.Output)
-		if accumulated <= k.Cfg.ToolCallPrunedSize {
-			continue
-		}
-		start := k.StepHistoryStart[i]
-		end := len(k.History)
-		if i+1 < len(k.StepHistoryStart) {
-			end = k.StepHistoryStart[i+1]
-		}
-		k.trimHistoryRange(start, end, 800)
-	}
-}
-
-// trimHistoryRange clears tool-call args and truncates tool results in [start, end).
-func (k *Kernel) trimHistoryRange(start, end, maxResultChars int) {
-	if maxResultChars <= 0 {
-		maxResultChars = 800
-	}
-	if start < 0 {
-		start = 0
-	}
-	if end > len(k.History) {
-		end = len(k.History)
-	}
-	for j := start; j < end; j++ {
+// trimForCompact shrinks history in place just before the compaction summarize
+// call: tool-call args are cleared, tool results truncated, and media/reasoning
+// parts stripped — the summary needs none of them, and un-stripped images would
+// make the one call meant to REDUCE cost re-pay for every blob in the
+// transcript. History is never mutated mid-chat outside compaction: rewriting
+// an already-sent message changes the byte prefix and busts the prompt cache.
+func (k *Kernel) trimForCompact(maxResultChars int) {
+	for j := range k.History {
 		msg := &k.History[j]
-		for p, part := range msg.Content {
-			switch msg.Role {
-			case fantasy.MessageRoleAssistant:
-				if tc, ok := fantasy.AsMessagePart[fantasy.ToolCallPart](part); ok {
-					tc.Input = "{}"
-					msg.Content[p] = tc
+		kept := msg.Parts[:0]
+		for _, part := range msg.Parts {
+			switch p := part.(type) {
+			case llm.ReasoningPart:
+				continue // never needed for the summary
+			case llm.ToolCallPart:
+				p.Arguments = "{}"
+				kept = append(kept, p)
+			case llm.ToolResultPart:
+				if len(p.Content) > maxResultChars {
+					p.Content = p.Content[:maxResultChars] + "… [trimmed]"
 				}
-			case fantasy.MessageRoleTool:
-				if tr, ok := fantasy.AsMessagePart[fantasy.ToolResultPart](part); ok {
-					if txt, ok := tr.Output.(fantasy.ToolResultOutputContentText); ok {
-						if len(txt.Text) > maxResultChars {
-							txt.Text = txt.Text[:maxResultChars] + "… [trimmed]"
-							tr.Output = txt
-							msg.Content[p] = tr
-						}
-					}
+				if len(p.Files) > 0 {
+					p.Files = nil
+					p.Content += " [media omitted]"
 				}
+				kept = append(kept, p)
+			case llm.FilePart:
+				kept = append(kept, llm.TextPart{Text: "[media omitted]"})
+			default:
+				kept = append(kept, part)
 			}
 		}
+		msg.Parts = kept
 	}
-}
-
-// trimAllToolResults caps every tool result in history. Used before Compact so
-// the summary call is not dominated by a single unbounded grep/MCP dump.
-func (k *Kernel) trimAllToolResults(maxResultChars int) {
-	k.trimHistoryRange(0, len(k.History), maxResultChars)
 }
 
 // Compact summarizes the current history and resets it.
@@ -1157,9 +734,9 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return nil
 	}
 
-	// Shrink fat tool results before paying for a full-history summarize call.
-	// Age-based prune may not have touched the recent (largest) dumps yet.
-	k.trimAllToolResults(2000)
+	// Shrink fat tool results (and strip media/reasoning) before paying for a
+	// full-history summarize call.
+	k.trimForCompact(2000)
 
 	messagesBefore := len(k.History)
 	tokensBefore := k.currentTokens
@@ -1173,37 +750,40 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return err
 	}
 
-	// Summarization is one llm-step on the cost-sensitive model. Run it through
-	// the Step layer so it is billed and (on non-stream) prefers the gateway cost
-	// header. Cross-model handoff (M9): when the compact model differs from the
-	// main chat model, adapt history for the target's wire API — a no-op while all
-	// in-scope models share openai-completions.
-	mainModel := ResolveModel(k.Cfg.Model)
-	compactModel := ResolveModel(k.cheapModelID())
-	histForCompact := TransformForHandoff(k.History, mainModel, compactModel)
-	compactMsgs := append(histForCompact, fantasy.NewUserMessage(string(prompt)))
-
-	res, err := k.cheapStep().Complete(ctx, compactModel, Context{
+	// Summarization is one llm-step on the cost-sensitive model, billed like any
+	// other (and preferring the gateway cost header on non-stream). Cross-model
+	// handoff (M9): when the compact model differs from the main chat model,
+	// adapt history for the target's wire API — a no-op while all in-scope
+	// models share openai-completions.
+	compactModelID := k.Cfg.Model
+	if k.Cfg.SmallerModel != "" {
+		compactModelID = k.Cfg.SmallerModel
+	}
+	compactModel := ResolveModel(compactModelID)
+	histForCompact := TransformForHandoff(k.History, ResolveModel(k.Cfg.Model), compactModel)
+	compactCtx := Context{
 		System:   k.SystemPrompt,
-		Messages: compactMsgs,
-	}, k.stepOptions())
+		Messages: append(histForCompact, llm.NewUserMessage(string(prompt))),
+	}
+	k.fireLLMStep(ctx, compactModel.ID, compactCtx, "")
+	res, err := k.Step.Complete(ctx, compactModel, compactCtx, StepOptions{Thinking: k.Cfg.Thinking, DisablePromptCache: true})
 	if err != nil {
 		return err
 	}
 	summary := res.Text()
 
-	// Bill the compact llm-step (previously invisible to runningCostUSD).
+	// Bill the compact llm-step.
 	k.recordUsage(ctx, res.Usage)
 
-	// Reset history. System stays out of History — Fantasy re-injects it via
-	// WithSystemPrompt on the main agent.
-	k.History = []fantasy.Message{
-		fantasy.NewUserMessage("Tell me the summary of our conversation."),
+	// Reset history. System stays out of History — the Step layer re-injects it
+	// as the single leading system message on every call.
+	k.History = []llm.Message{
+		llm.NewUserMessage("Tell me the summary of our conversation."),
 	}
-	msg := fantasy.NewUserMessage(
+	msg := llm.NewUserMessage(
 		"Here is a summary of our previous interaction for your reference:\n\n" + summary,
 	)
-	msg.Role = fantasy.MessageRoleAssistant
+	msg.Role = llm.RoleAssistant
 	k.History = append(k.History, msg)
 
 	// Reset the occupancy gauge to reflect the new, tiny history. Without this it
@@ -1237,8 +817,6 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 	subCfg.ParentSpanID = k.Cfg.SessionID
 	if k.Cfg.SmallerModel != "" {
 		subCfg.Model = k.Cfg.SmallerModel
-		// Force provider re-resolve for the cheaper model (may differ in prefix).
-		subCfg.Provider = nil
 	}
 
 	// Create an independent Kernel instance for the subagent
@@ -1322,11 +900,7 @@ func (r *HookRegistry) Fire(ctx context.Context, e Event) error {
 // is Enqueue()d and — if the parent has since gone idle — the kernel is woken and
 // re-enters its loop to process the result, the way a background-task completion
 // notification wakes the agent in Claude Code. This reuses the existing message
-// queue + step-boundary interrupt machinery; the only new primitive is Wake.
-
-// wakeMu serializes wake attempts (see Wake). It is a package-free field on the
-// Kernel via the embedded sync types declared in kernel.go's struct; we keep the
-// extra mutex local to this file to avoid touching that struct further.
+// queue + turn-boundary interrupt machinery; the only new primitive is Wake.
 
 // SpawnBackground starts task as an asynchronous subagent and returns a short
 // task id. The call returns immediately; the result is delivered later via the
@@ -1344,7 +918,7 @@ func (k *Kernel) SpawnBackground(task string) string {
 		}
 		_ = k.Fire(bctx, string(EventTaskCompleted), &TaskPayload{TaskID: id, Title: task, Status: status})
 		k.Enqueue(fmt.Sprintf("[background task %s %s]\n%s", id, status, result))
-		// If a loop is already running it will drain the queue at the next step
+		// If a loop is already running it will drain the queue at the next turn
 		// boundary; otherwise wake the idle kernel to process the result.
 		if !k.running.Load() {
 			_ = k.Wake(bctx)
@@ -1368,9 +942,9 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if len(msgs) == 0 {
 		return nil
 	}
-	// System prompt is Fantasy-owned; only inject the queued user messages.
+	// System prompt is Step-owned; only inject the queued user messages.
 	for _, m := range msgs {
-		k.History = append(k.History, fantasy.NewUserMessage(m))
+		k.History = append(k.History, llm.NewUserMessage(m))
 	}
 	w := k.lastWriter
 	if w == nil {
@@ -1387,17 +961,14 @@ type SubagentAsyncArgs struct {
 // newSubagentAsyncTool builds the subagent_async tool, which delegates a subtask
 // to a background agent and returns immediately.
 func newSubagentAsyncTool(k *Kernel, desc string) *tools.ToolDef {
-	fTool := fantasy.NewAgentTool("subagent_async", desc, func(ctx context.Context, args SubagentAsyncArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("subagent_async", desc, func(ctx context.Context, args SubagentAsyncArgs) (llm.ToolResult, error) {
 		id := k.SpawnBackground(args.Task)
-		return fantasy.ToolResponse{
-			Type:    "text",
-			Content: fmt.Sprintf("Started background task %s. You'll be notified when it completes — continue with other work in the meantime.", id),
-		}, nil
+		return llm.NewTextResult(fmt.Sprintf("Started background task %s. You'll be notified when it completes — continue with other work in the meantime.", id)), nil
 	})
 	return &tools.ToolDef{
 		Name:        "subagent_async",
 		Description: desc,
 		Template:    "subagent.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

@@ -5,15 +5,19 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 const (
 	DefaultReadLimit = 2000
 	MaxLineLength    = 2000
+	// MaxMediaBytes caps a media attachment returned by the read tool — the
+	// same 5 MiB bound the kernel applies to inline ![](path) refs.
+	MaxMediaBytes = 5 << 20
 )
 
 type ReadArgs struct {
@@ -33,13 +37,13 @@ func (a ReadArgs) Validate() error {
 }
 
 func NewReadTool(a Agent, desc string) *ToolDef {
-	// errf builds an error tool response; toroid keys tool failure off the
+	// errf builds an error tool result; toroid keys tool failure off the
 	// "Error:" content prefix, so every failure path funnels through here.
-	errf := func(format string, a ...any) fantasy.ToolResponse {
-		return fantasy.NewTextErrorResponse("Error: " + fmt.Sprintf(format, a...))
+	errf := func(format string, a ...any) llm.ToolResult {
+		return llm.NewErrorResult("Error: " + fmt.Sprintf(format, a...))
 	}
 
-	fTool := fantasy.NewAgentTool("read", desc, func(ctx context.Context, args ReadArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("read", desc, func(ctx context.Context, args ReadArgs) (llm.ToolResult, error) {
 		if err := args.Validate(); err != nil {
 			return errf("%v", err), nil
 		}
@@ -104,14 +108,20 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			if isBinary {
 				// Images and PDFs are returned as media attachments so a
 				// vision-capable model can see them; other binaries are refused.
+				// Media above the cap is refused outright: an unbounded blob would
+				// be re-sent (and re-billed) with every subsequent llm-step.
 				if mt, ok := MediaType(path); ok {
+					if info.Size() > MaxMediaBytes {
+						return errf("media %s is %d bytes, over the %d-byte cap", path, info.Size(), MaxMediaBytes), nil
+					}
 					data, err := os.ReadFile(path)
 					if err != nil {
 						return errf("%v", err), nil
 					}
-					resp := fantasy.NewMediaResponse(data, mt)
-					resp.Content = fmt.Sprintf("Read %s (%d bytes, %s)", path, len(data), mt)
-					return resp, nil
+					return llm.ToolResult{
+						Content: fmt.Sprintf("Read %s (%d bytes, %s)", path, len(data), mt),
+						Files:   []llm.FilePart{{Filename: filepath.Base(path), MediaType: mt, Data: data}},
+					}, nil
 				}
 				return errf("cannot read binary file: %s", path), nil
 			}
@@ -148,14 +158,14 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			content += "\n</content>"
 		}
 
-		return fantasy.NewTextResponse(content), nil
+		return llm.NewTextResult(TruncateToolOutput(content)), nil
 	})
 
 	return &ToolDef{
 		Name:        "read",
 		Description: desc,
 		Template:    "read.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }
 

@@ -3,7 +3,7 @@ package tools
 import (
 	"context"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 type SubagentArgs struct {
@@ -12,18 +12,20 @@ type SubagentArgs struct {
 
 // NewSubagentTool runs a subagent synchronously and returns its output.
 func NewSubagentTool(a Agent, desc string) *ToolDef {
-	fTool := fantasy.NewAgentTool("subagent", desc, func(ctx context.Context, args SubagentArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+	h := llm.NewTool("subagent", desc, func(ctx context.Context, args SubagentArgs) (llm.ToolResult, error) {
 		output, err := a.RunSubagent(ctx, args.Task)
 		if err != nil {
-			return fantasy.ToolResponse{}, err
+			return llm.ToolResult{}, err
 		}
-		return fantasy.ToolResponse{Type: "text", Content: output}, nil
+		// Cap like every other tool: a verbose subagent transcript would
+		// otherwise ride in the parent's prompt at full size every turn.
+		return llm.NewTextResult(TruncateToolOutput(output)), nil
 	})
 
 	return &ToolDef{
 		Name:        "subagent",
 		Description: desc,
 		Template:    "subagent.tool.tmpl",
-		AgentTool:   fTool,
+		Handler:     h,
 	}
 }

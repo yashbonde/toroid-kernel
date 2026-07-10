@@ -8,7 +8,8 @@ canonical way to use each feature.
 Run any example from the repo root:
 
 ```bash
-export ANTHROPIC_API_KEY=your_api_key   # default model is anthropic/claude-haiku-4-5; see "Providers" below
+export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
+export LLM_GATEWAY_KEY=sk-...           # default model is llmgateway/claude-haiku-4-5
 go run ./examples/<name>
 ```
 
@@ -37,16 +38,16 @@ calls as compact trimmed one-liners, and tracks running cost. Targeting knobs ar
 environment variables; per-run toggles are flags:
 
 ```bash
-export TOROID_LLM_TOKEN=your_api_key
-TOROID_MODEL=anthropic/claude-haiku-4-5 go run ./examples/toroid-repl --thinking high --save
+export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
+TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/toroid-repl --thinking high --save
 # in-REPL: /help /cost /model /reset /clear /exit (or Ctrl-D)
 ```
 
 | Env var | Meaning | Default |
 |---------|---------|---------|
-| `TOROID_MODEL` | provider/model id | `anthropic/claude-haiku-4-5` |
+| `TOROID_MODEL` | model id | `llmgateway/claude-haiku-4-5` |
 | `TOROID_LLM_TOKEN` | API key for the provider | _(required)_ |
-| `TOROID_MAX_ITER` | max tool iterations | kernel default (50) |
+| `TOROID_MAX_ITER` | max tool iterations | kernel default (25) |
 | `TOROID_TRIM` | max chars per tool arg/result line | 120 |
 
 | Flag | Meaning | Default |
@@ -58,7 +59,7 @@ TOROID_MODEL=anthropic/claude-haiku-4-5 go run ./examples/toroid-repl --thinking
 ## Core concepts
 
 - **Construct once, reuse.** `toroid.NewKernel(ctx, toroid.Config{...})` wires the
-  provider, tools, event bus, and (when `Save: true`) the SQLite store. Always
+  gateway client, tools, event bus, and (when `Save: true`) the SQLite store. Always
   `defer kernel.Close()`.
 - **Run vs Stream.** `Run` blocks and returns the full text; `Stream` writes
   incrementally to an `io.Writer`. Both drive the same tool-calling loop.
@@ -74,16 +75,9 @@ TOROID_MODEL=anthropic/claude-haiku-4-5 go run ./examples/toroid-repl --thinking
   `~/.toroid/sql.db`; `toroid.OTELSpans(traceID)` exports spec-valid
   OpenTelemetry spans for any OTLP backend.
 
-## Providers
+## Models
 
-Every example uses `anthropic/claude-haiku-4-5` (the kernel default), but the
-only change needed for another provider is the `Model` prefix and the API key:
-
-| Prefix       | Model env / key            |
-|--------------|----------------------------|
-| `google`     | `GEMINI_TOKEN`             |
-| `anthropic`  | `ANTHROPIC_API_KEY`        |
-| `openai`     | `OPENAI_API_KEY`           |
-| `llmgateway` | `LLM_GATEWAY_BASE_URL` + bearer key |
-
-See the repo root `README.md` for provider config snippets.
+Everything runs through the LiteLLM gateway (`LLM_GATEWAY_BASE_URL` +
+`LLM_GATEWAY_KEY`). Model ids are `llmgateway/<name>` where `<name>` is
+whatever the gateway routes — `claude-haiku-4-5`, `gpt-5.4-mini`, `kimi-k2p6`,
+`glm-5p1`, `minimax-m2p7`, …. See the repo root `README.md`.

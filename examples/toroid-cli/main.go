@@ -8,12 +8,12 @@
 // answer — without binding to Go. Diagnostics go to stderr so stdout stays a
 // clean, machine-parseable event stream.
 //
-//	export ANTHROPIC_API_KEY=your_api_key
+//	export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
 //	go run ./examples/toroid-cli 'what files are in this directory?'
 //
 // Flags (must come before the prompt):
 //
-//	-model    llm model            (default anthropic/claude-haiku-4-5)
+//	-model    llm model            (default llmgateway/claude-haiku-4-5)
 //	-workdir  working directory    (default current directory)
 //	-thinking thinking budget      none | low | high   (default none)
 //	-tokens   include per-token Token/Reasoning deltas  (default false)
@@ -45,7 +45,7 @@ import (
 )
 
 func main() {
-	model := flag.String("model", "anthropic/claude-haiku-4-5", "llm model name")
+	model := flag.String("model", "llmgateway/claude-haiku-4-5", "llm model name")
 	workdir := flag.String("workdir", ".", "working directory")
 	thinking := flag.String("thinking", "none", "thinking budget: none | low | high")
 	tokens := flag.Bool("tokens", false, "include per-step Reasoning deltas in the stream")
@@ -59,20 +59,13 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Pick the API-key env var from the model's provider prefix so the same
-	// binary works across providers. For llmgateway you must also set
-	// LLM_GATEWAY_BASE_URL (the OpenAI-compatible base, including "/v1").
-	keyEnv := apiKeyEnvFor(*model)
-	apiKey := os.Getenv(keyEnv)
-	if apiKey == "" {
-		fmt.Fprintf(os.Stderr, "set %s to run\n", keyEnv)
-		os.Exit(1)
-	}
+	// The key is resolved per provider prefix by NewKernel: LLM_GATEWAY_KEY for
+	// llmgateway/* (with LLM_GATEWAY_BASE_URL), OPENAI_API_KEY for openai/*,
+	// ANTHROPIC_API_KEY for anthropic/*.
 
 	ctx := context.Background()
 	k, err := toroid.NewKernel(ctx, toroid.Config{
 		Model:                *model,
-		APIKey:               apiKey,
 		WorkDir:              *workdir,
 		Thinking:             toroid.Thinking(*thinking),
 		IncludeComputerTools: true,
@@ -123,21 +116,5 @@ func main() {
 	if _, _, err := k.Run(ctx, prompt); err != nil {
 		fmt.Fprintln(os.Stderr, "run:", err)
 		os.Exit(1)
-	}
-}
-
-// apiKeyEnvFor maps a "provider/model" id to the env var holding that provider's
-// API key, mirroring toroid.NewProviderFromLLMId.
-func apiKeyEnvFor(model string) string {
-	provider, _, _ := strings.Cut(model, "/")
-	switch provider {
-	case "anthropic":
-		return "ANTHROPIC_API_KEY"
-	case "openai":
-		return "OPENAI_API_KEY"
-	case "llmgateway":
-		return "LLM_GATEWAY_KEY"
-	default: // google or unprefixed
-		return "GEMINI_TOKEN"
 	}
 }

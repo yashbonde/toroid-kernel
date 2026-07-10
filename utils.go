@@ -21,9 +21,6 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-//go:embed assets/*.json
-var assetsFS embed.FS
-
 //go:embed prompts/*.tmpl prompts/*.txt
 var promptFS embed.FS
 
@@ -36,15 +33,6 @@ func readPrompt(name string) ([]byte, error) {
 		}
 	}
 	return promptFS.ReadFile("prompts/" + name)
-}
-
-func readAssets(name string) ([]byte, error) {
-	if dir, err := toroidHome(); err == nil {
-		if b, err := os.ReadFile(filepath.Join(dir, "assets", name)); err == nil {
-			return b, nil
-		}
-	}
-	return assetsFS.ReadFile("assets/" + name)
 }
 
 const (
@@ -114,7 +102,7 @@ func PrettyPrintHistory(kernel *Kernel) {
 	var b strings.Builder
 	indent := strings.Repeat(" ", logPrefix)
 	for _, msg := range kernel.History {
-		message := indent + colorGray + string(msg.Role) + colorReset + ": " + strings.ReplaceAll(fmt.Sprintf("%v", msg.Content), "\n", "\\n")
+		message := indent + colorGray + string(msg.Role) + colorReset + ": " + strings.ReplaceAll(fmt.Sprintf("%v", msg.Parts), "\n", "\\n")
 		if len(message) > logWidth {
 			message = message[:logWidth-3] + "..."
 		}

@@ -11,7 +11,7 @@
 //     to EventToken to observe individual token deltas (e.g. to render a
 //     live UI). Use it for interactive/TUI hosts.
 //
-//     export ANTHROPIC_API_KEY=your_api_key
+//     export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
 //     go run ./examples/running
 package main
 
@@ -26,9 +26,8 @@ import (
 	"runtime"
 	"strings"
 
-	"charm.land/fantasy"
-	fantasyschema "charm.land/fantasy/schema"
 	toroid "github.com/yashbonde/toroid-kernel"
+	"github.com/yashbonde/toroid-kernel/llm"
 	tools "github.com/yashbonde/toroid-kernel/tools"
 )
 
@@ -39,11 +38,7 @@ func main() {
 	apiKey := os.Getenv("LLM_GATEWAY_KEY")
 	model := "llmgateway/claude-haiku-4-5"
 	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-		model = "anthropic/claude-haiku-4-5"
-	}
-	if apiKey == "" {
-		fmt.Println("set LLM_GATEWAY_KEY or ANTHROPIC_API_KEY to run this example")
+		fmt.Println("set LLM_GATEWAY_KEY to run this example")
 		return
 	}
 	// Allow overriding the model via env to run the example across providers.
@@ -75,10 +70,10 @@ func main() {
 	k.Tools.Register(&tools.ToolDef{
 		Name:        "get_user",
 		Description: "Fetch the current user profile from randomuser.me",
-		AgentTool: fantasy.NewAgentTool(
+		Handler: llm.NewTool(
 			"get_user",
 			"Fetch the current user profile from randomuser.me",
-			func(ctx context.Context, args GetUserArgs, call fantasy.ToolCall) (fantasy.ToolResponse, error) {
+			func(ctx context.Context, args GetUserArgs) (llm.ToolResult, error) {
 				var fields []string
 				if args.Gender {
 					fields = append(fields, "gender")
@@ -104,14 +99,14 @@ func main() {
 				}
 				resp, err := http.Get(url)
 				if err != nil {
-					return fantasy.ToolResponse{}, err
+					return llm.ToolResult{}, err
 				}
 				defer resp.Body.Close()
 				body, err := io.ReadAll(resp.Body)
 				if err != nil {
-					return fantasy.ToolResponse{}, err
+					return llm.ToolResult{}, err
 				}
-				return fantasy.ToolResponse{Type: "text", Content: string(body)}, nil
+				return llm.NewTextResult(string(body)), nil
 			}),
 	})
 
@@ -175,7 +170,7 @@ func main() {
 		MainFiles   []string `json:"main_files"`
 		Description string   `json:"description"`
 	}
-	dirSchema := fantasyschema.Generate(reflect.TypeOf(DirectoryInfo{}))
+	dirSchema := toroid.GenerateSchema(reflect.TypeOf(DirectoryInfo{}))
 	// Structured generation is single-turn with no tools — embed the facts directly.
 	out, _, err = k.Run(ctx,
 		"This is a Go library called toroid-kernel. Its root files include kernel.go, store.go, utils.go, multimodal.go, otlp.go, provider.go, and an examples/ directory. Return structured info about this project.",

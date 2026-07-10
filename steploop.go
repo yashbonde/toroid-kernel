@@ -3,28 +3,30 @@ package toroid
 import (
 	"context"
 	"encoding/json"
+	"hash/fnv"
 	"io"
+	"strconv"
+	"strings"
 
-	"charm.land/fantasy"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
-// Kernel-owned tool loop (Phase B, P1.1). This drives each turn's LLM call
-// through the Step layer — one product llm-step per turn — with the kernel
-// executing tools between calls. It is the architecture the port prefers (§2):
-// the Kernel owns turns/tools/compaction; a Step performs a single LLM call.
+// Kernel-owned tool loop. This drives each turn's LLM call through the Step
+// layer — one product llm-step per turn — with the kernel executing tools
+// between calls (§2 of the port scope): the Kernel owns turns/tools/compaction;
+// a Step performs a single LLM call.
 //
-// It reproduces the guarantees of the Fantasy Agent.Stream path: MaxIter cap,
-// repeat-call loop guard, queue-interrupt at turn boundaries, mid-turn
-// compaction under context pressure, tool events, and per-turn cost. It is
-// opt-in (Config.UseStepLoop) so the proven Agent path stays the production
-// default until this is validated against a live gateway.
+// Guarantees: MaxIter cap, repeat-call loop guard, queue-interrupt at turn
+// boundaries, mid-turn compaction under context pressure, tool events, and
+// per-turn cost.
 //
-// v1 uses Step.Complete (non-streaming): the assistant text is written after
-// each turn rather than token-by-token, and live reasoning deltas are not
-// emitted. Everything else — tools, history shape, cost, guards — matches.
+// Turns use Step.Complete (non-streaming) so every llm-step can carry the
+// gateway's authoritative cost header: the assistant text is written after each
+// turn rather than token-by-token; reasoning content is emitted as one
+// EventReasoning per turn.
 func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 	model := ResolveModel(k.Cfg.Model)
-	tools := k.agentTools()
+	wireTools := k.wireTools()
 
 	var recentSigs []string // rolling window of tool-call signatures for the loop guard
 	turns := 0
@@ -34,36 +36,44 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 			return err
 		}
 
-		res, err := k.Step.Complete(ctx, model, Context{
+		stepCtx := Context{
 			System:   k.SystemPrompt,
 			Messages: k.History,
-			Tools:    tools,
-		}, k.stepOptions())
+			Tools:    wireTools,
+		}
+		k.fireLLMStep(ctx, model.ID, stepCtx, "")
+		res, err := k.Step.Complete(ctx, model, stepCtx, StepOptions{Thinking: k.Cfg.Thinking})
 		if err != nil {
 			return err
 		}
 		turns++
 
 		// Record the assistant turn: append to history, bill, update occupancy.
-		assistant := assistantMessageFromContent(res.Content)
-		k.appendStepMessages(ctx, []fantasy.Message{assistant})
-		k.recordUsage(ctx, res.Usage)
-		k.setWindowTokens(res.Usage)
+		// Reasoning parts stay in history for observability; the wire layer drops
+		// them when replaying (OpenAI assistant messages carry text + tool calls).
+		k.appendStepMessages(ctx, []llm.Message{{Role: llm.RoleAssistant, Parts: res.Content}})
+		k.recordUsage(ctx, res.Usage) // also refreshes the window-occupancy gauge
 
-		toolCalls := res.Content.ToolCalls()
+		for _, p := range res.Content {
+			if rp, ok := p.(llm.ReasoningPart); ok && rp.Text != "" {
+				_ = k.Fire(ctx, string(EventReasoning), &ReasoningPayload{Text: rp.Text})
+			}
+		}
+
+		toolCalls := llm.ToolCallsOf(res.Content)
 
 		// Write assistant text once the turn's tool intent is known: a final turn
 		// (no tools) is the user-visible answer.
 		if len(toolCalls) == 0 {
-			if _, err := io.WriteString(w, res.Content.Text()); err != nil {
+			if _, err := io.WriteString(w, llm.TextOf(res.Content)); err != nil {
 				return err
 			}
 			return nil // end of chat
 		}
 
 		// Execute tools locally (not an llm-step) and append their results.
-		toolMsg, sig := k.runToolCalls(ctx, tools, toolCalls)
-		k.appendStepMessages(ctx, []fantasy.Message{toolMsg})
+		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
+		k.appendStepMessages(ctx, []llm.Message{toolMsg})
 
 		// Loop guard: stop if the last MaxRepeatCalls turns made the identical
 		// tool call(s) with identical result(s) — a spin making no progress.
@@ -88,7 +98,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 		// continue the same chat on the extended history.
 		if queued := k.drainQueue(); len(queued) > 0 {
 			for _, qm := range queued {
-				k.History = append(k.History, fantasy.NewUserMessage(qm))
+				k.History = append(k.History, llm.NewUserMessage(qm))
 			}
 			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{Messages: queued})
 			continue
@@ -103,118 +113,126 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 	}
 }
 
-// agentTools returns the kernel's registered tools as Fantasy AgentTools for a
-// Step Context (same set the Fantasy Agent path receives via WithTools).
-func (k *Kernel) agentTools() []fantasy.AgentTool {
+// wireTools returns the kernel's registered tools as wire descriptions for a
+// Step Context.
+func (k *Kernel) wireTools() []llm.Tool {
 	if k.Tools == nil {
 		return nil
 	}
-	var out []fantasy.AgentTool
+	var out []llm.Tool
 	for _, t := range k.Tools.Tools() {
-		out = append(out, t.AgentTool)
+		if t.Handler != nil {
+			out = append(out, llm.ToolOf(t.Handler))
+		}
 	}
 	return out
 }
 
-// appendStepMessages appends a turn's messages to history, index-aligning
-// StepHistoryStart so pruneOldToolCalls keeps working, and fires
-// EventAssistantTurn so history can be reconstructed from events alone.
-func (k *Kernel) appendStepMessages(ctx context.Context, msgs []fantasy.Message) {
+// appendStepMessages appends a turn's messages to history and fires
+// EventAssistantTurn so history can be reconstructed from events alone. Media
+// bytes are stripped from the persisted payload — an image the model saw would
+// otherwise be duplicated into SQLite (and the event bus) as base64 every time
+// it appears in a turn; a resumed session gets a text stub instead.
+func (k *Kernel) appendStepMessages(ctx context.Context, msgs []llm.Message) {
 	if len(msgs) == 0 {
 		return
 	}
-	k.StepHistoryStart = append(k.StepHistoryStart, len(k.History))
 	k.History = append(k.History, msgs...)
-	if b, err := json.Marshal(msgs); err == nil {
+	persist := make([]llm.Message, len(msgs))
+	for i, m := range msgs {
+		persist[i] = m
+		hasMedia := false
+		for _, p := range m.Parts {
+			switch v := p.(type) {
+			case llm.FilePart:
+				hasMedia = true
+			case llm.ToolResultPart:
+				hasMedia = hasMedia || len(v.Files) > 0
+			}
+		}
+		if !hasMedia {
+			continue
+		}
+		parts := make([]llm.Part, 0, len(m.Parts))
+		for _, p := range m.Parts {
+			switch v := p.(type) {
+			case llm.FilePart:
+				parts = append(parts, llm.TextPart{Text: "[media omitted: " + v.Filename + "]"})
+			case llm.ToolResultPart:
+				if len(v.Files) > 0 {
+					v.Files = nil
+					v.Content += " [media omitted]"
+				}
+				parts = append(parts, v)
+			default:
+				parts = append(parts, p)
+			}
+		}
+		persist[i].Parts = parts
+	}
+	if b, err := json.Marshal(persist); err == nil {
 		_ = k.Fire(ctx, string(EventAssistantTurn), &AssistantTurnPayload{Messages: json.RawMessage(b)})
 	}
-}
-
-// setWindowTokens updates the context-occupancy gauge from a single turn's usage
-// (see windowTokens — one step's request size, not a summed multi-step total).
-func (k *Kernel) setWindowTokens(u Usage) {
-	k.usageMu.Lock()
-	k.currentTokens = windowTokens(u)
-	k.usageMu.Unlock()
 }
 
 // runToolCalls executes each tool call via the registry, firing pre/post events,
 // and returns a tool-role message with the results plus a signature of
 // (name, input, result) pairs for the loop guard.
-func (k *Kernel) runToolCalls(ctx context.Context, tools []fantasy.AgentTool, calls []fantasy.ToolCallContent) (fantasy.Message, string) {
-	toolMap := make(map[string]fantasy.AgentTool, len(tools))
-	for _, t := range tools {
-		toolMap[t.Info().Name] = t
-	}
-
-	var parts []fantasy.MessagePart
+func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.ToolCallPart) (llm.Message, string) {
+	var parts []llm.Part
 	var sig string
 	for _, call := range calls {
 		_ = k.Fire(ctx, string(EventPreToolUse), &ToolUsePayload{
-			CallID: call.ToolCallID, Name: call.ToolName, Args: call.Input,
+			CallID: call.ID, Name: call.Name, Args: call.Arguments,
 		})
 
-		var output fantasy.ToolResultOutputContent
 		var resultText string
-		tool, ok := toolMap[call.ToolName]
-		if !ok {
-			resultText = "Error: tool not found: " + call.ToolName
-			output = fantasy.ToolResultOutputContentText{Text: resultText}
+		var files []llm.FilePart
+		tool, ok := k.Tools.Lookup(call.Name)
+		if !ok || tool.Handler == nil {
+			resultText = "Error: tool not found: " + call.Name
 		} else {
-			resp, err := tool.Run(ctx, fantasy.ToolCall{ID: call.ToolCallID, Name: call.ToolName, Input: call.Input})
+			res, err := tool.Handler.Run(ctx, call.Arguments)
 			if err != nil {
 				resultText = "Error: " + err.Error()
-			} else if resp.IsError {
-				resultText = "Error: " + resp.Content
+			} else if res.IsError && !strings.HasPrefix(res.Content, "Error:") {
+				resultText = "Error: " + res.Content
 			} else {
-				resultText = resp.Content
+				resultText = res.Content
+				files = res.Files
 			}
-			output = fantasy.ToolResultOutputContentText{Text: resultText}
+		}
+		if len(files) > 0 && !model.SupportsImage() {
+			// Never ship media to a text-only model: it would either error or be
+			// silently dropped upstream while still being paid for on the wire.
+			files = nil
+			resultText += " [media omitted: model does not accept image input]"
 		}
 
-		parts = append(parts, fantasy.ToolResultPart{ToolCallID: call.ToolCallID, Output: output})
+		parts = append(parts, llm.ToolResultPart{
+			ToolCallID: call.ID,
+			Content:    resultText,
+			IsError:    strings.HasPrefix(resultText, "Error:"),
+			Files:      files,
+		})
 
-		payload := &ToolUseResultPayload{CallID: call.ToolCallID, Name: call.ToolName, Result: resultText}
-		if len(resultText) >= 6 && resultText[:6] == "Error:" {
+		payload := &ToolUseResultPayload{CallID: call.ID, Name: call.Name, Result: resultText}
+		if strings.HasPrefix(resultText, "Error:") {
 			payload.Error = resultText
 			_ = k.Fire(ctx, string(EventPostToolUseFailure), payload)
 		} else {
 			_ = k.Fire(ctx, string(EventPostToolUse), payload)
 		}
 
-		sig += call.ToolName + "\x00" + call.Input + "\x00" + resultText + "\n"
+		h := fnv.New64a()
+		h.Write([]byte(call.Name))
+		h.Write([]byte{0})
+		h.Write([]byte(call.Arguments))
+		h.Write([]byte{0})
+		h.Write([]byte(resultText))
+		sig += strconv.FormatUint(h.Sum64(), 16) + "\n"
 	}
-	return fantasy.Message{Role: fantasy.MessageRoleTool, Content: parts}, sig
-}
-
-// assistantMessageFromContent converts a Step's response content into an
-// assistant message for history, mirroring Fantasy's own assembly so the wire
-// shape is identical (text, reasoning, and tool-call parts are preserved).
-func assistantMessageFromContent(rc fantasy.ResponseContent) fantasy.Message {
-	var parts []fantasy.MessagePart
-	for _, c := range rc {
-		switch c.GetType() {
-		case fantasy.ContentTypeText:
-			if tc, ok := fantasy.AsContentType[fantasy.TextContent](c); ok {
-				parts = append(parts, fantasy.TextPart{Text: tc.Text, ProviderOptions: fantasy.ProviderOptions(tc.ProviderMetadata)})
-			}
-		case fantasy.ContentTypeReasoning:
-			if rcn, ok := fantasy.AsContentType[fantasy.ReasoningContent](c); ok {
-				parts = append(parts, fantasy.ReasoningPart{Text: rcn.Text, ProviderOptions: fantasy.ProviderOptions(rcn.ProviderMetadata)})
-			}
-		case fantasy.ContentTypeToolCall:
-			if tcc, ok := fantasy.AsContentType[fantasy.ToolCallContent](c); ok {
-				parts = append(parts, fantasy.ToolCallPart{
-					ToolCallID:       tcc.ToolCallID,
-					ToolName:         tcc.ToolName,
-					Input:            tcc.Input,
-					ProviderExecuted: tcc.ProviderExecuted,
-					ProviderOptions:  fantasy.ProviderOptions(tcc.ProviderMetadata),
-				})
-			}
-		}
-	}
-	return fantasy.Message{Role: fantasy.MessageRoleAssistant, Content: parts}
+	return llm.Message{Role: llm.RoleTool, Parts: parts}, sig
 }
 
 // allEqual reports whether the last n entries of sigs are all identical and
