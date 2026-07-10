@@ -2,14 +2,14 @@
 
 `toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, gateway-truth cost accounting, and a built-in tool registry.
 
-**~6,650 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
+**~6,654 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
 
 **Runner binaries** (built with `-trimpath -ldflags="-s -w"`; linux is amd64):
 
 | runner | macOS (arm64) | Linux (amd64) | Linux + upx |
 |---|---|---|---|
-| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.7 MB |
-| `examples/repl` | 13.3 MB | 13.7 MB | 5.7 MB |
+| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.6 MB |
+| `examples/repl` | 13.3 MB | 13.7 MB | 5.6 MB |
 
 ## Features
 
