@@ -7,10 +7,10 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ### Changed
 
-- **grep tool removed.** The bash tool already routes `grep`/`rg` through rtk
-  (compressed, gitignore-aware via rg) — the dedicated tool ran plain
-  `grep -r` with no rtk, scanned `.git`/`node_modules`, and was strictly
-  worse. Searching is bash's job now; the bash doc says so.
+- **grep, glob, and ls tools removed.** bash+rtk covers all three (`rtk grep`,
+  `rtk find`, `rtk ls` — compressed output), and `read` already lists
+  directories. The default toolset is now read/write/edit/multiedit/bash/
+  notify/skill/subagent (+ subagent_async).
 - **`MaxIter` default 25 → 100.** With prompt-cache breakpoints on every loop
   step, additional turns re-read the prefix at cache price, so a deep tool loop
   is affordable; the repeat-call guard still stops genuine spins early.

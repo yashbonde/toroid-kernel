@@ -20,7 +20,7 @@
 - Multimodal input: images and PDFs inline in prompts (`![](path)`, 5 MiB cap, capability-gated per model) and as tool-result media (the `read` tool returns images a vision model can see)
 - Single-file SQLite persistence (traces, costs, events) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
 - Conversation compaction, loop guards (MaxIter, default 100, + repeat-call spin guard), and history reconstruction for resume
-- Built-in filesystem, shell, search, notification, and subagent tools; MCP client for remote tool servers. Truncated tool outputs spill to `~/.toroid/sessions/<session>/tool-output/` (the result names the file) so nothing is lost; when `rtk` is on PATH, simple read-only bash commands are auto-routed through it for compressed output
+- Lean default toolset — read, write, edit, multiedit, bash, notify, skill, subagent (search/list/find go through bash); MCP client for remote tool servers. Truncated tool outputs spill to `~/.toroid/sessions/<session>/tool-output/` (the result names the file) so nothing is lost; when `rtk` is on PATH, simple read-only bash commands are auto-routed through it for compressed output
 - Background agents — async subagents that wake an idle kernel on completion
 
 ## Verified models
