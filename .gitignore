@@ -6,11 +6,7 @@ coverage.out
 dist/
 
 # Built example binaries (compiled artifacts, never committed)
-examples/toroid-repl/app
-examples/toroid-repl/app_stripped
-examples/toroid-repl/app_upx
-examples/toroid-repl/toroid-repl
-examples/toroid-repl/toroid-repl.exe
+examples/repl/repl
 examples/toroid-cli/toroid-cli
 examples/structured-after-tools/structured-after-tools
 examples/usage-with-mcp/slack-mcp

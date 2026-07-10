@@ -34,7 +34,7 @@ func NewSkillTool(a Agent, desc string) *ToolDef {
 		if err != nil {
 			return llm.NewErrorResult(fmt.Sprintf("Error: %v", err)), nil
 		}
-		return llm.NewTextResult(TruncateToolOutput(string(b))), nil
+		return llm.NewTextResult(TruncateToolOutput(a, string(b))), nil
 	})
 
 	return &ToolDef{

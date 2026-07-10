@@ -26,7 +26,7 @@ func NewGrepTool(a Agent, desc string) *ToolDef {
 			return llm.NewTextResult("No matches found."), nil
 		}
 
-		return llm.NewTextResult(TruncateToolOutput(string(out))), nil
+		return llm.NewTextResult(TruncateToolOutput(a, string(out))), nil
 	})
 
 	return &ToolDef{

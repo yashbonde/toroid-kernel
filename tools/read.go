@@ -158,7 +158,7 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			content += "\n</content>"
 		}
 
-		return llm.NewTextResult(TruncateToolOutput(content)), nil
+		return llm.NewTextResult(TruncateToolOutput(a, content)), nil
 	})
 
 	return &ToolDef{

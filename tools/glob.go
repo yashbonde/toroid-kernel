@@ -10,12 +10,15 @@ import (
 )
 
 type GlobArgs struct {
-	Pattern string `json:"pattern" jsonschema:"description=The glob pattern to match (e.g. '**/*.go')"`
+	Pattern string `json:"pattern" jsonschema:"description=File name pattern (e.g. '*.go'); a leading **/ means in any directory"`
 }
 
 func NewGlobTool(a Agent, desc string) *ToolDef {
 	h := llm.NewTool("glob", desc, func(ctx context.Context, args GlobArgs) (llm.ToolResult, error) {
-		cmd := exec.CommandContext(ctx, "find", ".", "-name", args.Pattern)
+		// find -name matches basenames only, so the common '**/' prefix ("in any
+		// directory") is stripped rather than silently matching nothing.
+		pattern := strings.TrimPrefix(args.Pattern, "**/")
+		cmd := exec.CommandContext(ctx, "find", ".", "-name", pattern)
 		cmd.Dir = a.WorkDir()
 		out, err := cmd.CombinedOutput()
 		if err != nil {
@@ -30,7 +33,7 @@ func NewGlobTool(a Agent, desc string) *ToolDef {
 			}
 		}
 
-		content := TruncateToolOutput(fmt.Sprintf("<matches>\n%s\n</matches>", strings.Join(filtered, "\n")))
+		content := TruncateToolOutput(a, fmt.Sprintf("<matches>\n%s\n</matches>", strings.Join(filtered, "\n")))
 		return llm.NewTextResult(content), nil
 	})
 

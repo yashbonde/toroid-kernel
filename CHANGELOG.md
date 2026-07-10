@@ -5,6 +5,38 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ## Unreleased
 
+### Changed
+
+- **`MaxIter` default 25 → 100.** With prompt-cache breakpoints on every loop
+  step, additional turns re-read the prefix at cache price, so a deep tool loop
+  is affordable; the repeat-call guard still stops genuine spins early.
+
+- **Tool layer revamp** (informed by a study of crush, opencode, and pi):
+  - Tool docs are now short (2.8 KB total, was ~29 KB) and — for the first
+    time — actually sent to the model in full: previously only line 2 of each
+    `.tool.tmpl` reached the model and the rich docs were dead weight that had
+    drifted from reality (the bash doc promised a persistent shell and timeout
+    that never existed). Stale prompt files deleted.
+  - **todo tools removed** (`todo_write`/`todo_read` + SQLite table): the
+    system prompt now tells the model to keep plans in a markdown file.
+  - **Truncated tool output spills to `~/.toroid/sessions/<session>/tool-output/<ts>.txt`** and
+    the truncation note names the file, so the model (or a subagent) can read
+    or grep the full result instead of losing it.
+  - **rtk integration**: when the `rtk` CLI is on PATH, simple read-only bash
+    commands (git status/diff/log, ls, cat, grep, find, …) are transparently
+    rewritten to `rtk <cmd>` for token-compressed output.
+  - **Deterministic tool ordering**: the wire tool list is sorted by name —
+    the registry map previously shuffled it every Run, changing the request
+    prefix and busting the prompt cache across Runs.
+  - **glob fixed**: `find -name` matches basenames only, so the documented
+    `**/*.go` form silently matched nothing; the `**/` prefix is now handled.
+  - `EventPermissionRequest` and `PermissionPayload` deleted — the event was
+    never fired and implied a permission layer that does not exist.
+  - Validation errors name the tool and instruct a schema-conformant re-call
+    in one line.
+- **`assets/pre-ship.md`**: checklist AI agents must follow before pushing
+  (verify live, refresh README numbers, changelog, scrub secrets/scratch).
+
 ### Added
 
 - **`anthropic/` provider (native messages API).** An `anthropic/<model>` id
@@ -62,7 +94,7 @@ All notable changes to toroid-kernel are documented here. This project follows
   `FireTraceLog`, `pathToTilde`, `parseCostHeader`, `hasFiles`, `scanSSE`,
   `apiKeyEnvFor`, custom `trimSpace`, …); fixed a double window-gauge update
   per turn in the step loop.
-- Runners (`toroid-cli`, `toroid-repl`) default to
+- Runners (`toroid-cli`, `repl`) default to
   `llmgateway/claude-haiku-4-5` and authenticate with `LLM_GATEWAY_KEY` only.
 
 - **Fantasy removed; in-repo `llm` package is the only wire.** The

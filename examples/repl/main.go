@@ -12,14 +12,14 @@
 //
 //	env  TOROID_MODEL      provider/model id      (default llmgateway/claude-haiku-4-5)
 //	env  TOROID_LLM_TOKEN  API key for the provider (required)
-//	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 50)
+//	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 100)
 //	env  TOROID_TRIM       max chars per tool arg/result line (default 120)
 //	flag --save            persist events/costs to the SQLite store (default off)
 //	flag --thinking        none | low | high      (default low)
 //	flag --no-colour       disable all ANSI styling (default off)
 //
 //	export TOROID_LLM_TOKEN=your_api_key
-//	go run ./examples/toroid-repl --thinking high --save
+//	go run ./examples/repl --thinking high --save
 //
 // In-REPL commands: /help /cost /model /reset /clear /exit  (or Ctrl-D to quit).
 package main
@@ -267,11 +267,29 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	fmt.Printf("\n%s%s ◂%s\n", aMagenta+aBold, shortModel(cfg.model), aReset)
 	fmt.Print(renderMarkdown(out, width))
 
-	// Turn footer: running cost (gateway-reported) plus output throughput.
+	// Turn footer: running cost (gateway-reported) plus token usage and throughput.
 	// EventStop's UsagePayload carries the session's per-turn usage by session ID.
-	fmt.Printf("%s  cost so far: $%.6f%s", aGray, k.RunningCostUSD(), aReset)
+	fmt.Printf("%s  ₹%.0f%s", aGray, k.RunningCostUSD()*100, aReset)
+	
+	// Print token usage and cache statistics if available.
+	if u, ok := usage.Tokens[k.SessionID()]; ok && (u.Input > 0 || u.CacheRead > 0 || u.CacheWrite > 0) {
+		var parts []string
+		if u.Input > 0 {
+			parts = append(parts, fmt.Sprintf("%d←", u.Input))
+		}
+		if u.CacheRead > 0 {
+			parts = append(parts, fmt.Sprintf("%d📥", u.CacheRead))
+		}
+		if u.CacheWrite > 0 {
+			parts = append(parts, fmt.Sprintf("%d📤", u.CacheWrite))
+		}
+		if len(parts) > 0 {
+			fmt.Printf("%s  ·  %s%s", aGray, strings.Join(parts, " "), aReset)
+		}
+	}
+	
 	if outTokens := usage.Tokens[k.SessionID()].Output; outTokens > 0 && elapsed.Seconds() > 0 {
-		fmt.Printf("%s  ·  %d out tok in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
+		fmt.Printf("%s  ·  %d→ in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
 	}
 	fmt.Println()
 }
@@ -306,7 +324,7 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 
 func banner(cfg config) {
 	fmt.Printf("%s┌─────────────────────────────────────────────%s\n", aCyan, aReset)
-	fmt.Printf("%s│ toroid-repl%s  %s%s%s\n", aCyan+aBold, aReset, aGray, shortModel(cfg.model), aReset)
+	fmt.Printf("%s│ toroid repl%s  %s%s%s\n", aCyan+aBold, aReset, aGray, shortModel(cfg.model), aReset)
 	fmt.Printf("%s│%s thinking=%s save=%v workdir=%s\n", aCyan, aReset, cfg.thinking, cfg.save, displayWorkdir(cfg.workdir))
 	fmt.Printf("%s└ %stype a message, or /help · /exit%s\n", aCyan, aGray, aReset)
 }

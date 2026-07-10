@@ -2,14 +2,14 @@
 
 `toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, gateway-truth cost accounting, and a built-in tool registry.
 
-**~6,250 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
+**~6,650 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
 
 **Runner binaries** (built with `-trimpath -ldflags="-s -w"`; linux is amd64):
 
 | runner | macOS (arm64) | Linux (amd64) | Linux + upx |
 |---|---|---|---|
-| `examples/toroid-cli` | 13.3 MB | 13.6 MB | 4.4 MB |
-| `examples/toroid-repl` | 13.3 MB | 13.7 MB | 4.2 MB |
+| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.7 MB |
+| `examples/repl` | 13.3 MB | 13.7 MB | 5.7 MB |
 
 ## Features
 
@@ -18,9 +18,9 @@
 - **Gateway-truth cost**: every non-streaming llm-step carries the gateway's authoritative `x-litellm-response-cost`; there is no local pricing table to drift out of date. `Usage.PricingOK` is true only when the gateway reported a cost
 - Structured output (`WithSchema`) as a forced tool call — works across upstreams, including Bedrock-backed Anthropic
 - Multimodal input: images and PDFs inline in prompts (`![](path)`, 5 MiB cap, capability-gated per model) and as tool-result media (the `read` tool returns images a vision model can see)
-- Single-file SQLite persistence (traces, costs, events, todos) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
-- Conversation compaction, tool-output pruning, loop guards (MaxIter + repeat-call), and history reconstruction for resume
-- Built-in filesystem, shell, search, notification, and subagent tools; MCP client for remote tool servers
+- Single-file SQLite persistence (traces, costs, events) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
+- Conversation compaction, loop guards (MaxIter, default 100, + repeat-call spin guard), and history reconstruction for resume
+- Built-in filesystem, shell, search, notification, and subagent tools; MCP client for remote tool servers. Truncated tool outputs spill to `~/.toroid/sessions/<session>/tool-output/` (the result names the file) so nothing is lost; when `rtk` is on PATH, simple read-only bash commands are auto-routed through it for compressed output
 - Background agents — async subagents that wake an idle kernel on completion
 
 ## Verified models
@@ -121,14 +121,14 @@ func main() {
 The two production runners live in `examples/`:
 
 - **`toroid-cli`** — one-shot: drive the kernel from the command line, emitting every kernel event as NDJSON on stdout (the bridge for hosts in other languages; `-plain` prints just the final answer).
-- **`toroid-repl`** — interactive terminal chat with live tool-call display, cost footer, `/cost`, `/model`, `/reset`.
+- **`repl`** — interactive terminal chat with live tool-call display, cost footer, `/cost`, `/model`, `/reset`.
 
 ```bash
 export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
 export LLM_GATEWAY_KEY=sk-...
 
 go run ./examples/toroid-cli -plain 'what files are in this directory?'
-go run ./examples/toroid-repl
+go run ./examples/repl
 ```
 
 ## Examples
@@ -168,7 +168,7 @@ audit and its resolutions live in
 
 ## Persistence & telemetry
 
-When `Save: true`, traces, spans, costs, events, and todos are written to a
+When `Save: true`, traces, spans, costs, and events are written to a
 single SQLite database at `~/.toroid/sql.db`. Span IDs are time-ordered
 [Snowflake](https://en.wikipedia.org/wiki/Snowflake_ID) IDs and the
 trace/span/parent graph maps directly onto OpenTelemetry —

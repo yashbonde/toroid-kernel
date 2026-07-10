@@ -19,7 +19,7 @@ func NewSubagentTool(a Agent, desc string) *ToolDef {
 		}
 		// Cap like every other tool: a verbose subagent transcript would
 		// otherwise ride in the parent's prompt at full size every turn.
-		return llm.NewTextResult(TruncateToolOutput(output)), nil
+		return llm.NewTextResult(TruncateToolOutput(a, output)), nil
 	})
 
 	return &ToolDef{

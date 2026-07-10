@@ -60,7 +60,7 @@ func (t *funcTool[T]) Run(ctx context.Context, argumentsJSON string) (ToolResult
 	var input T
 	if s := strings.TrimSpace(argumentsJSON); s != "" && s != "null" {
 		if err := json.Unmarshal([]byte(s), &input); err != nil {
-			return NewErrorResult("invalid tool arguments: " + err.Error()), nil
+			return NewErrorResult(t.name + ": invalid arguments (" + err.Error() + "); re-call with arguments matching the schema"), nil
 		}
 	}
 	return t.fn(ctx, input)

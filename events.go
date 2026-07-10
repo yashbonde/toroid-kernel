@@ -8,7 +8,6 @@ const (
 	EventTraceLog           EventKind = "TraceLog" // structured log entry stored in the trace; visible in UI and readable by follow-on agents
 	EventSessionStart       EventKind = "SessionStart"
 	EventUserPromptSubmit   EventKind = "UserPromptSubmit"
-	EventPermissionRequest  EventKind = "PermissionRequest"  // before a tool is called, if permission is required
 	EventPreToolUse         EventKind = "PreToolUse"         // before a tool is called
 	EventPostToolUse        EventKind = "PostToolUse"        // after a tool call is completed
 	EventPostToolUseFailure EventKind = "PostToolUseFailure" // after a tool call fails
@@ -151,12 +150,6 @@ type LLMStepPayload struct {
 	Messages int      `json:"messages"` // message count (system excluded)
 	Tools    []string `json:"tools,omitempty"`
 	Schema   string   `json:"schema,omitempty"` // schema name for object calls
-}
-
-type PermissionPayload struct {
-	ToolName string         `json:"tool_name"`
-	Args     map[string]any `json:"args"`
-	Verdict  string         `json:"verdict"` // "allow" | "deny"
 }
 
 type TaskPayload struct {

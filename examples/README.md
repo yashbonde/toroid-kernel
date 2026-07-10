@@ -21,7 +21,7 @@ go run ./examples/<name>
 | `delegation` | Subagents, background agents, OTEL export | `subagent`/`subagent_async` tools, `RunSubagent`, `SpawnBackground`, `On(EventSubagentStart/TaskCompleted/MasterIdle)`, `Save`, `OTELSpans`, `ListSessions` |
 | `events`     | Lifecycle observability + notify sinks    | `On(EventPreToolUse/PostToolUse/TurnCost/Notification)`, `tools.RegisterNotifySink` |
 | `toroid-cli` | CLI runner that emits every event as NDJSON on stdout — wrap it in a subprocess from any language | `NewKernel`, `OnAll`, `Run`, JSON-encoded `Event` |
-| `toroid-repl` | Interactive, pretty-printing chat REPL — rendered Markdown answers, trimmed tool-call lines, running cost | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `Run`, `RunningCostUSD` |
+| `repl` | Interactive, pretty-printing chat REPL — rendered Markdown answers, trimmed tool-call lines, running cost | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `Run`, `RunningCostUSD` |
 | `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
 
 `toroid-cli` takes the prompt as an argument and is the recommended way to embed
@@ -32,14 +32,14 @@ go run ./examples/toroid-cli 'what files are in this directory?'
 # each stdout line is one JSON-encoded toroid.Event; diagnostics go to stderr
 ```
 
-`toroid-repl` is the human-facing counterpart: an interactive loop that renders
+`repl` is the human-facing counterpart: an interactive loop that renders
 Markdown answers (headings, **bold**, `code`, fenced blocks, lists), shows tool
 calls as compact trimmed one-liners, and tracks running cost. Targeting knobs are
 environment variables; per-run toggles are flags:
 
 ```bash
 export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
-TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/toroid-repl --thinking high --save
+TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/repl --thinking high --save
 # in-REPL: /help /cost /model /reset /clear /exit (or Ctrl-D)
 ```
 
@@ -47,7 +47,7 @@ TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/toroid-repl --thinkin
 |---------|---------|---------|
 | `TOROID_MODEL` | model id | `llmgateway/claude-haiku-4-5` |
 | `TOROID_LLM_TOKEN` | API key for the provider | _(required)_ |
-| `TOROID_MAX_ITER` | max tool iterations | kernel default (25) |
+| `TOROID_MAX_ITER` | max tool iterations | kernel default (100) |
 | `TOROID_TRIM` | max chars per tool arg/result line | 120 |
 
 | Flag | Meaning | Default |

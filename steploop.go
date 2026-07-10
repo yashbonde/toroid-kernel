@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"hash/fnv"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -114,7 +115,8 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 }
 
 // wireTools returns the kernel's registered tools as wire descriptions for a
-// Step Context.
+// Step Context, sorted by name: the registry is a map, and a shuffled tool
+// order would change the request prefix every Run — busting the prompt cache.
 func (k *Kernel) wireTools() []llm.Tool {
 	if k.Tools == nil {
 		return nil
@@ -125,6 +127,7 @@ func (k *Kernel) wireTools() []llm.Tool {
 			out = append(out, llm.ToolOf(t.Handler))
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 

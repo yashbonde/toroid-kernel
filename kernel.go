@@ -2,7 +2,6 @@ package toroid
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -40,11 +39,10 @@ type Kernel struct {
 	SystemPrompt string
 	History      []llm.Message
 	Sessions     map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
-	usageMu          sync.Mutex
-	currentTokens    int
-	runningCostUSD   float64
-	todoDB           *sql.DB
-	mcpClients       []io.Closer // open connections to configured MCP servers, closed in Close()
+	usageMu        sync.Mutex
+	currentTokens  int
+	runningCostUSD float64
+	mcpClients     []io.Closer // open connections to configured MCP servers, closed in Close()
 
 	// message queue — callers enqueue messages that are injected at the next
 	// safe interruption point (turn boundary), causing the loop to continue
@@ -77,9 +75,10 @@ type Config struct {
 	APIKey    string `json:"api_key,omitempty" description:"API key for the gateway"`
 	SessionID string `json:"session_id,omitempty" description:"unique identifier for the session"`
 	WorkDir   string `json:"work_dir" description:"working directory" default:"current directory"`
-	// MaxIter caps tool-call steps per turn. Kept intentionally modest so a
-	// thrashing model cannot burn dozens of full-context steps by default.
-	MaxIter        int      `json:"max_iter" description:"max tool-call iterations" default:"25"`
+	// MaxIter caps tool-call steps per turn. With prompt caching every extra
+	// step re-reads the prefix at cache price, so a deep loop is affordable;
+	// the repeat-call guard still stops genuine spins early.
+	MaxIter        int      `json:"max_iter" description:"max tool-call iterations" default:"100"`
 	MaxRepeatCalls int      `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
 	Thinking       Thinking `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
@@ -171,13 +170,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		cfg.CompactionBufferSize = 50000
 	}
 	if cfg.MaxIter <= 0 {
-		cfg.MaxIter = 25
-	}
-
-	// Open the shared SQLite DB only when persistence is requested.
-	var todoDB *sql.DB
-	if cfg.Save {
-		todoDB, _ = openDefaultSQL()
+		cfg.MaxIter = 100
 	}
 
 	// Kernel object
@@ -186,17 +179,25 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		Hooks:         &HookRegistry{},
 		Sessions:      map[string]Usage{},
 		currentTokens: 0,
-		todoDB:        todoDB,
 		Tools:         tools.NewRegistry(),
 	}
 
+	// getDescription returns a tool's full model-facing documentation: the
+	// .tool.tmpl body with its frontmatter ("---\n<summary>\n---") stripped.
+	// The docs are deliberately short — a few lines of usage rules each — so
+	// sending them whole costs little and the model actually sees them.
 	getDescription := func(name string) string {
 		b, _ := readPrompt(name + ".tool.tmpl")
-		lines := strings.Split(string(b), "\n")
-		if len(lines) > 1 {
-			return lines[1]
+		s := strings.TrimSpace(string(b))
+		if strings.HasPrefix(s, "---") {
+			if parts := strings.SplitN(s, "---", 3); len(parts) == 3 {
+				return strings.TrimSpace(parts[1]) + "\n" + strings.TrimSpace(parts[2])
+			}
 		}
-		return "Tool " + name
+		if s == "" {
+			return "Tool " + name
+		}
+		return s
 	}
 
 	// register all tools
@@ -212,8 +213,6 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		k.Tools.Register(tools.NewNotifyTool(k, getDescription("notify")))
 		k.Tools.Register(tools.NewSubagentTool(k, getDescription("subagent")))
 		k.Tools.Register(newSubagentAsyncTool(k, getDescription("subagent")))
-		k.Tools.Register(tools.NewTodoWriteTool(k, k.todoDB, getDescription("todowrite")))
-		k.Tools.Register(tools.NewTodoReadTool(k, k.todoDB, getDescription("todoread")))
 	}
 
 	if cfg.Tools != nil {
@@ -237,7 +236,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// MCP: connect each configured remote server and register its tools.
 	// Connections stay open for the kernel's lifetime and are closed in Close().
 	for _, sc := range cfg.MCPServers {
-		client, err := tools.ConnectMCPServer(ctx, k.Tools, sc)
+		client, err := tools.ConnectMCPServer(ctx, k, k.Tools, sc)
 		if err != nil {
 			return nil, fmt.Errorf("mcp server %q: %w", sc.BaseURL, err)
 		}
@@ -491,7 +490,6 @@ func (k *Kernel) OnAll(fn HookFn) {
 	for _, kind := range []EventKind{
 		EventSessionStart,
 		EventUserPromptSubmit,
-		EventPermissionRequest,
 		EventPreToolUse,
 		EventPostToolUse,
 		EventPostToolUseFailure,

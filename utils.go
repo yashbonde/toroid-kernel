@@ -21,7 +21,7 @@ import (
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
-//go:embed prompts/*.tmpl prompts/*.txt
+//go:embed prompts/*.tmpl
 var promptFS embed.FS
 
 // readPrompt loads a prompt file from ~/.toroid/prompts/<name> if present,

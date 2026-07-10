@@ -33,18 +33,18 @@ type MCPServerConfig struct {
 // legacy SSE if the server rejects the initialize request with a 4xx.
 // The returned client stays open for the life of the kernel — callers are
 // responsible for closing it (the kernel does this in Close).
-func ConnectMCPServer(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
-	c, err := connectStreamableHTTP(ctx, reg, cfg)
+func ConnectMCPServer(ctx context.Context, a Agent, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
+	c, err := connectStreamableHTTP(ctx, a, reg, cfg)
 	if err == nil {
 		return c, nil
 	}
 	if errors.Is(err, transport.ErrLegacySSEServer) {
-		return connectSSE(ctx, reg, cfg)
+		return connectSSE(ctx, a, reg, cfg)
 	}
 	return nil, err
 }
 
-func connectStreamableHTTP(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
+func connectStreamableHTTP(ctx context.Context, a Agent, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
 	var opts []transport.StreamableHTTPCOption
 	if len(cfg.Headers) > 0 {
 		opts = append(opts, transport.WithHTTPHeaders(cfg.Headers))
@@ -67,10 +67,10 @@ func connectStreamableHTTP(ctx context.Context, reg *Registry, cfg MCPServerConf
 		c.Close()
 		return nil, fmt.Errorf("mcp %s: initialize: %w", cfg.BaseURL, err)
 	}
-	return finishConnection(ctx, reg, cfg, c, initRes)
+	return finishConnection(ctx, a, reg, cfg, c, initRes)
 }
 
-func connectSSE(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
+func connectSSE(ctx context.Context, a Agent, reg *Registry, cfg MCPServerConfig) (*mcpclient.Client, error) {
 	var opts []transport.ClientOption
 	if len(cfg.Headers) > 0 {
 		opts = append(opts, transport.WithHeaders(cfg.Headers))
@@ -93,11 +93,12 @@ func connectSSE(ctx context.Context, reg *Registry, cfg MCPServerConfig) (*mcpcl
 		c.Close()
 		return nil, fmt.Errorf("mcp %s (sse): initialize: %w", cfg.BaseURL, err)
 	}
-	return finishConnection(ctx, reg, cfg, c, initRes)
+	return finishConnection(ctx, a, reg, cfg, c, initRes)
 }
 
 func finishConnection(
 	ctx context.Context,
+	a Agent,
 	reg *Registry,
 	cfg MCPServerConfig,
 	c *mcpclient.Client,
@@ -115,7 +116,7 @@ func finishConnection(
 	}
 
 	for _, t := range toolsRes.Tools {
-		reg.Register(newMCPToolDef(c, name, t))
+		reg.Register(newMCPToolDef(a, c, name, t))
 	}
 
 	return c, nil
@@ -124,7 +125,7 @@ func finishConnection(
 // newMCPToolDef adapts one MCP tool into a ToolDef. An MCP tool's input schema
 // is discovered at runtime (from the server), not known as a Go type at compile
 // time, so it uses llm.RawTool with the server-provided schema.
-func newMCPToolDef(c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef {
+func newMCPToolDef(a Agent, c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef {
 	name := t.Name
 	if serverName != "" {
 		name = serverName + "__" + t.Name
@@ -157,7 +158,7 @@ func newMCPToolDef(c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef 
 		if err != nil {
 			return llm.NewErrorResult(fmt.Sprintf("Error: %v", err)), nil
 		}
-		return mcpResultToResult(res), nil
+		return mcpResultToResult(a, res), nil
 	})
 
 	return &ToolDef{
@@ -170,7 +171,7 @@ func newMCPToolDef(c *mcpclient.Client, serverName string, t mcp.Tool) *ToolDef 
 // mcpResultToResult flattens an MCP CallToolResult's text content into a
 // single tool result. Non-text content (images, embedded resources) is
 // dropped for now.
-func mcpResultToResult(res *mcp.CallToolResult) llm.ToolResult {
+func mcpResultToResult(a Agent, res *mcp.CallToolResult) llm.ToolResult {
 	var sb strings.Builder
 	for _, c := range res.Content {
 		if tc, ok := c.(mcp.TextContent); ok {
@@ -180,5 +181,5 @@ func mcpResultToResult(res *mcp.CallToolResult) llm.ToolResult {
 			sb.WriteString(tc.Text)
 		}
 	}
-	return llm.ToolResult{Content: TruncateToolOutput(sb.String()), IsError: res.IsError}
+	return llm.ToolResult{Content: TruncateToolOutput(a, sb.String()), IsError: res.IsError}
 }
