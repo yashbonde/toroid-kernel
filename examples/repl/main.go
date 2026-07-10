@@ -14,12 +14,13 @@
 //	env  TOROID_LLM_TOKEN  API key for the provider (required)
 //	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 100)
 //	env  TOROID_TRIM       max chars per tool arg/result line (default 120)
+//	flag --model           override TOROID_MODEL  (default "")
 //	flag --save            persist events/costs to the SQLite store (default off)
 //	flag --thinking        none | low | high      (default low)
 //	flag --no-colour       disable all ANSI styling (default off)
 //
 //	export TOROID_LLM_TOKEN=your_api_key
-//	go run ./examples/repl --thinking high --save
+//	go run ./examples/repl --model openai/gpt-4o --thinking high --save
 //
 // In-REPL commands: /help /cost /model /reset /clear /exit  (or Ctrl-D to quit).
 package main
@@ -55,9 +56,10 @@ type config struct {
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
-// (--save, --thinking, --no-colour). It returns the config plus the resolved
+// (--model, --save, --thinking, --no-colour). It returns the config plus the resolved
 // API key. Flags win for the per-run toggles; env wins for the targeting knobs.
 func loadConfig() (config, string) {
+	model := flag.String("model", "", "override TOROID_MODEL (provider/model)")
 	save := flag.Bool("save", false, "persist events, costs and metadata to the SQLite store")
 	thinking := flag.String("thinking", "low", "thinking budget: none | low | high")
 	noColour := flag.Bool("no-colour", false, "disable ANSI colour/styling")
@@ -76,8 +78,14 @@ func loadConfig() (config, string) {
 		absWd = wd
 	}
 
+	// Flag --model overrides env TOROID_MODEL
+	modelStr := envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5")
+	if *model != "" {
+		modelStr = *model
+	}
+
 	c := config{
-		model:    envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5"),
+		model:    modelStr,
 		workdir:  absWd,
 		thinking: toroid.Thinking(*thinking),
 		save:     *save,
@@ -339,7 +347,7 @@ func printHelp() {
   /exit        quit (or Ctrl-D)
 
 config via env:   TOROID_MODEL, TOROID_LLM_TOKEN, TOROID_MAX_ITER, TOROID_TRIM
-config via flags: --save, --thinking (none|low|high), --no-colour
+config via flags: --model, --save, --thinking (none|low|high), --no-colour
 ` + aReset)
 }
 
