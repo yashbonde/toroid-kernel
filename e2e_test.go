@@ -123,3 +123,89 @@ func TestKernelE2E(t *testing.T) {
 		t.Error("object llm-step was not billed")
 	}
 }
+
+func TestSpendLimitsE2E(t *testing.T) {
+	newKernel := func(t *testing.T, transcriptMax float64, replies []FauxReply) (*Kernel, *FauxStep, *int) {
+		t.Helper()
+		toolRuns := 0
+		reg := tools.NewRegistry()
+		reg.Register(&tools.ToolDef{
+			Name: "echo", Description: "echo the message",
+			Handler: llm.NewTool("echo", "echo the message",
+				func(context.Context, struct {
+					Msg string `json:"msg"`
+				}) (llm.ToolResult, error) {
+					toolRuns++
+					return llm.NewTextResult("ok"), nil
+				}),
+		})
+		k, err := NewKernel(context.Background(), Config{
+			Model:                 "llmgateway/claude-haiku-4-5",
+			WorkDir:               t.TempDir(),
+			IncludeComputerTools:  false,
+			Tools:                 reg,
+			MaxTranscriptSpendUSD: transcriptMax,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { k.Close() })
+		step := &FauxStep{
+			Replies: replies,
+			Object:  FauxObject{Object: map[string]any{"ok": true}, Cost: 0.01},
+		}
+		k.Step = step
+		return k, step, &toolRuns
+	}
+
+	toolReply := func(id string, cost float64) FauxReply {
+		return FauxReply{
+			ToolCalls: []FauxToolCall{{ID: id, Name: "echo", Input: `{"msg":"x"}`}},
+			Cost:      cost,
+		}
+	}
+
+	t.Run("turn limit stops tools and structured output", func(t *testing.T) {
+		k, step, toolRuns := newKernel(t, 0, []FauxReply{
+			toolReply("c1", 0.01),
+			toolReply("c2", 0.01),
+			toolReply("c3", 0.01),
+			{Text: "too late", Cost: 0.01},
+		})
+		var out strings.Builder
+		err := k.Stream(context.Background(), "work", &out,
+			WithMaxTurnSpendUSD(0.025),
+			WithSchema(Schema{"type": "object"}, "result", "result"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if step.next != 3 || *toolRuns != 2 {
+			t.Fatalf("llm steps=%d tool runs=%d, want 3 and 2", step.next, *toolRuns)
+		}
+		if out.Len() != 0 {
+			t.Fatalf("structured-output call ran after limit: %q", out.String())
+		}
+	})
+
+	t.Run("transcript limit blocks the next call", func(t *testing.T) {
+		k, step, toolRuns := newKernel(t, 0.025, []FauxReply{
+			toolReply("c1", 0.01),
+			{Text: "first done", Cost: 0.01},
+			toolReply("c2", 0.01),
+			{Text: "too late", Cost: 0.01},
+		})
+		if _, _, err := k.Run(context.Background(), "first"); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := k.Run(context.Background(), "second"); err != nil {
+			t.Fatal(err)
+		}
+		stepsAtLimit := step.next
+		if _, _, err := k.Run(context.Background(), "third"); err != nil {
+			t.Fatal(err)
+		}
+		if step.next != stepsAtLimit || step.next != 3 || *toolRuns != 1 {
+			t.Fatalf("llm steps=%d tool runs=%d, want 3 and 1 with no third-call llm-step", step.next, *toolRuns)
+		}
+	})
+}

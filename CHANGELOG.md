@@ -43,6 +43,11 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ### Added
 
+- **Hard USD spend limits.** Hosts can cap a single `Run`/`Stream` call with
+  `WithMaxTurnSpendUSD` and cumulative transcript spend with
+  `Config.MaxTranscriptSpendUSD`. Once accounting reaches either limit, the
+  kernel prevents further LLM steps, including structured-output and wake
+  re-entry; subagents inherit only the parent's remaining transcript budget.
 - **`anthropic/` provider (native messages API).** An `anthropic/<model>` id
   talks to `api.anthropic.com/v1/messages` (`ANTHROPIC_API_KEY`) via a native
   wire in the llm package (`AnthropicClient`, sharing the `Chat` interface and

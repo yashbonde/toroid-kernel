@@ -10,8 +10,9 @@ import (
 
 // MaxToolOutputChars is the shared hard cap for tool result text returned to
 // the model. Unbounded grep/MCP dumps otherwise re-enter the next prompt at
-// full size. ~20k chars ≈ 5k tokens; bash already used this budget.
-const MaxToolOutputChars = 20_000
+// full size. ~12k chars ≈ 3k tokens; the full result remains available on
+// disk for targeted follow-up reads without burdening every later LLM step.
+const MaxToolOutputChars = 12_000
 
 // TruncateToolOutput clips s to MaxToolOutputChars. When it truncates, the
 // FULL output is saved under ~/.toroid/sessions/<session>/tool-output/ and the
