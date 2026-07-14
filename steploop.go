@@ -25,7 +25,7 @@ import (
 // gateway's authoritative cost header: the assistant text is written after each
 // turn rather than token-by-token; reasoning content is emitted as one
 // EventReasoning per turn.
-func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
+func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget) error {
 	model := ResolveModel(k.Cfg.Model)
 	wireTools := k.wireTools()
 
@@ -35,6 +35,10 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if budget.reached(k) {
+			k.Logf("spend limit reached; stopping before the next llm-step")
+			return nil
 		}
 
 		stepCtx := Context{
@@ -54,6 +58,10 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer) error {
 		// them when replaying (OpenAI assistant messages carry text + tool calls).
 		k.appendStepMessages(ctx, []llm.Message{{Role: llm.RoleAssistant, Parts: res.Content}})
 		k.recordUsage(ctx, res.Usage) // also refreshes the window-occupancy gauge
+		if budget.reached(k) {
+			k.Logf("spend limit reached; stopping agent loop")
+			return nil
+		}
 
 		for _, p := range res.Content {
 			if rp, ok := p.(llm.ReasoningPart); ok && rp.Text != "" {

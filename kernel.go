@@ -114,6 +114,10 @@ type Config struct {
 	CompactionBufferSize int `json:"compaction_buffer_size" description:"tokens reserved below TotalContextSize before auto-compact fires" default:"50000"`
 	TotalContextSize     int `json:"total_context_size" description:"total context window size" default:"200000"`
 
+	// MaxTranscriptSpendUSD caps cumulative LLM spend across this kernel's
+	// transcript. A non-positive value disables the limit.
+	MaxTranscriptSpendUSD float64 `json:"max_transcript_spend_usd,omitempty" description:"maximum cumulative transcript spend in USD; 0 disables"`
+
 	// logging flags
 	AttachLoggerHooks *bool `json:"attach_logger_hooks,omitempty" description:"automatically attach logger hooks" default:"false"`
 	ShowHistory       *bool `json:"show_history" description:"print history" default:"false"`
@@ -515,6 +519,7 @@ type runOptions struct {
 	schema            Schema
 	schemaName        string
 	schemaDescription string
+	maxTurnSpendUSD   float64
 }
 
 // WithSchema enables structured generation for this Run/Stream call.
@@ -526,6 +531,26 @@ func WithSchema(schema Schema, name, description string) RunOption {
 		o.schemaName = name
 		o.schemaDescription = description
 	}
+}
+
+// WithMaxTurnSpendUSD caps LLM spend for one Run or Stream call. A
+// non-positive value disables the limit.
+func WithMaxTurnSpendUSD(usd float64) RunOption {
+	return func(o *runOptions) { o.maxTurnSpendUSD = usd }
+}
+
+type spendBudget struct {
+	turnStartUSD float64
+	turnMaxUSD   float64
+	hit          bool
+}
+
+func (b *spendBudget) reached(k *Kernel) bool {
+	total := k.RunningCostUSD()
+	b.hit = b.hit ||
+		(b.turnMaxUSD > 0 && total-b.turnStartUSD >= b.turnMaxUSD) ||
+		(k.Cfg.MaxTranscriptSpendUSD > 0 && total >= k.Cfg.MaxTranscriptSpendUSD)
+	return b.hit
 }
 
 func (k *Kernel) Run(ctx context.Context, prompt string, opts ...RunOption) (string, UsagePayload, error) {
@@ -550,6 +575,10 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	for _, o := range opts {
 		o(&ro)
 	}
+	budget := &spendBudget{
+		turnStartUSD: k.RunningCostUSD(),
+		turnMaxUSD:   ro.maxTurnSpendUSD,
+	}
 	// Fire session start only once. System prompt is sent as the single leading
 	// system message by the Step layer — do not also put it in History (double
 	// bill + cache bust).
@@ -558,7 +587,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	}
 
 	// Auto-compact if approaching context limit; important to do this before adding user prompt
-	if k.overContextThreshold() {
+	if !budget.reached(k) && k.overContextThreshold() {
 		k.Logf("auto-compacting: currentTokens=%d threshold=%d", k.currentTokens, k.Cfg.TotalContextSize-k.Cfg.CompactionBufferSize)
 		if err := k.Compact(ctx); err != nil {
 			return err
@@ -594,11 +623,14 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	if ro.schema != nil {
 		loopWriter = io.Discard
 	}
-	if err := k.streamCurrent(ctx, loopWriter); err != nil {
+	if err := k.streamCurrent(ctx, loopWriter, budget); err != nil {
 		return err
 	}
 
 	if ro.schema != nil {
+		if budget.reached(k) {
+			return nil
+		}
 		// The structured-output pass is one more llm-step in the SAME chat (M7).
 		// After the agentic loop the last message is assistant, so append a user
 		// turn asking the model to emit structured output. Run it through the Step
@@ -613,6 +645,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		}
 		// Bill the object llm-step and roll it into transcript totals (M7).
 		k.recordUsage(ctx, res.Usage)
+		budget.reached(k)
 		b, err := json.Marshal(res.Object)
 		if err != nil {
 			return err
@@ -629,14 +662,14 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 // appending the user message, pruning) and then calls this; Wake calls it after
 // injecting a background completion. runMu serializes the loop so the two never
 // race on history.
-func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer) error {
+func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBudget) error {
 	k.runMu.Lock()
 	defer k.runMu.Unlock()
 	k.running.Store(true)
 	k.lastWriter = w
 	defer k.running.Store(false)
 
-	if err := k.streamViaStep(ctx, w); err != nil {
+	if err := k.streamViaStep(ctx, w, budget); err != nil {
 		return err
 	}
 
@@ -810,6 +843,13 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 	subCfg.SessionID = NewSessionID()
 	subCfg.TraceID = k.Cfg.TraceID
 	subCfg.ParentSpanID = k.Cfg.SessionID
+	if subCfg.MaxTranscriptSpendUSD > 0 {
+		remaining := subCfg.MaxTranscriptSpendUSD - k.RunningCostUSD()
+		if remaining <= 0 {
+			return "", nil
+		}
+		subCfg.MaxTranscriptSpendUSD = remaining
+	}
 	if k.Cfg.SmallerModel != "" {
 		subCfg.Model = k.Cfg.SmallerModel
 	}
@@ -945,7 +985,7 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if w == nil {
 		w = io.Discard
 	}
-	return k.streamCurrent(ctx, w)
+	return k.streamCurrent(ctx, w, &spendBudget{turnStartUSD: k.RunningCostUSD()})
 }
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.
