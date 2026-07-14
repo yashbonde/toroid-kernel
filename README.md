@@ -2,20 +2,21 @@
 
 `toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, gateway-truth cost accounting, and a built-in tool registry.
 
-**~6,654 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
+**~6,562 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
 
 **Runner binaries** (built with `-trimpath -ldflags="-s -w"`; linux is amd64):
 
 | runner | macOS (arm64) | Linux (amd64) | Linux + upx |
 |---|---|---|---|
-| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.6 MB |
-| `examples/repl` | 13.3 MB | 13.7 MB | 5.6 MB |
+| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.7 MB |
+| `examples/repl` | 13.2 MB | 13.6 MB | 5.7 MB |
 
 ## Features
 
 - Self-contained LLM layer (in-repo `llm/` package) speaking OpenAI-compatible chat completions to a [LiteLLM](https://github.com/BerriAI/litellm) gateway — SSE streaming, tool calls, multimodal content blocks, retries on 429/5xx
 - Kernel-owned tool loop: one llm-step per turn via the `Step` interface
 - **Gateway-truth cost**: every non-streaming llm-step carries the gateway's authoritative `x-litellm-response-cost`; there is no local pricing table to drift out of date. `Usage.PricingOK` is true only when the gateway reported a cost
+- Hard USD spend limits: `WithMaxTurnSpendUSD` caps one `Run`/`Stream` call and `Config.MaxTranscriptSpendUSD` caps cumulative transcript spend; reaching either stops further LLM steps, including structured-output and wake paths
 - Structured output (`WithSchema`) as a forced tool call — works across upstreams, including Bedrock-backed Anthropic
 - Multimodal input: images and PDFs inline in prompts (`![](path)`, 5 MiB cap, capability-gated per model) and as tool-result media (the `read` tool returns images a vision model can see)
 - Single-file SQLite persistence (traces, costs, events) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
@@ -158,6 +159,12 @@ Per-step costs land in `EventTurnCost`, roll up into `RunningCostUSD()`
 client-side price table; if the gateway does not report a cost
 (`Usage.PricingOK == false`), the cost is *unknown*, never assumed free, and a
 warning is logged.
+
+Hosts can enforce hard stop boundaries with `WithMaxTurnSpendUSD` for one
+`Run`/`Stream` call and `Config.MaxTranscriptSpendUSD` for the kernel's
+cumulative transcript. Because providers report cost after a response, the
+step that crosses a limit is billed; the kernel then runs no subsequent LLM
+step for that call. A non-positive limit disables it.
 
 Prompt caching: Claude-family models get `cache_control` breakpoints (system +
 last user/tool message) on every loop step, so each turn re-reads the prior

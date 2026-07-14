@@ -4,7 +4,7 @@
 
 Source: [github.com/yashbonde/toroid-kernel](https://github.com/yashbonde/toroid-kernel) · ~3,200 LOC Go · self-contained (in-repo [llm](../llm) package; no third-party model SDK) · reflects the code as of this update (2026-06-23).
 
-> **What it is in one line.** A library — not a CLI or a TUI — that you `import` into a Go program to run a tool-calling agent loop with streaming, per-step cost accounting, resumable persistence, OpenTelemetry-native tracing, conversation compaction, loop guards, structured output, image input, synchronous *and* background subagents, and a built-in tool registry. The host program owns the UI and the lifecycle; the kernel owns the loop.
+> **What it is in one line.** A library — not a CLI or a TUI — that you `import` into a Go program to run a tool-calling agent loop with streaming, per-step cost accounting and hard spend limits, resumable persistence, OpenTelemetry-native tracing, conversation compaction, loop guards, structured output, image input, synchronous *and* background subagents, and a built-in tool registry. The host program owns the UI and the lifecycle; the kernel owns the loop.
 
 This explainer walks the system as built (§1–§12): construction and wiring, the turn loop, tools, providers, the single SQLite persistence store, OTEL-native telemetry with an OTLP exporter, context management, the message queue, sub/background agents, and the event bus. §13 is the remaining roadmap — inter-kernel communication and permission gating — which is designed but not yet code.
 
@@ -57,6 +57,7 @@ flowchart TB
 - **System prompt** — `system.tmpl` is rendered with `WorkDir` and `Date`.
 - **Provider + model** — resolved from the `provider/model` ID, then the `provider/` prefix is stripped before asking for the `LanguageModel`.
 - **Loop guards** — two kernel-owned guards are wired into the step loop: `MaxIter` (default 25) caps the absolute number of tool-call turns, and `MaxRepeatCalls` (default 3) trips when consecutive steps issue identical tool calls with identical results. Both halt cleanly at a step boundary.
+- **Spend limits** — `Config.MaxTranscriptSpendUSD` caps cumulative transcript cost; a caller can add `WithMaxTurnSpendUSD` to cap one `Run`/`Stream` call. Non-positive values disable the corresponding limit.
 - **Thinking** — when `Thinking` is not `none`, a Google thinking-budget/level config is added (`low`≈1k, `high`≈8k tokens; gemini-3 uses thinking *levels*), and reasoning deltas can stream to `ThinkingWriter`.
 - **Agent options** — system prompt, tools, and the optional thinking budget (gateway `reasoning_effort`) are applied per llm-step via `StepOptions`.
 
@@ -112,6 +113,13 @@ sequenceDiagram
 After every llm-step the wire usage plus the gateway-reported dollar cost (`x-litellm-response-cost`, present on non-streaming responses) is converted to a `Usage`, accumulated into `runningCostUSD`, appended to `StepUsage`, persisted via `AppendCost`, and emitted as an `EventTurnCost`. The turn boundary after tool execution is the **safe interruption point** where the message queue is drained and context pressure is re-checked.
 
 `Usage` carries a `PricingOK` flag: it is `true` only when the gateway reported an authoritative cost for the call. There is no client-side pricing table — when the gateway does not report a cost, `Cost` stays `0` and `PricingOK` is `false`, so a surface can show "cost unknown" rather than a misleading free `$0`.
+
+The step loop checks its call-local spend budget before each LLM request and
+again after billing. Reaching `WithMaxTurnSpendUSD` or
+`Config.MaxTranscriptSpendUSD` suppresses every later LLM step for the call,
+including the structured-output pass and idle-kernel wake re-entry. The response
+that crosses the boundary is necessarily billed because authoritative cost is
+known only after the provider returns it.
 
 ### Structured output
 
