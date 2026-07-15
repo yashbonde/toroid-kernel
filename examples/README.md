@@ -17,12 +17,20 @@ go run ./examples/<name>
 
 | Example      | Feature                                   | Key APIs |
 |--------------|-------------------------------------------|----------|
-| `running`    | Blocking run + streaming run              | `NewKernel`, `Run`, `Stream`, `On(EventToken)`, `RunningCostUSD`, `Close` |
-| `delegation` | Subagents, background agents, OTEL export | `subagent`/`subagent_async` tools, `RunSubagent`, `SpawnBackground`, `On(EventSubagentStart/TaskCompleted/MasterIdle)`, `Save`, `OTELSpans`, `ListSessions` |
-| `events`     | Lifecycle observability                   | `On(EventPreToolUse/PostToolUse/TurnCost)` |
+| `running`    | The one example to read first: blocking run + streaming run, lifecycle events, loop guards, synchronous + background delegation, multimodal input, structured output (after tools and single-turn), and OTEL span export | `NewKernel`, `Run`, `Stream`, `On(EventPreToolUse/PostToolUse/TurnCost/SubagentStart/TaskCompleted/MasterIdle)`, `WithSchema`, `GenerateSchema`, `MaxIter`, `MaxRepeatCalls`, `RunSubagent`, `SpawnBackground`, `Save`, `OTELSpans`, `ListSessions`, `RunningCostUSD`, `Close` |
 | `cli` | Interactive, pretty-printing chat REPL — plus a `--run` flag that emits every event as NDJSON on stdout, wrappable as a subprocess from any language | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `OnAll`, `Run`, `RunningCostUSD`, JSON-encoded `Event` |
 | `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
 | `e2e-test` | Offline integration fixture: discovered skill, local MCP server, host/core/subagent tools, structured output, and a cache-stable system/tool prefix | `FauxStep`, `Config.MCPServers`, `Config.IncludeSubagentTools`, `WithSchema` |
+
+`running` is the single consolidated example. Run it with an API key for the
+full live tour (blocking, streaming, events, delegation, multimodal, structured
+output, OTEL export); pass `--guardrails` to exercise the loop-guard scenarios
+with a scripted `FauxStep` and no network:
+
+```bash
+go run ./examples/running               # full live tour
+go run ./examples/running --guardrails  # loop guards only, no API key needed
+```
 
 Run the self-contained integration example with `go test ./examples/e2e-test`.
 Its committed `skills/e2e-review.md` fixture is copied into an isolated

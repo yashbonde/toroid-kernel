@@ -6,9 +6,10 @@ coverage.out
 dist/
 
 # Built example binaries (compiled artifacts, never committed)
+examples/cli/cli
 examples/repl/repl
 examples/toroid-cli/toroid-cli
-examples/structured-after-tools/structured-after-tools
+examples/running/running
 examples/usage-with-mcp/slack-mcp
 
 # Scratch error/output files

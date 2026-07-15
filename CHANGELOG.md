@@ -296,7 +296,7 @@ interactive examples — into a single cut.
   boundary with history intact. Keying on the result — not just the arguments —
   keeps legitimate polling alive: a poll that observes changing state produces a
   distinct signature each step and never trips the guard. Set to `0` to disable.
-  See `examples/guardrails`.
+  See `examples/running --guardrails`.
 - **Structured output (`WithSchema` / `RunOption`).** `Run` and `Stream` now
   accept options; `WithSchema(schema, name, description)` makes the model emit a
   JSON object matching a `fantasy.Schema` instead of free text. `Run` returns the

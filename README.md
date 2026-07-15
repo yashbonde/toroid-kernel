@@ -143,11 +143,9 @@ one per usage pattern. Start with [`examples/README.md`](examples/README.md).
 > up-to-date reference for how to use this library.
 
 ```bash
-go run ./examples/running                 # blocking Run + streaming + multimodal + structured output
-go run ./examples/structured-after-tools  # tool calls, then schema-coerced JSON
-go run ./examples/guardrails              # loop guards, no network needed (scripted FauxStep)
-go run ./examples/delegation              # subagents, background agents
-go run ./examples/events                  # lifecycle observability hooks
+go run ./examples/running                 # the one example: blocking + streaming + events + guardrails
+                                         #   + delegation + multimodal + structured output + OTEL
+go run ./examples/running --guardrails   # loop guards only, no network needed (scripted FauxStep)
 go run ./examples/langfuse                # push a persisted trace to Langfuse over OTLP
 go test ./examples/e2e-test               # offline skill + MCP + cache-prefix integration test
 ```
