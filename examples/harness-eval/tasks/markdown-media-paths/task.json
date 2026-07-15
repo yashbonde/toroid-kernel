@@ -1,0 +1,10 @@
+{
+  "id": "markdown-media-paths",
+  "title": "Robust markdown media path parsing",
+  "difficulty": "hard",
+  "branch_slug": "markdown-media-paths",
+  "required_changed": ["multimodal.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "./..."],
+  "timeout_minutes": 15
+}

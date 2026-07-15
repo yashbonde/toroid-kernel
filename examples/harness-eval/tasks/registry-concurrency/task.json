@@ -1,0 +1,9 @@
+{
+  "id": "registry-concurrency",
+  "title": "Concurrent-safe tool registry",
+  "branch_slug": "registry-concurrency",
+  "required_changed": ["tools/registry.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "-race", "./tools"],
+  "timeout_minutes": 15
+}

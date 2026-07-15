@@ -33,14 +33,14 @@ of the underlying model.
 
 Reference points as of mid-2026. "toroid" reflects the current state of this
 repo (`kernel.go`, `tools/`, `provider.go`, `events.go`, `skills.go`,
-`tools/mcp.go`, `tools/skill.go`, `examples/toroid-cli/`).
+`tools/mcp.go`, `tools/skill.go`, `examples/cli/`).
 
 | Feature | toroid | Claude Code | Claude Agent SDK | OpenAI Codex CLI | pi.dev |
 |---|---|---|---|---|---|
-| **Distribution** | Go library, embed in your own program; plus `toroid-cli` binary (`examples/toroid-cli/`) that emits NDJSON events on stdout — usable as a subprocess from any language | Standalone CLI / IDE ext / desktop app | Go/Python/TS SDK, embed in your own program | Standalone CLI (Rust) / IDE ext / desktop app / cloud | Standalone CLI + TUI, npm/git packages |
+| **Distribution** | Go library, embed in your own program; plus the `cli --run` flag (`examples/cli/`) that emits NDJSON events on stdout — usable as a subprocess from any language | Standalone CLI / IDE ext / desktop app | Go/Python/TS SDK, embed in your own program | Standalone CLI (Rust) / IDE ext / desktop app / cloud | Standalone CLI + TUI, npm/git packages |
 | **Core loop** | Kernel `Run`/`Stream`, tool-call loop via `charm.land/fantasy` | Built-in agentic loop | Exposes the same loop Claude Code runs on, programmatically | Built-in agentic loop | Minimal agent loop, four core tools (read/write/edit/bash) |
 | **Model providers** | Anthropic, Google, OpenAI, OpenAI-compatible gateway (`provider.go`) | Anthropic only (native); some third-party model routing | Anthropic only | OpenAI only (native) | Unified LLM API — many providers |
-| **Built-in tools** | Bash, Read, Write, Edit, MultiEdit, Glob, Grep, LS, Todo, Notify, Subagent, Skill (`tools/`) | Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, TodoWrite, NotebookEdit, etc. | Same tool surface as Claude Code, programmatically composable | Bash/exec, file read/write/patch, web search (cloud mode) | Deliberately just 4: read, write, edit, bash — everything else is opt-in |
+| **Built-in tools** | Bash, Read, Write, Edit, MultiEdit; Skill when discovered; Subagent opt-in (`tools/`) | Bash, Read, Write, Edit, Glob, Grep, WebFetch, WebSearch, Task/Agent, TodoWrite, NotebookEdit, etc. | Same tool surface as Claude Code, programmatically composable | Bash/exec, file read/write/patch, web search (cloud mode) | Deliberately just 4: read, write, edit, bash — everything else is opt-in |
 | **MCP client support** | Yes — `tools/mcp.go` connects via streamable HTTP (SSE fallback), discovers tools via `tools/list`, registers them as namespaced `ToolDef`s in `tools.Registry`. Wired in `kernel.go` via `Config.MCPServers`. No stdio transport; non-text content (images, embedded resources) dropped | Yes — full MCP client (stdio/SSE), first-class | Yes — inherits Claude Code's MCP client | Yes — MCP client support | **None by design** — "MCP is overkill"; favors CLI tools + README-based progressive disclosure over MCP |
 | **Skills / progressive-disclosure capability packages** | Partial — `skills.go` discovers `~/.toroid/skills/*.md` by frontmatter (name + description only in system prompt); `tools/skill.go` loads full body on demand. On by default (`Config.LoadSkills`). No marketplace, no `/skill:name` invocation syntax, no hook composition | Yes — Skills marketplace, `/skill:name`, loaded on demand, composes with hooks | Yes (same primitive, programmatic) | Partial — custom instructions/prompts, no first-class skills marketplace | Yes — first-class Skills concept, invoked via `/skill:name`, explicitly built for progressive disclosure without busting prompt cache |
 | **Subagents** | Yes — `RunSubagent`, sync and async (`subagent_async`) background agents that wake an idle kernel on completion | Yes — Task tool / Agent Teams | Yes — same primitive, programmatic | Yes — multi-agent v2 support | Yes — sub-agents supported, not built into core |
@@ -52,7 +52,7 @@ repo (`kernel.go`, `tools/`, `provider.go`, `events.go`, `skills.go`,
 | **Permission / approval gating** | `EventPermissionRequest` exists as an event; no built-in policy engine | Full permission modes, allow/deny lists, settings-driven | Caller implements policy on top of SDK primitives | Sandboxing + approval modes | Permission gates available as opt-in, not built-in |
 | **Sandboxing** | None built-in | OS-level sandboxing options on some platforms | Caller-managed | Sandboxed execution (containers) built-in for cloud tasks | Available as opt-in (not core) |
 | **Multimodal input** | Yes (`multimodal.go`) | Yes (images, screenshots) | Yes | Yes (image inputs added 2026) | Depends on underlying model/provider |
-| **Notifications** | Built-in (`notify` tool + desktop notification sinks, pluggable) | Limited | Caller-managed | Limited | Caller-managed |
+| **Notifications** | Caller-managed | Limited | Caller-managed | Limited | Caller-managed |
 | **Extensibility model** | Go package — extend by writing Go code against `tools.Registry`, or plug in external MCP servers via `Config.MCPServers` | Skills, hooks, MCP, plugins, marketplace | Full programmatic control — build any of the above yourself | Extensions via SDK, GitHub/Slack integrations | Packages (extensions, skills, prompts, themes) via npm/git |
 
 ### Radar: 7-axis capability comparison

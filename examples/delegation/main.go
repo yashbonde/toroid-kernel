@@ -50,6 +50,7 @@ func main() {
 		WorkDir:              ".",
 		Save:                 true, // persist the trace so we can export it as OTEL below
 		IncludeComputerTools: true,
+		IncludeSubagentTools: true,
 	})
 	if err != nil {
 		panic(err)

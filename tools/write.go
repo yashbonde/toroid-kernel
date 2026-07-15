@@ -10,12 +10,15 @@ import (
 )
 
 type WriteArgs struct {
-	Path    string `json:"path" jsonschema:"description=The absolute path to the file to write"`
+	Path    string `json:"path" jsonschema:"description=Repository-relative path to write; absolute only for files outside the workspace,minLength=1"`
 	Content string `json:"content" jsonschema:"description=The complete content to write to the file"`
 }
 
 func NewWriteTool(a Agent, desc string) *ToolDef {
 	h := llm.NewTool("write", desc, func(ctx context.Context, args WriteArgs) (llm.ToolResult, error) {
+		if args.Path == "" {
+			return llm.NewErrorResult("Error: path is required"), nil
+		}
 		path := args.Path
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(a.WorkDir(), path)
@@ -35,7 +38,6 @@ func NewWriteTool(a Agent, desc string) *ToolDef {
 	return &ToolDef{
 		Name:        "write",
 		Description: desc,
-		Template:    "write.tool.tmpl",
 		Handler:     h,
 	}
 }

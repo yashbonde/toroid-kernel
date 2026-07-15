@@ -1,0 +1,1 @@
+Make tools.Registry safe when MCP/background setup registers tools while other goroutines perform Lookup, Tools, or Execute. Preserve the public API. Tools must return a snapshot that callers can iterate or mutate without racing with the registry or changing registry state. Add focused concurrency and snapshot-isolation tests, and keep the uncontended path simple.

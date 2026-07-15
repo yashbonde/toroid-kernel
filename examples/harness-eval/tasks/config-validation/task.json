@@ -1,0 +1,9 @@
+{
+  "id": "config-validation",
+  "title": "Fail-fast kernel configuration validation",
+  "branch_slug": "config-validation",
+  "required_changed": ["kernel.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "./..."],
+  "timeout_minutes": 12
+}

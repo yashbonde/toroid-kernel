@@ -53,8 +53,8 @@ flowchart TB
 - **Defaults** — API key falls back to `GEMINI_TOKEN`; a Snowflake-based `SessionID` is generated; `WorkDir` defaults to a per-session runner dir; `ApplyDefaultDataTypes` fills the rest. The default model is `anthropic/claude-haiku-4-5`.
 - **Trace root** — if `TraceID` is empty it is set equal to `SessionID`. This is the marker of a *root* kernel; subagents inherit the parent's `TraceID` instead.
 - **Store** — opened only when `Save` is true. One shared SQLite handle backs both the trace store and the todo tools. On a non-root span it *reconstructs history* by replaying stored events (resume).
-- **Tools** — when `IncludeComputerTools` is set, `NewKernel` registers the thirteen built-ins; their short descriptions are read from the second line of each `*.tool.tmpl` file. Host-supplied `Config.Tools` are merged in too.
-- **System prompt** — `system.tmpl` is rendered with `WorkDir` and `Date`.
+- **Tools** — `IncludeComputerTools` registers the five core file/shell tools. Skills, subagents, and MCP tools are added only when discovered or explicitly enabled. Host-supplied `Config.Tools` are merged in too.
+- **System prompt** — `prompt_compiler.go` builds a small stable prefix after startup capabilities are known.
 - **Provider + model** — resolved from the `provider/model` ID, then the `provider/` prefix is stripped before asking for the `LanguageModel`.
 - **Loop guards** — two kernel-owned guards are wired into the step loop: `MaxIter` (default 25) caps the absolute number of tool-call turns, and `MaxRepeatCalls` (default 3) trips when consecutive steps issue identical tool calls with identical results. Both halt cleanly at a step boundary.
 - **Spend limits** — `Config.MaxTranscriptSpendUSD` caps cumulative transcript cost; a caller can add `WithMaxTurnSpendUSD` to cap one `Run`/`Stream` call. Non-positive values disable the corresponding limit.
@@ -140,7 +140,9 @@ The model catalog ([`model.go`](../model.go), `ResolveModel`) is the "model as d
 
 ## 4. Tools and the registry
 
-Each tool is a `ToolDef` pairing an `llm.ToolHandler` (the executable, schema-bearing function) with a `*.tool.tmpl` documentation file. The registry is a name-keyed map. The thirteen built-ins cover file/shell/search/planning/notification/delegation:
+Each tool is a `ToolDef` pairing a short compiled description with an
+`llm.ToolHandler` (the executable, schema-bearing function). The registry is a
+name-keyed map. Five core tools are enabled for ordinary coding runs:
 
 | Tool | Purpose | Notable behavior |
 |------|---------|------------------|
@@ -148,12 +150,11 @@ Each tool is a `ToolDef` pairing an `llm.ToolHandler` (the executable, schema-be
 | `write` | Write a file | Creates parent dirs |
 | `edit` | Exact-string replace | Fails if `oldText` is missing or non-unique |
 | `multiedit` | Batched edits to one file | — |
-| `ls` / `glob` / `grep` | List / find / content search | Scoped to the working directory |
-| `bash` | Run a shell command | Combined output truncated at 20k chars; no timeout arg |
-| `todowrite` / `todoread` | Task list | Persisted in the shared SQLite DB, keyed by session |
-| `notify` | Notification | Fires `EventNotification` on the bus + best-effort desktop notifier (macOS / Linux / Windows) + any registered `NotifySink` |
-| `subagent` | Delegate a subtask synchronously | In-process child kernel; parent blocks |
-| `subagent_async` | Delegate a subtask in the background | Returns a task id immediately; wakes the parent on completion (§9) |
+| `bash` | Run a shell command | Non-interactive, 120s default timeout, output capped at 12k chars |
+
+`skill` appears only when skills are discovered. `subagent` and
+`subagent_async` require `IncludeSubagentTools`; MCP and host tools appear only
+when configured.
 
 > **Note.** Tool failures are returned as ordinary text beginning with `"Error:"`; in [`OnToolResult`](../kernel.go#L765) the kernel sniffs that string prefix to decide between `PostToolUse` and `PostToolUseFailure`. The result is now carried in a structured `ToolUseResultPayload` (with a dedicated `Error` field populated on the failure path), but the failure *detection* is still string-prefix based rather than a structured error flag from the tool.
 
@@ -282,6 +283,8 @@ OpenTelemetry is the kernel's telemetry substrate, not an afterthought. The pers
 
 **Export.** [`otlp.go`](../otlp.go) implements a minimal OTLP/HTTP-JSON exporter — it builds the OTLP request, gzip-encodes it, and POSTs to any OTLP backend. [`LangfuseOTLP(ctx, traceID, baseURL, publicKey, secretKey)`](../otlp.go#L491) is the ready-made entrypoint that ships a stored trace to Langfuse. The kernel takes no hard dependency on the OpenTelemetry SDK; a host calls the exporter (or feeds `OTELSpans` snapshots to its own exporter) whenever it wants to publish.
 
+**Always-on file transcript.** Independent of `Save`/SQLite, every session appends its observable events to `~/.toroid/sessions/<session-id>/transcript.jsonl` ([transcript.go](../transcript.go)) — one OTEL span-event per line (spec-valid trace/span IDs from `OTELIDs` + the same `Event.OTEL()` projection used for export, so the file never drifts from the SQLite/exported views). It is best-effort (a write failure never disrupts a run) and filtered to `Observable()` kinds. This gives a durable, greppable trace of every run — including all tool/CLI commands — even when a host never enables the store. `SessionDir(sessionID)` returns the per-session directory (shared with the `tool-output/` overflow files).
+
 ## 12. Mental model in one diagram
 
 ```mermaid
@@ -303,7 +306,7 @@ flowchart LR
 
 ## 13. Roadmap (designed, not yet code)
 
-Everything in §1–§12 is the system *as built* — including the storage consolidation, OTEL-native telemetry, pluggable notification sinks, and background agents that earlier drafts of this doc listed as future work. The two items below are the larger follow-on still to come. They are sequenced: permission gating (§13.2) is a prerequisite for safely opening the kernel to inter-kernel traffic (§13.1).
+Everything in §1–§12 is the system *as built* — including the storage consolidation, OTEL-native telemetry, and background agents that earlier drafts of this doc listed as future work. The two items below are the larger follow-on still to come. They are sequenced: permission gating (§13.2) is a prerequisite for safely opening the kernel to inter-kernel traffic (§13.1).
 
 ### 13.1 Inter-kernel communication (IKC)
 

@@ -7,7 +7,7 @@ import (
 )
 
 type SubagentArgs struct {
-	Task string `json:"task" jsonschema:"description=Full description of the subtask for the subagent to handle"`
+	Task string `json:"task" jsonschema:"description=Self-contained subtask with goal paths constraints and expected result,minLength=1"`
 }
 
 // NewSubagentTool runs a subagent synchronously and returns its output.
@@ -25,7 +25,6 @@ func NewSubagentTool(a Agent, desc string) *ToolDef {
 	return &ToolDef{
 		Name:        "subagent",
 		Description: desc,
-		Template:    "subagent.tool.tmpl",
 		Handler:     h,
 	}
 }

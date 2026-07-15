@@ -1,0 +1,25 @@
+You are working inside a clean checkout of the toroid-kernel Go repository, currently on the master branch. Complete the whole task below autonomously, without asking for confirmation. Each numbered item states an outcome to achieve, not a method — choose how yourself.
+
+1. Create and switch to a new git branch for your work. Use the name
+   bench/{{HARNESS}}/spend-limit. If a branch with that exact name already
+   exists (locally or on the origin remote), do NOT reuse, overwrite, or
+   force-push it — instead append a numeric suffix so the name is unique:
+   bench/{{HARNESS}}/spend-limit-2, then -3, and so on, using the smallest
+   number not already taken. Remember the exact branch name you chose and use
+   it for the push in step 5.
+
+2. Implement a hard spend limit in the kernel:
+   - Per-turn limit: an optional maximum cost in USD for a single kernel.Run / kernel.Stream call (i.e. one turn). If reached, that call must stop.
+   - Per-transcript limit: an optional maximum cost in USD, configured on the kernel Config, that applies across the whole transcript (every turn combined). If reached, the run must stop.
+   - Whichever limit is hit first must automatically exit the agent event loop, so no further LLM turns are made for that call.
+   The kernel already accounts for cost in USD both per-turn and cumulatively; build on that existing accounting.
+
+3. Make sure the project still builds (go build ./...). If there are directly relevant tests, they should pass.
+
+4. Commit your changes on the branch with a clear commit message.
+
+5. Push the branch to the origin remote, bypassing git hooks (use --no-verify).
+
+6. Append a short entry to a file named bench_log.txt at the repository root: what you implemented and the exact branch name.
+
+7. Switch back to the master branch.

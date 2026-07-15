@@ -1,0 +1,9 @@
+{
+  "id": "spend-limit",
+  "title": "Hard per-turn and transcript spend limits",
+  "branch_slug": "spend-limit",
+  "required_changed": ["kernel.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "./..."],
+  "timeout_minutes": 20
+}

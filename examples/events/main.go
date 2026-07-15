@@ -1,15 +1,9 @@
-// Pattern: EVENTS & NOTIFICATIONS (observability + pluggable sinks).
+// Pattern: EVENTS (lifecycle observability).
 //
 // The kernel exposes its whole lifecycle through a synchronous event bus. Use
 // On(kind, fn) to observe tool calls, costs, reasoning, compaction, etc. — this
 // is how a host renders output, tracks spend, and reacts to lifecycle changes.
 // A hook returning a non-nil error aborts the firing chain.
-//
-// Notifications are a specialised case: the `notify` tool fires an
-// EventNotification on the bus AND runs any sinks registered with
-// tools.RegisterNotifySink (plus a best-effort desktop notification). Register
-// your own sink to route notifications to a webhook, Slack, or a peer kernel —
-// the tool itself stays platform-agnostic.
 //
 //	export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
 //	go run ./examples/events
@@ -21,7 +15,6 @@ import (
 	"os"
 
 	toroid "github.com/yashbonde/toroid-kernel"
-	"github.com/yashbonde/toroid-kernel/tools"
 )
 
 func main() {
@@ -37,13 +30,6 @@ func main() {
 		model = m
 	}
 	ctx := context.Background()
-
-	// Register a custom notification sink BEFORE constructing the kernel. In a
-	// real host this might POST to a webhook or forward to a peer kernel.
-	tools.RegisterNotifySink(func(_ context.Context, title, message string) error {
-		fmt.Printf("[sink] %s: %s\n", title, message)
-		return nil
-	})
 
 	k, err := toroid.NewKernel(ctx, toroid.Config{
 		Model:                model,
@@ -75,15 +61,7 @@ func main() {
 		}
 		return nil
 	})
-	// Notifications also arrive on the bus, alongside the registered sink above.
-	k.On(toroid.EventNotification, func(_ context.Context, e toroid.Event) error {
-		fmt.Printf("[event] %v\n", e.Payload)
-		return nil
-	})
-
-	out, _, err := k.Run(ctx,
-		"List the files here and tell me how many there are, then send a notification "+
-			"titled 'done' with the message 'example finished'.")
+	out, _, err := k.Run(ctx, "List the files here and tell me how many there are.")
 	if err != nil {
 		panic(err)
 	}

@@ -1,0 +1,1 @@
+Fix tool-output truncation so arbitrary UTF-8 text is never cut into an invalid string. Keep the existing byte-oriented hard budget, full-output spill file, and truncation diagnostics. The returned retained prefix must not exceed MaxToolOutputChars bytes, must end on a rune boundary, and ASCII behavior must remain unchanged.

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"text/template"
 	"time"
 
 	"github.com/yashbonde/toroid-kernel/llm"
@@ -32,13 +31,13 @@ type Kernel struct {
 	Cfg  Config
 	Step Step // one-llm-step backend; defaults to GatewayStep over the llm client
 
-	Hooks            *HookRegistry
-	Tools            *tools.Registry
-	Store            *Store
-	seq              atomic.Uint64
-	SystemPrompt string
-	History      []llm.Message
-	Sessions     map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
+	Hooks          *HookRegistry
+	Tools          *tools.Registry
+	Store          *Store
+	seq            atomic.Uint64
+	SystemPrompt   string
+	History        []llm.Message
+	Sessions       map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
 	usageMu        sync.Mutex
 	currentTokens  int
 	runningCostUSD float64
@@ -78,13 +77,17 @@ type Config struct {
 	// MaxIter caps tool-call steps per turn. With prompt caching every extra
 	// step re-reads the prefix at cache price, so a deep loop is affordable;
 	// the repeat-call guard still stops genuine spins early.
-	MaxIter        int      `json:"max_iter" description:"max tool-call iterations" default:"100"`
-	MaxRepeatCalls int      `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
-	Thinking       Thinking `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
+	MaxIter        int       `json:"max_iter" description:"max tool-call iterations" default:"100"`
+	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
+	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
 
 	// Tools
-	IncludeComputerTools bool            `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
+	IncludeComputerTools bool `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
+	// IncludeSubagentTools opts into synchronous and background delegation.
+	// It is separate from the core file/shell tools so ordinary runs keep a
+	// smaller, more relevant tool prefix.
+	IncludeSubagentTools bool            `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"false"`
 	Tools                *tools.Registry `json:"tools,omitempty" description:"custom tools"`
 
 	// Skills: if unset or true, scan ~/.toroid/skills/*.md at startup for
@@ -186,34 +189,17 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		Tools:         tools.NewRegistry(),
 	}
 
-	// getDescription returns a tool's full model-facing documentation: the
-	// .tool.tmpl body with its frontmatter ("---\n<summary>\n---") stripped.
-	// The docs are deliberately short — a few lines of usage rules each — so
-	// sending them whole costs little and the model actually sees them.
-	getDescription := func(name string) string {
-		b, _ := readPrompt(name + ".tool.tmpl")
-		s := strings.TrimSpace(string(b))
-		if strings.HasPrefix(s, "---") {
-			if parts := strings.SplitN(s, "---", 3); len(parts) == 3 {
-				return strings.TrimSpace(parts[1]) + "\n" + strings.TrimSpace(parts[2])
-			}
-		}
-		if s == "" {
-			return "Tool " + name
-		}
-		return s
-	}
-
 	// register all tools
 	if cfg.IncludeComputerTools {
-		k.Tools.Register(tools.NewReadTool(k, getDescription("read")))
-		k.Tools.Register(tools.NewWriteTool(k, getDescription("write")))
-		k.Tools.Register(tools.NewBashTool(k, getDescription("bash")))
-		k.Tools.Register(tools.NewEditTool(k, getDescription("edit")))
-		k.Tools.Register(tools.NewMultiEditTool(k, getDescription("multiedit")))
-		k.Tools.Register(tools.NewNotifyTool(k, getDescription("notify")))
-		k.Tools.Register(tools.NewSubagentTool(k, getDescription("subagent")))
-		k.Tools.Register(newSubagentAsyncTool(k, getDescription("subagent")))
+		k.Tools.Register(tools.NewReadTool(k, toolDescription("read")))
+		k.Tools.Register(tools.NewWriteTool(k, toolDescription("write")))
+		k.Tools.Register(tools.NewBashTool(k, toolDescription("bash")))
+		k.Tools.Register(tools.NewEditTool(k, toolDescription("edit")))
+		k.Tools.Register(tools.NewMultiEditTool(k, toolDescription("multiedit")))
+	}
+	if cfg.IncludeSubagentTools {
+		k.Tools.Register(tools.NewSubagentTool(k, toolDescription("subagent")))
+		k.Tools.Register(newSubagentAsyncTool(k, toolDescription("subagent_async")))
 	}
 
 	if cfg.Tools != nil {
@@ -231,7 +217,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	var skills []SkillMeta
 	if cfg.LoadSkills == nil || *cfg.LoadSkills {
 		skills, _ = discoverSkills()
-		k.Tools.Register(tools.NewSkillTool(k, getDescription("skill")))
+		if len(skills) > 0 {
+			k.Tools.Register(tools.NewSkillTool(k, toolDescription("skill")))
+		}
 	}
 
 	// MCP: connect each configured remote server and register its tools.
@@ -276,12 +264,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		}
 	}
 
-	// Load system prompt (includes SmallerModel routing note when set)
-	systemPrompt, err := buildSystemPrompt(cfg.WorkDir, skills, cfg.Model, cfg.SmallerModel)
-	if err != nil {
-		return nil, err
-	}
-	k.SystemPrompt = systemPrompt
+	// Compile one stable system prefix after every startup capability is known.
+	k.SystemPrompt = buildSystemPrompt(cfg.WorkDir, skills, len(cfg.MCPServers) > 0,
+		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel)
 
 	// Step is the one-llm-step backend over the in-repo wire client (OpenAI
 	// chat completions, or native Anthropic messages for anthropic/ ids). Tests
@@ -350,27 +335,6 @@ func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
 		TurnCostUSD:  u.Cost,
 		TotalCostUSD: runningCost,
 	})
-}
-
-func buildSystemPrompt(workDir string, skills []SkillMeta, model, smallerModel string) (string, error) {
-	raw, err := readPrompt("system.tmpl")
-	if err != nil {
-		return "", err
-	}
-	tmpl, err := template.New("system").Parse(string(raw))
-	if err != nil {
-		return "", err
-	}
-
-	var buf strings.Builder
-	err = tmpl.Execute(&buf, map[string]any{
-		"WorkDir":      workDir,
-		"Date":         time.Now().Format("2006-01-02"),
-		"Skills":       skills,
-		"Model":        model,
-		"SmallerModel": smallerModel,
-	})
-	return buf.String(), err
 }
 
 // Implement tools.Agent interface
@@ -850,6 +814,7 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 		}
 		subCfg.MaxTranscriptSpendUSD = remaining
 	}
+	subCfg.IncludeSubagentTools = false
 	if k.Cfg.SmallerModel != "" {
 		subCfg.Model = k.Cfg.SmallerModel
 	}
@@ -990,7 +955,7 @@ func (k *Kernel) Wake(ctx context.Context) error {
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.
 type SubagentAsyncArgs struct {
-	Task string `json:"task" jsonschema:"description=Full description of the subtask to run in the background"`
+	Task string `json:"task" jsonschema:"description=Independent background subtask with goal paths constraints and expected result,minLength=1"`
 }
 
 // newSubagentAsyncTool builds the subagent_async tool, which delegates a subtask
@@ -1003,7 +968,6 @@ func newSubagentAsyncTool(k *Kernel, desc string) *tools.ToolDef {
 	return &tools.ToolDef{
 		Name:        "subagent_async",
 		Description: desc,
-		Template:    "subagent.tool.tmpl",
 		Handler:     h,
 	}
 }

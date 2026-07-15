@@ -2,14 +2,13 @@
 
 `toroid-kernel` is a Go package for running tool-using LLM agents with persistent traces, resumable history, gateway-truth cost accounting, and a built-in tool registry.
 
-**~6,562 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
+**~6,824 lines of Go** across the kernel (`.`), the LLM wire layer (`llm/`), and the tools (`tools/`). No third-party model SDK.
 
 **Runner binaries** (built with `-trimpath -ldflags="-s -w"`; linux is amd64):
 
 | runner | macOS (arm64) | Linux (amd64) | Linux + upx |
 |---|---|---|---|
-| `examples/toroid-cli` | 13.2 MB | 13.6 MB | 5.7 MB |
-| `examples/repl` | 13.2 MB | 13.6 MB | 5.7 MB |
+| `examples/cli` | 11.8 MB | 12.1 MB | 5.2 MB |
 
 ## Features
 
@@ -20,8 +19,10 @@
 - Structured output (`WithSchema`) as a forced tool call — works across upstreams, including Bedrock-backed Anthropic
 - Multimodal input: images and PDFs inline in prompts (`![](path)`, 5 MiB cap, capability-gated per model) and as tool-result media (the `read` tool returns images a vision model can see)
 - Single-file SQLite persistence (traces, costs, events) with OpenTelemetry-compatible trace/span IDs and a Langfuse OTLP exporter
+- Always-on transcript: every session appends its observable events (tool calls included) as OTEL-shaped NDJSON to `~/.toroid/sessions/<session-id>/transcript.jsonl` — independent of `Save`, so there is a durable trace even without SQLite
 - Conversation compaction, loop guards (MaxIter, default 100, + repeat-call spin guard), and history reconstruction for resume
-- Lean default toolset — read, write, edit, multiedit, bash, notify, skill, subagent (search/list/find go through bash); MCP client for remote tool servers. Truncated tool outputs spill to `~/.toroid/sessions/<session>/tool-output/` (the result names the file) so nothing is lost; when `rtk` is on PATH, simple read-only bash commands are auto-routed through it for compressed output
+- Lean default toolset — read, write, edit, multiedit, and bash (search/list/find go through bash). Skills appear only when discovered; subagents are opt-in with `IncludeSubagentTools`; MCP tools appear only when configured. Truncated tool outputs spill to `~/.toroid/sessions/<session>/tool-output/` (the result names the file) so nothing is lost; when `rtk` is on PATH, simple read-only bash commands are auto-routed through it for compressed output. The bash tool runs non-interactively with a per-command timeout (default 120s, overridable) and a process-group kill, so a command that opens an editor or otherwise blocks on a terminal can never hang the kernel
+- Cache-stable prompt compilation — startup capabilities (skills, MCP, and optional subagents) are compiled once into the system prompt after discovery; tool definitions are deterministically ordered and remain unchanged across loop turns and later runs. Capability guidance appears once in that stable prefix instead of being re-injected as cache-busting history
 - Background agents — async subagents that wake an idle kernel on completion
 
 ## Verified models
@@ -119,17 +120,17 @@ func main() {
 
 ## Runners
 
-The two production runners live in `examples/`:
+The `cli` runner in `examples/` does double duty:
 
-- **`toroid-cli`** — one-shot: drive the kernel from the command line, emitting every kernel event as NDJSON on stdout (the bridge for hosts in other languages; `-plain` prints just the final answer).
-- **`repl`** — interactive terminal chat with live tool-call display, cost footer, `/cost`, `/model`, `/reset`.
+- **`cli`** — interactive terminal chat with live tool-call display, cost footer, `/cost`, `/model`, `/reset`.
+- **`cli --run '<prompt>'`** — one-shot: drive the kernel from the command line, emitting every kernel event as NDJSON on stdout (the bridge for hosts in other languages; `--plain` prints just the final answer). Shares the same flags, so `--model`, `--thinking`, `--save` all apply.
 
 ```bash
 export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
 export LLM_GATEWAY_KEY=sk-...
 
-go run ./examples/toroid-cli -plain 'what files are in this directory?'
-go run ./examples/repl
+go run ./examples/cli
+go run ./examples/cli --run 'what files are in this directory?' --plain
 ```
 
 ## Examples
@@ -146,8 +147,9 @@ go run ./examples/running                 # blocking Run + streaming + multimoda
 go run ./examples/structured-after-tools  # tool calls, then schema-coerced JSON
 go run ./examples/guardrails              # loop guards, no network needed (scripted FauxStep)
 go run ./examples/delegation              # subagents, background agents
-go run ./examples/events                  # lifecycle observability + notification sinks
+go run ./examples/events                  # lifecycle observability hooks
 go run ./examples/langfuse                # push a persisted trace to Langfuse over OTLP
+go test ./examples/e2e-test               # offline skill + MCP + cache-prefix integration test
 ```
 
 ## Cost accounting
@@ -184,28 +186,24 @@ and pushes it to Langfuse. Call `kernel.Close()` when done to checkpoint the sto
 
 ## Background agents
 
+Set `IncludeSubagentTools: true` to expose `subagent` and `subagent_async`.
 `subagent_async` runs a subtask in the background and returns immediately. When
 it finishes, its result is queued and the kernel is woken to process it — even
 if `Run`/`Stream` had already returned. The `MasterIdle` and `TaskCompleted`
 events let a host observe these transitions.
-
-## Notifications
-
-The `notify` tool fires a `Notification` event on the kernel's event bus and
-delivers a best-effort desktop notification (macOS / Linux / Windows). Register
-additional sinks (webhook, Slack, a peer kernel) with `tools.RegisterNotifySink`.
 
 ## Skills
 
 When `Config.LoadSkills` is unset or `true` (the default), the kernel scans
 `~/.toroid/skills/*.md` at startup and reads only each file's frontmatter
 (`name` + `description`) into the system prompt — the full body is not loaded.
-The kernel registers a `skill` tool that loads a skill's full contents on
-demand, so token cost is proportional to the skills actually used, not how many
-exist on disk. Set `LoadSkills` to `false` to disable.
+When at least one skill exists, the kernel registers a `skill` tool that loads
+its full contents on demand. Set `LoadSkills` to `false` to disable discovery.
 
 ## Release Notes
 
 - The module path is `github.com/yashbonde/toroid-kernel`.
-- Embedded prompts live in `prompts/`.
+- The stable system prompt and built-in tool contracts are compiled in
+  `prompt_compiler.go`; `prompts/` holds only task-specific prompts such as
+  conversation compaction.
 - Runtime state is stored under `~/.toroid/` (single SQLite DB at `sql.db`).

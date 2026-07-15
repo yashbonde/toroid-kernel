@@ -19,27 +19,34 @@ go run ./examples/<name>
 |--------------|-------------------------------------------|----------|
 | `running`    | Blocking run + streaming run              | `NewKernel`, `Run`, `Stream`, `On(EventToken)`, `RunningCostUSD`, `Close` |
 | `delegation` | Subagents, background agents, OTEL export | `subagent`/`subagent_async` tools, `RunSubagent`, `SpawnBackground`, `On(EventSubagentStart/TaskCompleted/MasterIdle)`, `Save`, `OTELSpans`, `ListSessions` |
-| `events`     | Lifecycle observability + notify sinks    | `On(EventPreToolUse/PostToolUse/TurnCost/Notification)`, `tools.RegisterNotifySink` |
-| `toroid-cli` | CLI runner that emits every event as NDJSON on stdout — wrap it in a subprocess from any language | `NewKernel`, `OnAll`, `Run`, JSON-encoded `Event` |
-| `repl` | Interactive, pretty-printing chat REPL — rendered Markdown answers, trimmed tool-call lines, running cost | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `Run`, `RunningCostUSD` |
+| `events`     | Lifecycle observability                   | `On(EventPreToolUse/PostToolUse/TurnCost)` |
+| `cli` | Interactive, pretty-printing chat REPL — plus a `--run` flag that emits every event as NDJSON on stdout, wrappable as a subprocess from any language | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `OnAll`, `Run`, `RunningCostUSD`, JSON-encoded `Event` |
 | `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
+| `e2e-test` | Offline integration fixture: discovered skill, local MCP server, host/core/subagent tools, structured output, and a cache-stable system/tool prefix | `FauxStep`, `Config.MCPServers`, `Config.IncludeSubagentTools`, `WithSchema` |
 
-`toroid-cli` takes the prompt as an argument and is the recommended way to embed
-the kernel in a non-Go host:
+Run the self-contained integration example with `go test ./examples/e2e-test`.
+Its committed `skills/e2e-review.md` fixture is copied into an isolated
+`~/.toroid/skills` during the test; it never reads or writes your real home.
+
+`toroid --run '<prompt>'` takes the prompt as a flag value and is the
+recommended way to embed the kernel in a non-Go host. It shares the REPL's flag
+set, so `--model`, `--thinking`, and `--save` all apply:
 
 ```bash
-go run ./examples/toroid-cli 'what files are in this directory?'
+go run ./examples/cli --run 'what files are in this directory?'
 # each stdout line is one JSON-encoded toroid.Event; diagnostics go to stderr
+# add --plain to print just the final answer as text
 ```
 
-`repl` is the human-facing counterpart: an interactive loop that renders
-Markdown answers (headings, **bold**, `code`, fenced blocks, lists), shows tool
-calls as compact trimmed one-liners, and tracks running cost. Targeting knobs are
-environment variables; per-run toggles are flags:
+Without `--run`, `cli` is the human-facing counterpart: an
+interactive loop that renders Markdown answers (headings, **bold**, `code`,
+fenced blocks, lists), shows tool calls as compact trimmed one-liners, and
+tracks running cost. Targeting knobs are environment variables; per-run toggles
+are flags:
 
 ```bash
 export LLM_GATEWAY_BASE_URL=... LLM_GATEWAY_KEY=...
-TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/repl --thinking high --save
+TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/cli --thinking high --save
 # in-REPL: /help /cost /model /reset /clear /exit (or Ctrl-D)
 ```
 

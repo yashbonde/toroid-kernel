@@ -14,11 +14,11 @@ import (
 // SGR escape sequences. Vars (not consts) so disableColor can blank them all
 // when NO_COLOR is set; named so the rendering rules read as intent.
 var (
-	aReset     = "\x1b[0m"
-	aBold      = "\x1b[1m"
-	aDim       = "\x1b[2m"
-	aItalic    = "\x1b[3m"
-	aUnderline = "\x1b[4m"
+	aReset         = "\x1b[0m"
+	aBold          = "\x1b[1m"
+	aDim           = "\x1b[2m"
+	aItalic        = "\x1b[3m"
+	aUnderline     = "\x1b[4m"
 	aStrikethrough = "\x1b[9m"
 
 	aRed     = "\x1b[31m"

@@ -9,7 +9,6 @@ import (
 type ToolDef struct {
 	Name        string
 	Description string // short (discovery) — shown to LLM in tool schema
-	Template    string // name of the .tool.tmpl file (full documentation)
 	Handler     llm.ToolHandler
 }
 

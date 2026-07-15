@@ -9,7 +9,7 @@ import (
 )
 
 type SkillArgs struct {
-	Path string `json:"path" jsonschema:"description=Path to the skill file to load in full (as listed in the Skills section of the system prompt, or named directly by the user)"`
+	Path string `json:"path" jsonschema:"description=Exact listed path of the skill to load,minLength=1"`
 }
 
 func (a SkillArgs) Validate() error {
@@ -40,7 +40,6 @@ func NewSkillTool(a Agent, desc string) *ToolDef {
 	return &ToolDef{
 		Name:        "skill",
 		Description: desc,
-		Template:    "skill.tool.tmpl",
 		Handler:     h,
 	}
 }

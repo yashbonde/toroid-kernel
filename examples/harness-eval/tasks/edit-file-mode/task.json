@@ -1,0 +1,9 @@
+{
+  "id": "edit-file-mode",
+  "title": "Permission-preserving atomic edit tool",
+  "branch_slug": "edit-file-mode",
+  "required_changed": ["tools/edit.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "./tools"],
+  "timeout_minutes": 15
+}

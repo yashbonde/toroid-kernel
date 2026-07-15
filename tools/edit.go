@@ -11,14 +11,25 @@ import (
 )
 
 type EditArgs struct {
-	FilePath string `json:"filePath" jsonschema:"description=The absolute path to the file to edit"`
-	OldText  string `json:"oldText" jsonschema:"description=The exact text to replace"`
-	NewText  string `json:"newText" jsonschema:"description=The text to replace it with"`
+	FilePath       string `json:"path" jsonschema:"description=Repository-relative path to edit; absolute only for files outside the workspace,minLength=1"`
+	LegacyFilePath string `json:"filePath,omitempty" jsonschema:"-"`
+	OldText        string `json:"oldText" jsonschema:"description=The exact text to replace,minLength=1"`
+	NewText        string `json:"newText" jsonschema:"description=The text to replace it with"`
+}
+
+func (a EditArgs) path() string {
+	if a.FilePath != "" {
+		return a.FilePath
+	}
+	return a.LegacyFilePath
 }
 
 func NewEditTool(a Agent, desc string) *ToolDef {
 	h := llm.NewTool("edit", desc, func(ctx context.Context, args EditArgs) (llm.ToolResult, error) {
-		path := args.FilePath
+		if args.path() == "" || args.OldText == "" {
+			return llm.NewErrorResult("Error: path and oldText are required"), nil
+		}
+		path := args.path()
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(a.WorkDir(), path)
 		}
@@ -48,7 +59,6 @@ func NewEditTool(a Agent, desc string) *ToolDef {
 	return &ToolDef{
 		Name:        "edit",
 		Description: desc,
-		Template:    "edit.tool.tmpl",
 		Handler:     h,
 	}
 }

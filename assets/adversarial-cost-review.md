@@ -4,7 +4,7 @@
 (50+ turns), large tool outputs, vision inputs, subagent-heavy workflows.
 **Method:** read the actual source — `kernel.go`, `steploop.go`, `gatewaystep.go`,
 `llm/client.go`, `llm/message.go`, `llm/tool.go`, `multimodal.go`, `history.go`,
-`store.go`, `model.go`, `tools/*.go`, `prompts/system.tmpl`. No speculation about
+`store.go`, `model.go`, `tools/*.go`, `prompt_compiler.go`. No speculation about
 unread code.
 
 ---
@@ -63,7 +63,7 @@ issue that can mask runaway spend.
 | 12 | Loop-guard signature concatenates full tool-result text each turn | `steploop.go:187` | CPU | large alloc/turn |
 | 13 | `Sessions[self]` overwritten with last step, not summed → Stop/Run usage undercounts | `kernel.go:404-408,626-633` | lost $ data | per-session tokens wrong |
 | 14 | Compaction summarize pays for full un-stripped media; `trimHistoryRange` skips `Files` | `kernel.go:730,691-720` | tokens | image $ in summarize call |
-| 15 | System-prompt `Date` at second granularity (cross-session cache/no per-turn) | `kernel.go:351`, `system.tmpl:4` | cache (minor) | new prefix per session |
+| 15 | System-prompt date changes across days (cross-session cache/no per-turn) | `prompt_compiler.go` | cache (minor) | new prefix per day |
 
 ---
 
@@ -379,15 +379,13 @@ does not need the raw images.
 
 ---
 
-### 15. System-prompt `Date` at second granularity
+### 15. System-prompt date changes across days
 
-**Where:** `kernel.go:351` (`"Date": time.Now().Format("2006-01-02 15:04:05")`),
-template `prompts/system.tmpl:4`.
+**Where:** `prompt_compiler.go` (`time.Now().Format("2006-01-02")`).
 
 **Mechanism:** The system prompt is built once per kernel (`kernel.go:272`), so this is
-**cache-stable within a chat** — no per-turn variance (good). But the second-granularity
-timestamp guarantees a different system prefix on every new/resumed kernel, so no
-cross-session prefix reuse is possible, and it is needless precision.
+**cache-stable within a chat** — no per-turn variance (good). The day changes the
+prefix across dates, so cross-day reuse is unavailable.
 
 **Cost impact:** Minor — only matters across sessions/resumes, and only once cache is
 enabled (finding #1).
@@ -399,9 +397,8 @@ prefix, or drop the time component.
 
 ## What is already done well (so it is not "fixed" away)
 
-- **Tool schemas are compact and built once.** `getDescription` (`kernel.go:185-192`)
-  sends only line 2 of each `.tool.tmpl` as the schema description; full tool docs are
-  *not* shipped in the schema. `GenerateSchema` runs once in `NewTool`
+- **Tool schemas are compact and built once.** `toolDescription` in
+  `prompt_compiler.go` returns short contracts, and `GenerateSchema` runs once in `NewTool`
   (`llm/tool.go:71-79`), not per turn.
 - **System prompt is a single leading message**, never duplicated into history
   (`client.go:326-328`, comments at `kernel.go:527-531`), and compaction keeps it out

@@ -1,0 +1,9 @@
+{
+  "id": "unicode-truncation",
+  "title": "UTF-8-safe tool output truncation",
+  "branch_slug": "unicode-truncation",
+  "required_changed": ["tools/path.go"],
+  "required_files": ["bench_log.txt"],
+  "verify": ["go", "test", "./tools"],
+  "timeout_minutes": 12
+}

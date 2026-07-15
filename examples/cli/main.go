@@ -1,7 +1,8 @@
 // Pattern: REPL — an interactive, pretty-printing chat loop for talking to any
 // agent the kernel can drive.
 //
-// This is the human-facing counterpart to toroid-cli (which emits machine NDJSON).
+// This is the human-facing counterpart to --run (`toroid --run '<prompt>'`,
+// which emits machine NDJSON — see run.go).
 // You type, the agent answers, and the answer is rendered: Markdown is formatted
 // (headings, **bold**, `code`, fenced blocks, lists), tool calls are shown as
 // compact one-liners with their args/results trimmed so a chatty tool never eats
@@ -20,7 +21,7 @@
 //	flag --no-colour       disable all ANSI styling (default off)
 //
 //	export TOROID_LLM_TOKEN=your_api_key
-//	go run ./examples/repl --model openai/gpt-4o --thinking high --save
+//	go run ./examples/cli --model openai/gpt-4o --thinking high --save
 //
 // In-REPL commands: /help /cost /model /reset /clear /exit  (or Ctrl-D to quit).
 package main
@@ -47,22 +48,34 @@ var (
 )
 
 type config struct {
-	model     string
-	workdir   string
-	thinking  toroid.Thinking
-	maxIter   int
-	save      bool
-	trim      int
+	model    string
+	workdir  string
+	thinking toroid.Thinking
+	maxIter  int
+	save     bool
+	trim     int
+
+	// One-shot mode (--run). When run is non-empty the binary drives the kernel
+	// once, emitting NDJSON events (or --plain for just the final answer),
+	// instead of starting the interactive REPL. --model/--thinking/--save all
+	// apply, since --run shares this flag set.
+	run    string
+	plain  bool
+	tokens bool
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
-// (--model, --save, --thinking, --no-colour). It returns the config plus the resolved
-// API key. Flags win for the per-run toggles; env wins for the targeting knobs.
+// (--model, --save, --thinking, --no-colour, --run, --plain, --tokens). It
+// returns the config plus the resolved API key. Flags win for the per-run
+// toggles; env wins for the targeting knobs.
 func loadConfig() (config, string) {
 	model := flag.String("model", "", "override TOROID_MODEL (provider/model)")
 	save := flag.Bool("save", false, "persist events, costs and metadata to the SQLite store")
 	thinking := flag.String("thinking", "low", "thinking budget: none | low | high")
 	noColour := flag.Bool("no-colour", false, "disable ANSI colour/styling")
+	run := flag.String("run", "", "one-shot: run this prompt, emit NDJSON events, and exit (non-interactive)")
+	plain := flag.Bool("plain", false, "with --run: print only the final assistant response as plain text, not the NDJSON event stream")
+	tokens := flag.Bool("tokens", false, "with --run: include per-step Reasoning deltas in the NDJSON stream")
 	flag.Parse()
 
 	if *noColour {
@@ -90,6 +103,9 @@ func loadConfig() (config, string) {
 		thinking: toroid.Thinking(*thinking),
 		save:     *save,
 		trim:     120,
+		run:      strings.TrimSpace(*run),
+		plain:    *plain,
+		tokens:   *tokens,
 	}
 	if v := os.Getenv("TOROID_MAX_ITER"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -123,6 +139,15 @@ func main() {
 	// (LLM_GATEWAY_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY); TOROID_LLM_TOKEN
 	// is an explicit override.
 	cfg, apiKey := loadConfig()
+
+	// --run: one-shot, non-interactive. Drive the kernel once and emit every
+	// event as NDJSON (or --plain for just the final answer) — the bridge for
+	// hosts in other languages. All targeting flags (--model, --thinking,
+	// --save, …) apply since --run shares the same flag set.
+	if cfg.run != "" {
+		runOneShot(cfg, apiKey)
+		return
+	}
 
 	ctx := context.Background()
 	k, err := newKernel(ctx, cfg, apiKey)
@@ -278,7 +303,7 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	// Turn footer: running cost (gateway-reported) plus token usage and throughput.
 	// EventStop's UsagePayload carries the session's per-turn usage by session ID.
 	fmt.Printf("%s  ₹%.0f%s", aGray, k.RunningCostUSD()*100, aReset)
-	
+
 	// Print token usage and cache statistics if available.
 	if u, ok := usage.Tokens[k.SessionID()]; ok && (u.Input > 0 || u.CacheRead > 0 || u.CacheWrite > 0) {
 		var parts []string
@@ -295,7 +320,7 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 			fmt.Printf("%s  ·  %s%s", aGray, strings.Join(parts, " "), aReset)
 		}
 	}
-	
+
 	if outTokens := usage.Tokens[k.SessionID()].Output; outTokens > 0 && elapsed.Seconds() > 0 {
 		fmt.Printf("%s  ·  %d→ in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
 	}

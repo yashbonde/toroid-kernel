@@ -2,6 +2,7 @@ package llm
 
 import (
 	"reflect"
+	"strconv"
 	"strings"
 )
 
@@ -62,16 +63,32 @@ func schemaForStruct(t reflect.Type) map[string]any {
 		if desc := fieldDescription(f); desc != "" {
 			fieldSchema["description"] = desc
 		}
+		applySchemaTags(fieldSchema, f.Tag.Get("jsonschema"))
 		props[name] = fieldSchema
 		if !omitempty && f.Type.Kind() != reflect.Ptr {
 			required = append(required, name)
 		}
 	}
-	out := map[string]any{"type": "object", "properties": props}
+	out := map[string]any{"type": "object", "properties": props, "additionalProperties": false}
 	if len(required) > 0 {
 		out["required"] = required
 	}
 	return out
+}
+
+func applySchemaTags(schema map[string]any, tag string) {
+	for _, seg := range strings.Split(tag, ",") {
+		key, value, ok := strings.Cut(seg, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "minimum", "maximum", "minLength", "maxLength", "minItems", "maxItems":
+			if n, err := strconv.Atoi(value); err == nil {
+				schema[key] = n
+			}
+		}
+	}
 }
 
 // fieldDescription resolves a field's schema description from either a plain
@@ -106,6 +123,9 @@ func fieldDescription(f reflect.StructField) string {
 
 // jsonFieldName resolves a struct field's JSON name and omitempty flag.
 func jsonFieldName(f reflect.StructField) (name string, omitempty, skip bool) {
+	if f.Tag.Get("jsonschema") == "-" {
+		return "", false, true
+	}
 	tag := f.Tag.Get("json")
 	if tag == "-" {
 		return "", false, true

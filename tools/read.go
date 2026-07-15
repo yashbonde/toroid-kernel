@@ -21,17 +21,28 @@ const (
 )
 
 type ReadArgs struct {
-	FilePath string `json:"filePath" jsonschema:"description=The absolute path to the file or directory to read"`
-	Offset   int    `json:"offset,omitempty" jsonschema:"description=The line number to start reading from (1-indexed),default=1"`
-	Limit    int    `json:"limit,omitempty" jsonschema:"description=The maximum number of lines to read (defaults to 2000),default=2000"`
+	FilePath       string `json:"path" jsonschema:"description=Repository-relative path to read; absolute only for files outside the workspace,minLength=1"`
+	LegacyFilePath string `json:"filePath,omitempty" jsonschema:"-"`
+	Offset         int    `json:"offset,omitempty" jsonschema:"description=First line to return (1-indexed),minimum=1"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"description=Maximum lines to return (default and maximum 2000),minimum=1,maximum=2000"`
+}
+
+func (a ReadArgs) path() string {
+	if a.FilePath != "" {
+		return a.FilePath
+	}
+	return a.LegacyFilePath
 }
 
 func (a ReadArgs) Validate() error {
-	if a.FilePath == "" {
-		return fmt.Errorf("filePath is required")
+	if a.path() == "" {
+		return fmt.Errorf("path is required")
 	}
 	if a.Offset < 0 {
 		return fmt.Errorf("offset must be >= 0")
+	}
+	if a.Limit < 0 || a.Limit > DefaultReadLimit {
+		return fmt.Errorf("limit must be between 1 and %d when set", DefaultReadLimit)
 	}
 	return nil
 }
@@ -48,7 +59,7 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 			return errf("%v", err), nil
 		}
 
-		path := ResolvePath(args.FilePath, a.WorkDir())
+		path := ResolvePath(args.path(), a.WorkDir())
 
 		offset := args.Offset
 		if offset <= 0 {
@@ -164,7 +175,6 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 	return &ToolDef{
 		Name:        "read",
 		Description: desc,
-		Template:    "read.tool.tmpl",
 		Handler:     h,
 	}
 }

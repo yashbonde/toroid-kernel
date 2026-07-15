@@ -5,22 +5,54 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ## Unreleased
 
+## v0.5.0
+
+### Added
+
+- **Capability-loading end-to-end fixture.** `examples/e2e-test` runs offline
+  with a committed mock skill and an in-process streamable-HTTP MCP server. It
+  invokes skill, MCP, and host tools, covers structured output and event
+  round-tripping, and asserts that the compiled system/tool cache prefix stays
+  byte-stable across turns and later runs.
+- **Always-on OTEL transcript.** Every session now appends its observable events
+  (tool calls included) to `~/.toroid/sessions/<session-id>/transcript.jsonl` as
+  newline-delimited, OTEL-shaped records (spec-valid trace/span IDs + the
+  canonical `Event.OTEL()` projection). It is independent of `Save`/SQLite, so a
+  durable, greppable trace of every run exists by default. Display-only events
+  (reasoning deltas, idle/queue bookkeeping) are excluded, matching the OTEL
+  span-event filter. New helper `SessionDir(sessionID)`.
+
 ### Changed
 
+- **Hardened the bash tool against hangs.** Commands now run non-interactively
+  (`EDITOR`/`GIT_EDITOR`/`PAGER` neutralized, `GIT_TERMINAL_PROMPT=0`, empty
+  stdin) so `git commit` (no `-m`), `git rebase -i`, `crontab -e`, etc. can no
+  longer open an editor and block the kernel. Every command also gets a timeout
+  (default 120s, overridable via the new `timeout` arg on the bash tool) and is
+  launched in its own process group, killed as a group on timeout so orphaned
+  grandchildren (e.g. an editor holding `/dev/tty`) die too.
+
+- **`examples/toroid-cli` merged into `examples/cli` (was `examples/repl`).**
+  The one-shot NDJSON runner is now the `--run` flag of the interactive
+  runner: `go run ./examples/cli --run '<prompt>' [--plain]` replaces
+  `go run ./examples/toroid-cli`. Because `--run` shares the REPL's flag set,
+  `--model`, `--thinking`, and `--save` all apply. One binary now does both
+  jobs — interactive chat and the machine-facing event stream for non-Go hosts.
 - **grep, glob, and ls tools removed.** bash+rtk covers all three (`rtk grep`,
   `rtk find`, `rtk ls` — compressed output), and `read` already lists
-  directories. The default toolset is now read/write/edit/multiedit/bash/
-  notify/skill/subagent (+ subagent_async).
+    directories. The default toolset is now read/write/edit/multiedit/bash;
+    skills are discovered on demand and subagent tools are explicit opt-in.
 - **`MaxIter` default 25 → 100.** With prompt-cache breakpoints on every loop
   step, additional turns re-read the prefix at cache price, so a deep tool loop
   is affordable; the repeat-call guard still stops genuine spins early.
 
 - **Tool layer revamp** (informed by a study of crush, opencode, and pi):
-  - Tool docs are now short (2.8 KB total, was ~29 KB) and — for the first
-    time — actually sent to the model in full: previously only line 2 of each
-    `.tool.tmpl` reached the model and the rich docs were dead weight that had
-    drifted from reality (the bash doc promised a persistent shell and timeout
-    that never existed). Stale prompt files deleted.
+  - Startup capabilities are compiled once after skill and MCP discovery. The
+    capability reminder lives once in the stable system prefix, and deterministic
+    tool ordering keeps the reusable prompt-cache prefix unchanged across turns.
+  - Tool docs are compiled alongside the system prompt in `prompt_compiler.go`:
+    short contracts, no frontmatter parser, and no override files to drift from
+    actual tool behavior.
   - **todo tools removed** (`todo_write`/`todo_read` + SQLite table): the
     system prompt now tells the model to keep plans in a markdown file.
   - **Truncated tool output spills to `~/.toroid/sessions/<session>/tool-output/<ts>.txt`** and

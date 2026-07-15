@@ -31,6 +31,13 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 
 	var recentSigs []string // rolling window of tool-call signatures for the loop guard
 	turns := 0
+	inspectionTurns := 0
+	inspectionGuardSent := false
+	workspaceMutated := false
+	validationSinceMutation := false
+	validationTurns := 0
+	validationGuardSent := false
+	completionGuardSent := false
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -56,6 +63,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// Record the assistant turn: append to history, bill, update occupancy.
 		// Reasoning parts stay in history for observability; the wire layer drops
 		// them when replaying (OpenAI assistant messages carry text + tool calls).
+		normalizeToolCallPaths(res.Content, k.Cfg.WorkDir)
 		k.appendStepMessages(ctx, []llm.Message{{Role: llm.RoleAssistant, Parts: res.Content}})
 		k.recordUsage(ctx, res.Usage) // also refreshes the window-occupancy gauge
 		if budget.reached(k) {
@@ -74,6 +82,14 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// Write assistant text once the turn's tool intent is known: a final turn
 		// (no tools) is the user-visible answer.
 		if len(toolCalls) == 0 {
+			if workspaceMutated && !validationSinceMutation && !completionGuardSent {
+				k.History = append(k.History, llm.NewUserMessage(
+					"Completion guard: files changed without validation after the last edit. "+
+						"Run relevant validation, or verify that none applies, then finish.",
+				))
+				completionGuardSent = true
+				continue
+			}
 			if _, err := io.WriteString(w, llm.TextOf(res.Content)); err != nil {
 				return err
 			}
@@ -83,6 +99,39 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// Execute tools locally (not an llm-step) and append their results.
 		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
 		k.appendStepMessages(ctx, []llm.Message{toolMsg})
+
+		// GLM can remain in repository-archeology mode long after it has enough
+		// evidence to act. After a bounded inspection phase, inject one neutral
+		// control-plane reminder. This is not a hard cap: genuinely missing
+		// information can still be gathered, but the model must identify the new
+		// question instead of repeating broad searches.
+		mutated := toolCallsMutateFiles(toolCalls)
+		validated := toolCallsRunValidation(toolCalls)
+		if mutated {
+			workspaceMutated = true
+			validationSinceMutation = false
+			validationTurns = 0
+		} else if !workspaceMutated {
+			inspectionTurns++
+			if inspectionTurns >= 8 && !inspectionGuardSent {
+				k.History = append(k.History, llm.NewUserMessage(
+					"8 inspection turns, no edit. If evidence is sufficient, implement now; "+
+						"otherwise do one targeted check for the missing fact.",
+				))
+				inspectionGuardSent = true
+			}
+		}
+		if validated && workspaceMutated {
+			validationSinceMutation = true
+			validationTurns++
+			if validationTurns >= 2 && !validationGuardSent {
+				k.History = append(k.History, llm.NewUserMessage(
+					"Validation guard: validation ran twice without an intervening edit. "+
+						"Use those results; rerun only after a change or for a specific new reason.",
+				))
+				validationGuardSent = true
+			}
+		}
 
 		// Loop guard: stop if the last MaxRepeatCalls turns made the identical
 		// tool call(s) with identical result(s) — a spin making no progress.
@@ -117,6 +166,81 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		if k.overContextThreshold() {
 			if err := k.Compact(ctx); err != nil {
 				return err
+			}
+		}
+	}
+}
+
+func toolCallsMutateFiles(calls []llm.ToolCallPart) bool {
+	for _, call := range calls {
+		switch call.Name {
+		case "write", "edit", "multiedit":
+			return true
+		}
+	}
+	return false
+}
+
+func toolCallsRunValidation(calls []llm.ToolCallPart) bool {
+	for _, call := range calls {
+		if call.Name != "bash" {
+			continue
+		}
+		var args struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			continue
+		}
+		command := strings.ToLower(args.Command)
+		for _, marker := range []string{
+			"go test", "go build", "go vet", "pytest", "cargo test", "cargo check",
+			"npm test", "npm run test", "pnpm test", "yarn test", "make test",
+			"gradle test", "mvn test", "dotnet test",
+		} {
+			if strings.Contains(command, marker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// normalizeToolCallPaths removes a redundant leading `cd <workdir> &&` from
+// fresh bash calls. The bash tool already executes with cmd.Dir=WorkDir, so the
+// prefix has no effect; retaining a long temporary clone path in every tool
+// call only enlarges all subsequent prompts. Normalization happens before the
+// call is executed or persisted, keeping live and reconstructed history equal.
+func normalizeToolCallPaths(parts []llm.Part, workDir string) {
+	if workDir == "" {
+		return
+	}
+	prefixes := []string{
+		"cd " + workDir + " && ",
+		"cd \"" + workDir + "\" && ",
+		"cd '" + workDir + "' && ",
+	}
+	for i, part := range parts {
+		call, ok := part.(llm.ToolCallPart)
+		if !ok || call.Name != "bash" {
+			continue
+		}
+		var args struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal([]byte(call.Arguments), &args) != nil {
+			continue
+		}
+		command := args.Command
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(command, prefix) {
+				args.Command = strings.TrimPrefix(command, prefix)
+				b, err := json.Marshal(args)
+				if err == nil {
+					call.Arguments = string(b)
+					parts[i] = call
+				}
+				break
 			}
 		}
 	}

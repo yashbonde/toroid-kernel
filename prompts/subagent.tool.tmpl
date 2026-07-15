@@ -1,9 +1,0 @@
----
-Delegate a self-contained subtask to a fresh agent and get its final answer back.
----
-
-The subagent starts with no context: include everything it needs in the task
-(paths, goals, constraints, expected output). Use it for exploratory or
-parallelisable work so large intermediate output stays out of this conversation.
-subagent blocks until done; subagent_async returns immediately and you are
-notified with the result when it completes.

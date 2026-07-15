@@ -7,7 +7,7 @@ part of shipping.
 **Verify the change actually works.** `go build ./...`, `go vet ./...`, and
 `go test ./...` must pass. If the change touches the wire, the tool loop, cost
 accounting, or a provider, run a small live check through one of the runners
-(`examples/toroid-cli -plain '<prompt>'`) against a real model — unit tests use
+(`examples/cli --run '<prompt>' --plain`) against a real model — unit tests use
 the scripted FauxStep and cannot catch wire regressions. Keep live spend small
 (haiku-class models, short prompts).
 
@@ -29,5 +29,6 @@ deleted symbol is worse than no doc.
 **Scrub before pushing.** No API keys, tokens, or company-internal hostnames
 in code, docs, examples, or test fixtures — use `example.com` placeholders.
 Delete scratch files, built binaries, and anything created only for testing.
-The repository ships one end-to-end test (`e2e_test.go`); development probes
-belong in a scratch directory outside the repo, not in the tree.
+The repository ships one end-to-end test (`examples/e2e-test/e2e_test.go`) and
+its mock skill fixture; development probes belong in a scratch directory
+outside the repo, not in the tree.
