@@ -54,6 +54,16 @@ type ResponseFormat struct {
 	Schema      map[string]any
 }
 
+// RequestMetadata identifies the product hierarchy for one outbound LLM call.
+// TraceID is the caller-requested wire name for the individual call; it is
+// distinct from the kernel/OTEL TraceID, which identifies a transcript graph.
+type RequestMetadata struct {
+	TranscriptID string `json:"transcript_id"`
+	ChatID       string `json:"chat_id"`
+	TurnID       string `json:"turn_id"`
+	TraceID      string `json:"trace_id"`
+}
+
 // Request is one llm-step request. System is sent as a single leading system
 // message (never duplicated in Messages) for a stable cache prefix.
 type Request struct {
@@ -61,6 +71,7 @@ type Request struct {
 	System          string
 	Messages        []Message
 	Tools           []Tool
+	Metadata        RequestMetadata
 	ToolChoice      string // "", "auto", "none", "required", or a tool name to force
 	MaxTokens       *int
 	Temperature     *float64
@@ -388,6 +399,7 @@ func (c *Client) buildBody(req Request, stream bool) ([]byte, error) {
 	body := map[string]any{
 		"model":    model,
 		"messages": msgs,
+		"metadata": req.Metadata,
 	}
 	if len(req.Tools) > 0 {
 		tools := make([]map[string]any, 0, len(req.Tools))

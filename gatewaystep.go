@@ -32,6 +32,7 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 		System:      c.System,
 		Messages:    c.Messages,
 		Tools:       c.Tools,
+		Metadata:    c.Metadata,
 		CachePrompt: model.PromptCache && !opts.DisablePromptCache,
 	}
 	if opts.MaxOutputTokens != nil {

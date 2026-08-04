@@ -52,6 +52,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			System:   k.SystemPrompt,
 			Messages: k.History,
 			Tools:    wireTools,
+			Metadata: k.nextRequestMetadata(ctx),
 		}
 		k.fireLLMStep(ctx, model.ID, stepCtx, "")
 		res, err := k.Step.Complete(ctx, model, stepCtx, StepOptions{Thinking: k.Cfg.Thinking})

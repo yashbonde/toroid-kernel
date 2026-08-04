@@ -534,6 +534,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// trace id so the upstream groups them under a single trace (preserved if the
 	// context already carries one, e.g. a subagent running inside a parent chat).
 	ctx = WithGatewayTrace(ctx)
+	ctx = k.withRequestChat(ctx)
 
 	var ro runOptions
 	for _, o := range opts {
@@ -603,6 +604,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		res, err := k.Step.CompleteObject(ctx, ResolveModel(k.Cfg.Model), Context{
 			System:   k.SystemPrompt,
 			Messages: schemaMsgs,
+			Metadata: k.nextRequestMetadata(ctx),
 		}, ro.schema, ro.schemaName, ro.schemaDescription, StepOptions{Thinking: k.Cfg.Thinking})
 		if err != nil {
 			return err
@@ -756,6 +758,7 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	compactCtx := Context{
 		System:   k.SystemPrompt,
 		Messages: append(histForCompact, llm.NewUserMessage(string(prompt))),
+		Metadata: k.nextRequestMetadata(ctx),
 	}
 	k.fireLLMStep(ctx, compactModel.ID, compactCtx, "")
 	res, err := k.Step.Complete(ctx, compactModel, compactCtx, StepOptions{Thinking: k.Cfg.Thinking, DisablePromptCache: true})
@@ -942,6 +945,8 @@ func (k *Kernel) Wake(ctx context.Context) error {
 	if len(msgs) == 0 {
 		return nil
 	}
+	ctx = WithGatewayTrace(ctx)
+	ctx = k.withRequestChat(ctx)
 	// System prompt is Step-owned; only inject the queued user messages.
 	for _, m := range msgs {
 		k.History = append(k.History, llm.NewUserMessage(m))

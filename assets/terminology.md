@@ -137,6 +137,21 @@ terms in new docs; use this table when reading the codebase.
 | **turn** | One agent loop **step** (`OnStepFinish`, `StepUsage` entry); may include multiple parallel tool calls |
 | **llm-step** | One LLM HTTP/stream call (`litellm_request`); usage in `EventTurnCost` is usually **per step** and often 1:1 with one LLM call |
 
+### Request metadata IDs
+
+Every outbound LLM request includes this wire-level hierarchy so gateways can
+reconstruct their own conversation model:
+
+```json
+{"metadata":{"transcript_id":"…","chat_id":"…","turn_id":"…","trace_id":"…"}}
+```
+
+`transcript_id` is stable across the root conversation graph, `chat_id` across
+one `Run`/`Stream`/`Wake`, and `turn_id` across one loop iteration. The wire
+`trace_id` is fresh for each LLM request. That last field keeps the requested
+external schema; internally the same unit is called an **llm-step**, while
+kernel/OTEL `TraceID` retains its conversation-graph meaning.
+
 ### Reserved “trace” (not product hierarchy)
 
 These keep existing engineering names; they are **not** an llm-step:

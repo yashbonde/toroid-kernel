@@ -5,6 +5,13 @@ All notable changes to toroid-kernel are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- Every outbound LLM request now carries hierarchy IDs in its JSON `metadata`:
+  `transcript_id`, `chat_id`, `turn_id`, and a per-request `trace_id`. IDs roll
+  over at their corresponding kernel lifecycle boundaries, including
+  compaction, structured-output, wake, and subagent request paths.
+
 ## v0.5.0
 
 ### Added

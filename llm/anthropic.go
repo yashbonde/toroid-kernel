@@ -52,6 +52,7 @@ func (c *AnthropicClient) buildBody(req Request, stream bool) ([]byte, error) {
 	body := map[string]any{
 		"model":    model,
 		"messages": anthropicMessages(req),
+		"metadata": req.Metadata,
 	}
 	maxTokens := defaultMaxTokens
 	if req.MaxTokens != nil {

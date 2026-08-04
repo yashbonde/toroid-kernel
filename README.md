@@ -14,6 +14,7 @@
 
 - Self-contained LLM layer (in-repo `llm/` package) speaking OpenAI-compatible chat completions to a [LiteLLM](https://github.com/BerriAI/litellm) gateway — SSE streaming, tool calls, multimodal content blocks, retries on 429/5xx
 - Kernel-owned tool loop: one llm-step per turn via the `Step` interface
+- Hierarchy metadata on every LLM request: `metadata` carries `transcript_id`, `chat_id`, `turn_id`, and a per-request `trace_id` so gateways can reconstruct the conversation shape
 - **Gateway-truth cost**: every non-streaming llm-step carries the gateway's authoritative `x-litellm-response-cost`; there is no local pricing table to drift out of date. `Usage.PricingOK` is true only when the gateway reported a cost
 - Hard USD spend limits: `WithMaxTurnSpendUSD` caps one `Run`/`Stream` call and `Config.MaxTranscriptSpendUSD` caps cumulative transcript spend; reaching either stops further LLM steps, including structured-output and wake paths
 - Structured output (`WithSchema`) as a forced tool call — works across upstreams, including Bedrock-backed Anthropic

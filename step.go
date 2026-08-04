@@ -57,6 +57,7 @@ type Context struct {
 	System   string
 	Messages []llm.Message
 	Tools    []llm.Tool
+	Metadata llm.RequestMetadata
 }
 
 // AssistantMessage is the result of one non-streaming llm-step: the assistant
