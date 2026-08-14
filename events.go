@@ -17,6 +17,9 @@ const (
 	EventNotification       EventKind = "Notification"       // before the notification is sent
 	EventTaskCompleted      EventKind = "TaskCompleted"      // before the task is completed
 	EventReasoning          EventKind = "Reasoning"          // streamed reasoning/thinking tokens (display only, not stored)
+	EventTurnStarted        EventKind = "TurnStarted"        // before one agent loop turn begins
+	EventTurnCompleted      EventKind = "TurnCompleted"      // after the LLM response and any requested tools finish
+	EventTurnFailed         EventKind = "TurnFailed"         // when a turn cannot reach its normal boundary
 	EventAssistantTurn      EventKind = "AssistantTurn"      // full structured content blocks for the turn (thinking+text+tool_use)
 	EventTurnCost           EventKind = "TurnCost"           // after each LLM turn, with incremental cost
 	EventStop               EventKind = "Stop"               // when the agent is stopped
@@ -89,6 +92,21 @@ type UserPromptPayload struct {
 
 type ReasoningPayload struct {
 	Text string `json:"text"`
+}
+
+// TurnPayload is attached to EventTurnStarted, EventTurnCompleted, and
+// EventTurnFailed. The IDs mirror the outbound request hierarchy so hosts can
+// correlate a hook with its transcript, chat, turn, and individual LLM call.
+// A completed turn may still contain failed tool results; those are reported by
+// EventPostToolUseFailure and remain valid input for the next turn.
+type TurnPayload struct {
+	TranscriptID string `json:"transcript_id"`
+	ChatID       string `json:"chat_id"`
+	TurnID       string `json:"turn_id"`
+	LLMStepID    string `json:"llm_step_id"`
+	StopReason   string `json:"stop_reason,omitempty"`
+	ToolCalls    int    `json:"tool_calls,omitempty"`
+	Error        string `json:"error,omitempty"`
 }
 
 type ToolUsePayload struct {

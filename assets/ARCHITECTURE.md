@@ -266,7 +266,7 @@ The kernel is observable through a simple synchronous bus. `On(kind, fn)` regist
 
 | Category | Event kinds |
 |----------|-------------|
-| Lifecycle | `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `MasterIdle` |
+| Lifecycle | `SessionStart`, `UserPromptSubmit`, `TurnStarted`, `TurnCompleted`, `TurnFailed`, `Stop`, `SessionEnd`, `MasterIdle` |
 | Streaming | `Reasoning` (display-only thinking deltas; not persisted) |
 | Tools | `PreToolUse`, `PostToolUse`, `PostToolUseFailure`, `PermissionRequest` |
 | Subagents / background | `SubagentStart`, `SubagentStop`, `TaskCompleted` |

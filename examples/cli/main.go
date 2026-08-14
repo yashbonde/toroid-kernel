@@ -19,6 +19,12 @@
 //	flag --save            persist events/costs to the SQLite store (default off)
 //	flag --thinking        none | low | high      (default low)
 //	flag --no-colour       disable all ANSI styling (default off)
+//	flag --context-size    total context window size (0 = use kernel default)
+//	flag --compact-buffer  tokens reserved before auto-compact triggers (0 = use kernel default)
+//	flag --max-iter        max tool-call iterations per turn (0 = use env or kernel default)
+//	flag --max-repeat-calls stop after N consecutive identical tool calls (0 or 1 disables the guard)
+//	flag --smaller-model   cheaper model for compaction/subagents (empty = use primary)
+//	flag --max-spend       max cumulative spend in USD (0 = unlimited)
 //
 //	export TOROID_LLM_TOKEN=your_api_key
 //	go run ./examples/cli --model openai/gpt-4o --thinking high --save
@@ -55,6 +61,14 @@ type config struct {
 	save     bool
 	trim     int
 
+	// Context/compaction knobs from CLI flags; zero/empty means "use kernel default".
+	contextSize    int
+	compactBuffer  int
+	maxRepeatCalls int
+	smallerModel   string
+	maxSpend       float64
+	maxTokens      int
+
 	// One-shot mode (--run). When run is non-empty the binary drives the kernel
 	// once, emitting NDJSON events (or --plain for just the final answer),
 	// instead of starting the interactive REPL. --model/--thinking/--save all
@@ -76,6 +90,15 @@ func loadConfig() (config, string) {
 	run := flag.String("run", "", "one-shot: run this prompt, emit NDJSON events, and exit (non-interactive)")
 	plain := flag.Bool("plain", false, "with --run: print only the final assistant response as plain text, not the NDJSON event stream")
 	tokens := flag.Bool("tokens", false, "with --run: include per-step Reasoning deltas in the NDJSON stream")
+
+	// Context/compaction knobs
+	contextSize := flag.Int("context-size", 0, "total context window size (0 = kernel default 200000)")
+	compactBuffer := flag.Int("compact-buffer", 0, "tokens reserved below context-size before auto-compact fires (0 = kernel default 50000)")
+	maxIterFlag := flag.Int("max-iter", 0, "max tool-call iterations per turn (0 = use TOROID_MAX_ITER or kernel default 100)")
+	maxRepeatCalls := flag.Int("max-repeat-calls", 0, "stop after N consecutive identical tool calls (0 or 1 = guard disabled)")
+	smallerModel := flag.String("smaller-model", "", "cheaper model for compaction and subagents (empty = use primary model)")
+	maxSpend := flag.Float64("max-spend", 0, "maximum cumulative transcript spend in USD (0 = unlimited)")
+	maxTokens := flag.Int("max-tokens", 0, "max output tokens per llm-step (0 = provider default)")
 	flag.Parse()
 
 	if *noColour {
@@ -106,10 +129,22 @@ func loadConfig() (config, string) {
 		run:      strings.TrimSpace(*run),
 		plain:    *plain,
 		tokens:   *tokens,
+
+		contextSize:    *contextSize,
+		compactBuffer:  *compactBuffer,
+		maxRepeatCalls: *maxRepeatCalls,
+		smallerModel:   *smallerModel,
+		maxSpend:       *maxSpend,
+		maxTokens:      *maxTokens,
 	}
-	if v := os.Getenv("TOROID_MAX_ITER"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			c.maxIter = n
+	// --max-iter flag wins; TOROID_MAX_ITER env is the fallback; 0 means kernel default.
+	if *maxIterFlag > 0 {
+		c.maxIter = *maxIterFlag
+	} else {
+		if v := os.Getenv("TOROID_MAX_ITER"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				c.maxIter = n
+			}
 		}
 	}
 	if v := os.Getenv("TOROID_TRIM"); v != "" {
@@ -145,7 +180,10 @@ func main() {
 	// hosts in other languages. All targeting flags (--model, --thinking,
 	// --save, …) apply since --run shares the same flag set.
 	if cfg.run != "" {
-		runOneShot(cfg, apiKey)
+		if err := runOneShot(cfg, apiKey); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -203,6 +241,13 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 		MaxIter:              cfg.maxIter,
 		Save:                 cfg.save,
 		IncludeComputerTools: true,
+
+		TotalContextSize:      cfg.contextSize,
+		CompactionBufferSize:  cfg.compactBuffer,
+		MaxRepeatCalls:        cfg.maxRepeatCalls,
+		SmallerModel:          cfg.smallerModel,
+		MaxTranscriptSpendUSD: cfg.maxSpend,
+		MaxTokens:             cfg.maxTokens,
 	})
 	if err != nil {
 		return nil, err
@@ -300,12 +345,12 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	fmt.Printf("\n%s%s ◂%s\n", aMagenta+aBold, shortModel(cfg.model), aReset)
 	fmt.Print(renderMarkdown(out, width))
 
-	// Turn footer: running cost (gateway-reported) plus token usage and throughput.
+	// Turn footer: running cost in USD (gateway-reported) plus token usage and throughput.
 	// EventStop's UsagePayload carries the session's per-turn usage by session ID.
-	fmt.Printf("%s  ₹%.0f%s", aGray, k.RunningCostUSD()*100, aReset)
+	fmt.Printf("%s  $%.6f%s", aGray, k.RunningCostUSD(), aReset)
 
 	// Print token usage and cache statistics if available.
-	if u, ok := usage.Tokens[k.SessionID()]; ok && (u.Input > 0 || u.CacheRead > 0 || u.CacheWrite > 0) {
+	if u, ok := usage.Tokens[k.SessionID()]; ok && (u.Input > 0 || u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
 		var parts []string
 		if u.Input > 0 {
 			parts = append(parts, fmt.Sprintf("%d←", u.Input))
@@ -316,6 +361,8 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 		if u.CacheWrite > 0 {
 			parts = append(parts, fmt.Sprintf("%d📤", u.CacheWrite))
 		}
+		total := u.Input + u.CacheRead + u.CacheWrite + u.Output
+		parts = append(parts, fmt.Sprintf("%dΣ", total))
 		if len(parts) > 0 {
 			fmt.Printf("%s  ·  %s%s", aGray, strings.Join(parts, " "), aReset)
 		}
@@ -347,6 +394,7 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 	case "/model":
 		fmt.Printf("%smodel: %s | workdir: %s | thinking: %s%s\n",
 			aYellow, cfg.model, displayWorkdir(cfg.workdir), cfg.thinking, aReset)
+		printModelExtras(cfg)
 	case "/help", "/?":
 		printHelp()
 	default:
@@ -373,6 +421,8 @@ func printHelp() {
 
 config via env:   TOROID_MODEL, TOROID_LLM_TOKEN, TOROID_MAX_ITER, TOROID_TRIM
 config via flags: --model, --save, --thinking (none|low|high), --no-colour
+                  --context-size, --compact-buffer, --max-iter, --max-repeat-calls,
+                  --smaller-model, --max-spend
 ` + aReset)
 }
 
@@ -394,4 +444,30 @@ func shortModel(m string) string {
 		return rest
 	}
 	return m
+}
+
+// printModelExtras prints the context/compaction knobs when they differ from defaults.
+func printModelExtras(cfg config) {
+	var parts []string
+	if cfg.contextSize > 0 {
+		parts = append(parts, fmt.Sprintf("context=%d", cfg.contextSize))
+	}
+	if cfg.compactBuffer > 0 {
+		parts = append(parts, fmt.Sprintf("buffer=%d", cfg.compactBuffer))
+	}
+	if cfg.maxIter > 0 {
+		parts = append(parts, fmt.Sprintf("max_iter=%d", cfg.maxIter))
+	}
+	if cfg.maxRepeatCalls > 0 {
+		parts = append(parts, fmt.Sprintf("max_repeat=%d", cfg.maxRepeatCalls))
+	}
+	if cfg.smallerModel != "" {
+		parts = append(parts, fmt.Sprintf("smaller=%s", shortModel(cfg.smallerModel)))
+	}
+	if cfg.maxSpend > 0 {
+		parts = append(parts, fmt.Sprintf("max_spend=$%.6f", cfg.maxSpend))
+	}
+	if len(parts) > 0 {
+		fmt.Printf("  %s%s%s\n", aGray, strings.Join(parts, " | "), aReset)
+	}
 }

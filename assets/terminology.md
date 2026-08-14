@@ -137,6 +137,11 @@ terms in new docs; use this table when reading the codebase.
 | **turn** | One agent loop **step** (`OnStepFinish`, `StepUsage` entry); may include multiple parallel tool calls |
 | **llm-step** | One LLM HTTP/stream call (`litellm_request`); usage in `EventTurnCost` is usually **per step** and often 1:1 with one LLM call |
 
+Turn hooks bracket that boundary: `TurnStarted` fires before its LLM step;
+exactly one of `TurnCompleted` or `TurnFailed` terminates it. Tool execution
+inside the turn remains observable through `PreToolUse`, `PostToolUse`, and
+`PostToolUseFailure`.
+
 ### Request metadata IDs
 
 Every outbound LLM request includes this wire-level hierarchy so gateways can
