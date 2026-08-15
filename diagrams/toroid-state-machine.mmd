@@ -1,0 +1,31 @@
+flowchart TD
+    HOST([Host calls Run or Stream]) -->|SessionStart, once| TRANSCRIPT[Transcript open]
+    TRANSCRIPT -->|UserPromptSubmit| CHAT[Chat active]
+    CHAT -->|TurnStarted| TURN[Turn active]
+    TURN -->|LLMStep| LLM[One LLM request]
+
+    LLM -->|Request error or abort| TURN_FAILED[TurnFailed]
+    TURN_FAILED --> ERROR([Run or Stream returns error])
+
+    LLM -->|AssistantTurn and TurnCost| DECIDE{Tool calls?}
+    DECIDE -->|No| FINAL[Write final response]
+    FINAL -->|TurnCompleted| CHAT_DONE[Chat complete]
+
+    DECIDE -->|One or more| TOOLS[Execute tool calls]
+    TOOLS -->|PreToolUse| TOOL_RESULT{Tool result}
+    TOOL_RESULT -->|PostToolUse| TURN_DONE[TurnCompleted]
+    TOOL_RESULT -->|PostToolUseFailure| TURN_DONE
+    TURN_DONE -->|Next turn; queue or compaction may intervene| TURN
+
+    CHAT_DONE -->|Stop| IDLE[MasterIdle]
+    IDLE -->|Next human prompt| CHAT
+    IDLE -.->|Kernel Close; SessionEnd is reserved| CLOSED([Transcript closed])
+
+    classDef lifecycle fill:#e8f0fe,stroke:#315ea8,color:#172b4d;
+    classDef success fill:#e7f6ec,stroke:#2f7d4a,color:#173d26;
+    classDef failure fill:#fdebec,stroke:#b33a3a,color:#5c1d1d;
+    classDef decision fill:#fff4d6,stroke:#a66b00,color:#533600;
+    class TRANSCRIPT,CHAT,TURN,LLM,TOOLS,IDLE lifecycle;
+    class TURN_DONE,CHAT_DONE,FINAL success;
+    class TURN_FAILED,ERROR failure;
+    class DECIDE,TOOL_RESULT decision;

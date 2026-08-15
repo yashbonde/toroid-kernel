@@ -78,6 +78,7 @@ type Config struct {
 	// step re-reads the prefix at cache price, so a deep loop is affordable;
 	// the repeat-call guard still stops genuine spins early.
 	MaxIter        int       `json:"max_iter" description:"max tool-call iterations" default:"100"`
+	MaxTokens      int       `json:"max_tokens,omitempty" description:"max output tokens per llm-step; 0 = provider default"`
 	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
 	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
@@ -163,6 +164,15 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// Root kernel: TraceID == SessionID
 	if cfg.TraceID == "" {
 		cfg.TraceID = cfg.SessionID
+	}
+
+	// Ask the gateway what this model can actually take before falling back to
+	// the compiled-in defaults: an id the static catalog has never seen would
+	// otherwise inherit a 200k window and no output ceiling, and the provider
+	// would truncate mid-answer. Best-effort — an unreachable or silent gateway
+	// leaves the configured values exactly as they are.
+	if lim, ok := fetchModelLimits(ctx, baseURL, cfg.APIKey, cfg.Model); ok {
+		applyModelLimits(&cfg, lim)
 	}
 
 	// Apply context-window defaults. The struct-tag `default` values are NOT
@@ -319,6 +329,39 @@ func (k *Kernel) fireLLMStep(ctx context.Context, model string, c Context, schem
 	})
 }
 
+func turnPayload(metadata llm.RequestMetadata) TurnPayload {
+	return TurnPayload{
+		TranscriptID: metadata.TranscriptID,
+		ChatID:       metadata.ChatID,
+		TurnID:       metadata.TurnID,
+		LLMStepID:    metadata.TraceID,
+	}
+}
+
+func (k *Kernel) fireTurnStarted(ctx context.Context, metadata llm.RequestMetadata) {
+	payload := turnPayload(metadata)
+	_ = k.Fire(ctx, string(EventTurnStarted), &payload)
+}
+
+func (k *Kernel) fireTurnCompleted(ctx context.Context, metadata llm.RequestMetadata, stopReason string, toolCalls int) {
+	payload := turnPayload(metadata)
+	payload.StopReason = stopReason
+	payload.ToolCalls = toolCalls
+	_ = k.Fire(ctx, string(EventTurnCompleted), &payload)
+}
+
+func (k *Kernel) fireTurnFailed(ctx context.Context, metadata llm.RequestMetadata, err error) {
+	payload := turnPayload(metadata)
+	payload.StopReason = StopReasonError
+	if ctx.Err() != nil {
+		payload.StopReason = StopReasonAborted
+	}
+	if err != nil {
+		payload.Error = err.Error()
+	}
+	_ = k.Fire(ctx, string(EventTurnFailed), &payload)
+}
+
 // recordUsage adds a single LLM call's usage to session cost accounting.
 func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
 	if !u.PricingOK {
@@ -464,6 +507,9 @@ func (k *Kernel) OnAll(fn HookFn) {
 		EventNotification,
 		EventTaskCompleted,
 		EventReasoning,
+		EventTurnStarted,
+		EventTurnCompleted,
+		EventTurnFailed,
 		EventStop,
 		EventPreCompact,
 		EventPostCompact,
@@ -605,7 +651,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 			System:   k.SystemPrompt,
 			Messages: schemaMsgs,
 			Metadata: k.nextRequestMetadata(ctx),
-		}, ro.schema, ro.schemaName, ro.schemaDescription, StepOptions{Thinking: k.Cfg.Thinking})
+		}, ro.schema, ro.schemaName, ro.schemaDescription, k.stepOpts())
 		if err != nil {
 			return err
 		}
@@ -686,6 +732,17 @@ func (k *Kernel) Close() error {
 	return nil
 }
 
+// stepOpts returns StepOptions derived from kernel config. When cfg.MaxTokens
+// is > 0 it sets the per-step output-token cap; zero leaves it to the provider.
+func (k *Kernel) stepOpts() StepOptions {
+	opts := StepOptions{Thinking: k.Cfg.Thinking}
+	if k.Cfg.MaxTokens > 0 {
+		mt := int64(k.Cfg.MaxTokens)
+		opts.MaxOutputTokens = &mt
+	}
+	return opts
+}
+
 // trimForCompact shrinks history in place just before the compaction summarize
 // call: tool-call args are cleared, tool results truncated, and media/reasoning
 // parts stripped — the summary needs none of them, and un-stripped images would
@@ -761,7 +818,9 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		Metadata: k.nextRequestMetadata(ctx),
 	}
 	k.fireLLMStep(ctx, compactModel.ID, compactCtx, "")
-	res, err := k.Step.Complete(ctx, compactModel, compactCtx, StepOptions{Thinking: k.Cfg.Thinking, DisablePromptCache: true})
+	opts := k.stepOpts()
+	opts.DisablePromptCache = true
+	res, err := k.Step.Complete(ctx, compactModel, compactCtx, opts)
 	if err != nil {
 		return err
 	}

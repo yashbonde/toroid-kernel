@@ -46,7 +46,7 @@ import (
 
 // runOneShot implements `toroid --run '<prompt>'`. It reuses the shared config
 // (so --model/--thinking/--save/etc. apply) and the resolved API key.
-func runOneShot(cfg config, apiKey string) {
+func runOneShot(cfg config, apiKey string) error {
 	// The key is resolved per provider prefix by NewKernel: LLM_GATEWAY_KEY for
 	// llmgateway/* (with LLM_GATEWAY_BASE_URL), OPENAI_API_KEY for openai/*,
 	// ANTHROPIC_API_KEY for anthropic/*. apiKey (TOROID_LLM_TOKEN) overrides.
@@ -60,10 +60,16 @@ func runOneShot(cfg config, apiKey string) {
 		MaxIter:              cfg.maxIter,
 		Save:                 cfg.save,
 		IncludeComputerTools: true,
+
+		TotalContextSize:      cfg.contextSize,
+		CompactionBufferSize:  cfg.compactBuffer,
+		MaxRepeatCalls:        cfg.maxRepeatCalls,
+		SmallerModel:          cfg.smallerModel,
+		MaxTranscriptSpendUSD: cfg.maxSpend,
+		MaxTokens:             cfg.maxTokens,
 	})
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "kernel init:", err)
-		os.Exit(1)
+		return fmt.Errorf("kernel init: %w", err)
 	}
 	defer k.Close()
 
@@ -73,11 +79,10 @@ func runOneShot(cfg config, apiKey string) {
 		// Run already returns it directly, so there's nothing to subscribe to.
 		out, _, err := k.Run(ctx, cfg.run)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "run:", err)
-			os.Exit(1)
+			return fmt.Errorf("run: %w", err)
 		}
 		fmt.Println(out)
-		return
+		return nil
 	}
 
 	// stdout is a single shared stream; events can fire from subagent goroutines,
@@ -105,7 +110,7 @@ func runOneShot(cfg config, apiKey string) {
 	// Drive the loop. We discard the writer copy of the final text because the
 	// EventStop / EventAssistantTurn events already carry it on the stream.
 	if _, _, err := k.Run(ctx, cfg.run); err != nil {
-		fmt.Fprintln(os.Stderr, "run:", err)
-		os.Exit(1)
+		return fmt.Errorf("run: %w", err)
 	}
+	return nil
 }

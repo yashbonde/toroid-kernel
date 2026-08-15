@@ -48,15 +48,18 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			return nil
 		}
 
+		metadata := k.nextRequestMetadata(ctx)
 		stepCtx := Context{
 			System:   k.SystemPrompt,
 			Messages: k.History,
 			Tools:    wireTools,
-			Metadata: k.nextRequestMetadata(ctx),
+			Metadata: metadata,
 		}
+		k.fireTurnStarted(ctx, metadata)
 		k.fireLLMStep(ctx, model.ID, stepCtx, "")
-		res, err := k.Step.Complete(ctx, model, stepCtx, StepOptions{Thinking: k.Cfg.Thinking})
+		res, err := k.Step.Complete(ctx, model, stepCtx, k.stepOpts())
 		if err != nil {
+			k.fireTurnFailed(ctx, metadata, err)
 			return err
 		}
 		turns++
@@ -69,6 +72,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		k.recordUsage(ctx, res.Usage) // also refreshes the window-occupancy gauge
 		if budget.reached(k) {
 			k.Logf("spend limit reached; stopping agent loop")
+			k.fireTurnCompleted(ctx, metadata, res.StopReason, len(res.ToolCalls()))
 			return nil
 		}
 
@@ -84,6 +88,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// (no tools) is the user-visible answer.
 		if len(toolCalls) == 0 {
 			if workspaceMutated && !validationSinceMutation && !completionGuardSent {
+				k.fireTurnCompleted(ctx, metadata, res.StopReason, 0)
 				k.History = append(k.History, llm.NewUserMessage(
 					"Completion guard: files changed without validation after the last edit. "+
 						"Run relevant validation, or verify that none applies, then finish.",
@@ -92,14 +97,17 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 				continue
 			}
 			if _, err := io.WriteString(w, llm.TextOf(res.Content)); err != nil {
+				k.fireTurnFailed(ctx, metadata, err)
 				return err
 			}
+			k.fireTurnCompleted(ctx, metadata, res.StopReason, 0)
 			return nil // end of chat
 		}
 
 		// Execute tools locally (not an llm-step) and append their results.
 		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
 		k.appendStepMessages(ctx, []llm.Message{toolMsg})
+		k.fireTurnCompleted(ctx, metadata, res.StopReason, len(toolCalls))
 
 		// GLM can remain in repository-archeology mode long after it has enough
 		// evidence to act. After a bounded inspection phase, inject one neutral

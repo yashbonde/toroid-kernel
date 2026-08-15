@@ -2,6 +2,7 @@ package toroid
 
 import (
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -537,7 +538,13 @@ type OTELSpan struct {
 }
 
 // OTELSpans loads a trace and returns its spans as OpenTelemetry-shaped snapshots
-// with spec-valid trace/span IDs and start/end timestamps.
+// with spec-valid trace/span IDs and start/end timestamps. Each kernel span is
+// projected as a structured span tree rather than one flat span carrying every
+// event: the kernel.run root keeps the aggregate usage attributes, one child
+// span is emitted per turn/llm-step (bounded by TurnStarted/TurnCompleted,
+// token attributes from its TurnCost event), and one child span is emitted per
+// tool call parented under the turn that issued it (bounded by
+// PreToolUse/PostToolUse). Every event stays attached to the span it belongs to.
 func OTELSpans(traceID string) ([]OTELSpan, error) {
 	td, err := LoadTraceData(traceID)
 	if err != nil {
@@ -561,17 +568,9 @@ func OTELSpans(traceID string) ([]OTELSpan, error) {
 			cost = sp.Costs[n-1].TotalUSD // total_usd is cumulative; last row is the span total
 		}
 
-		// Span events: the single canonical Event->OTEL mapping, filtered to
-		// observability-relevant kinds (drops display/control-plane chatter).
-		events := make([]OTELEvent, 0, len(sp.Events))
-		for _, ev := range sp.Events {
-			if !ev.Kind.Observable() {
-				continue
-			}
-			events = append(events, ev.OTEL())
-		}
-
-		out = append(out, OTELSpan{
+		// Root span: keeps the aggregate usage attributes and every event not
+		// consumed by a turn or tool child span.
+		root := OTELSpan{
 			TraceID:      tid,
 			SpanID:       sid,
 			ParentSpanID: pid,
@@ -581,10 +580,139 @@ func OTELSpans(traceID string) ([]OTELSpan, error) {
 			Model:        sp.Model,
 			CostUSD:      cost,
 			Attributes:   spanAttributes(sp, cost),
-			Events:       events,
-		})
+		}
+		var children []OTELSpan
+		root.Events, children = spanTreeEvents(tid, sid, sp)
+		out = append(out, root)
+		out = append(out, children...)
 	}
 	return out, nil
+}
+
+// otelChildSpanID derives a deterministic, non-zero child span ID for the nth
+// synthetic child of a parent span, so re-exporting a trace is idempotent.
+func otelChildSpanID(parent oteltrace.SpanID, n int) oteltrace.SpanID {
+	raw, _ := hex.DecodeString(childSpanID(hex.EncodeToString(parent[:]), n))
+	var s oteltrace.SpanID
+	copy(s[:], raw)
+	return s
+}
+
+// spanTreeEvents splits a kernel span's observable events into the span-event
+// list that stays on the kernel.run root and the ordered child spans (one per
+// turn/llm-step, plus one per tool call that said turn issued). Child IDs are
+// deterministic so re-exporting a trace reproduces the same tree.
+func spanTreeEvents(traceID oteltrace.TraceID, rootID oteltrace.SpanID, sp SpanData) (rootEvents []OTELEvent, children []OTELSpan) {
+	toolIdx := map[string]int{} // tool callID -> index into children
+	currentTurn := -1           // index into children of the open turn span; -1 when none
+	n := 0
+
+	for _, ev := range sp.Events {
+		if !ev.Kind.Observable() {
+			continue
+		}
+		oe := ev.OTEL()
+		switch ev.Kind {
+		case EventTurnStarted:
+			n++
+			currentTurn = len(children)
+			children = append(children, OTELSpan{
+				TraceID:      traceID,
+				SpanID:       otelChildSpanID(rootID, n),
+				ParentSpanID: rootID,
+				Name:         "llm.step",
+				StartUnix:    ev.EmitTS,
+				Model:        sp.Model,
+				Events:       []OTELEvent{oe},
+			})
+
+		case EventTurnCompleted, EventTurnFailed:
+			if currentTurn < 0 {
+				rootEvents = append(rootEvents, oe)
+				continue
+			}
+			t := &children[currentTurn]
+			t.EndUnix = ev.EmitTS
+			t.Events = append(t.Events, oe)
+			currentTurn = -1 // turn closed
+
+		case EventTurnCost:
+			if currentTurn < 0 {
+				rootEvents = append(rootEvents, oe)
+				continue
+			}
+			t := &children[currentTurn]
+			if p, ok := payloadOf[TurnCostPayload](ev); ok {
+				t.CostUSD = p.TurnCostUSD
+				t.Attributes = append(t.Attributes, usageAttributes(p.TurnUsage, p.TurnCostUSD)...)
+			}
+			t.Events = append(t.Events, oe)
+
+		case EventPreToolUse:
+			parent := rootID
+			if currentTurn >= 0 {
+				parent = children[currentTurn].SpanID
+			}
+			name := "tool"
+			if p, ok := payloadOf[ToolUsePayload](ev); ok {
+				if p.Name != "" {
+					name = "tool." + p.Name
+				}
+				if p.CallID != "" {
+					n++
+					idx := len(children)
+					children = append(children, OTELSpan{
+						TraceID:      traceID,
+						SpanID:       otelChildSpanID(rootID, n),
+						ParentSpanID: parent,
+						Name:         name,
+						StartUnix:    ev.EmitTS,
+						Events:       []OTELEvent{oe},
+					})
+					toolIdx[p.CallID] = idx
+					continue
+				}
+			}
+			// No linkable callID: keep it on the enclosing turn's span.
+			if currentTurn >= 0 {
+				children[currentTurn].Events = append(children[currentTurn].Events, oe)
+			} else {
+				rootEvents = append(rootEvents, oe)
+			}
+
+		case EventPostToolUse, EventPostToolUseFailure:
+			p, ok := payloadOf[ToolUseResultPayload](ev)
+			idx, found := toolIdx[p.CallID]
+			if !ok || p.CallID == "" || !found {
+				if currentTurn >= 0 {
+					children[currentTurn].Events = append(children[currentTurn].Events, oe)
+				} else {
+					rootEvents = append(rootEvents, oe)
+				}
+				continue
+			}
+			t := &children[idx]
+			t.EndUnix = ev.EmitTS
+			t.Events = append(t.Events, oe)
+			delete(toolIdx, p.CallID)
+
+		case EventLLMStep, EventAssistantTurn:
+			// The request the step sent and the content it produced belong to
+			// that step, not to the whole run — without this the waterfall shows
+			// turn spans with nothing but lifecycle markers on them.
+			if currentTurn < 0 {
+				rootEvents = append(rootEvents, oe)
+				continue
+			}
+			children[currentTurn].Events = append(children[currentTurn].Events, oe)
+
+		default:
+			// Everything else (session, user prompt, compaction, task, …) stays
+			// attached to the root kernel.run span.
+			rootEvents = append(rootEvents, oe)
+		}
+	}
+	return rootEvents, children
 }
 
 // spanAttributes builds the OTEL GenAI semantic-convention attributes for a span:
@@ -595,8 +723,14 @@ func spanAttributes(sp SpanData, cost float64) []OTELKeyValue {
 	if sp.Model != "" {
 		attrs = append(attrs, OTELKeyValue{Key: "gen_ai.request.model", Value: sp.Model})
 	}
+	return append(attrs, usageAttributes(aggregateUsage(sp), cost)...)
+}
 
-	u := aggregateUsage(sp)
+// usageAttributes renders a single turn's token usage and cost with the standard
+// GenAI semantic-convention names (shared by the root aggregate and llm.step
+// child spans, which take their token attributes from the TurnCost event).
+func usageAttributes(u Usage, cost float64) []OTELKeyValue {
+	attrs := make([]OTELKeyValue, 0, 7)
 	addTokens := func(key string, n int64) {
 		if n > 0 {
 			attrs = append(attrs, OTELKeyValue{Key: key, Value: n})
@@ -608,7 +742,6 @@ func spanAttributes(sp SpanData, cost float64) []OTELKeyValue {
 	addTokens("gen_ai.usage.cache_read_tokens", u.CacheRead)
 	addTokens("gen_ai.usage.cache_write_tokens", u.CacheWrite)
 	addTokens("gen_ai.usage.total_tokens", u.Input+u.Output)
-
 	attrs = append(attrs, OTELKeyValue{Key: "gen_ai.usage.cost_usd", Value: cost})
 	return attrs
 }
