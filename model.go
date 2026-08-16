@@ -136,6 +136,11 @@ var modelMetaFamilies = []struct {
 	{"deepseek", modelMeta{contextWindow: 128_000, reasoning: true}},
 	{"qwen", modelMeta{contextWindow: 128_000}},
 	{"minimax", modelMeta{contextWindow: 200_000, reasoning: true}},
+	// NVIDIA Nemotron (free tier via gateway) — 128K context, text-only.
+	// The :free suffix indicates zero cost; pricing is zero so PricingOK = true
+	// even when the gateway omits the cost header.
+	{"nemotron", modelMeta{contextWindow: 128_000,
+		price: &ModelPrice{In: 0, Out: 0, CacheRead: 0, CacheWrite: 0}}},
 }
 
 // lookupModelMeta resolves metadata for a normalized name: an exact override

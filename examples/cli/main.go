@@ -34,6 +34,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -42,10 +43,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	tsize "github.com/kopoli/go-terminal-size"
 	toroid "github.com/yashbonde/toroid-kernel"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -76,12 +77,22 @@ type config struct {
 	run    string
 	plain  bool
 	tokens bool
+
+	// lastTurn is the most recent single-turn token usage, captured from
+	// EventTurnCost so the per-turn footer reflects this turn (not the
+	// session-accumulated totals carried in EventStop's UsagePayload).
+	lastTurn toroid.Usage
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
 // (--model, --save, --thinking, --no-colour, --run, --plain, --tokens). It
 // returns the config plus the resolved API key. Flags win for the per-run
 // toggles; env wins for the targeting knobs.
+//
+// A bare first positional argument is taken as the model id
+// (`cli deepseek/deepseek-v4-flash-0731 --run '...'`): Go's flag package
+// stops parsing at the first non-flag argument, so it is rewritten into
+// --model before Parse.
 func loadConfig() (config, string) {
 	model := flag.String("model", "", "override TOROID_MODEL (provider/model)")
 	save := flag.Bool("save", false, "persist events, costs and metadata to the SQLite store")
@@ -99,7 +110,16 @@ func loadConfig() (config, string) {
 	smallerModel := flag.String("smaller-model", "", "cheaper model for compaction and subagents (empty = use primary model)")
 	maxSpend := flag.Float64("max-spend", 0, "maximum cumulative transcript spend in USD (0 = unlimited)")
 	maxTokens := flag.Int("max-tokens", 0, "max output tokens per llm-step (0 = provider default)")
-	flag.Parse()
+	// Support a bare leading positional model: `cli <provider/model> …`. The
+	// standard flag parser stops at the first non-flag argument, which would
+	// leave the flags that follow unparsed; peel the positional off first.
+	args := os.Args[1:]
+	var positionalModel string
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		positionalModel = args[0]
+		args = args[1:]
+	}
+	flag.CommandLine.Parse(args)
 
 	if *noColour {
 		disableColor()
@@ -114,8 +134,12 @@ func loadConfig() (config, string) {
 		absWd = wd
 	}
 
-	// Flag --model overrides env TOROID_MODEL
+	// Flag --model overrides env TOROID_MODEL; a bare positional model id
+	// (peeled off above) overrides the env default but loses to the flag.
 	modelStr := envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5")
+	if positionalModel != "" {
+		modelStr = positionalModel
+	}
 	if *model != "" {
 		modelStr = *model
 	}
@@ -187,52 +211,15 @@ func main() {
 		return
 	}
 
-	ctx := context.Background()
-	k, err := newKernel(ctx, cfg, apiKey)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "kernel init:", err)
+	if err := runTUI(cfg, apiKey); err != nil {
+		fmt.Fprintln(os.Stderr, "cli:", err)
 		os.Exit(1)
 	}
-
-	banner(cfg)
-	in := bufio.NewScanner(os.Stdin)
-	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	for {
-		fmt.Print(aGreen + aBold + "\nyou ▸ " + aReset)
-		if !in.Scan() {
-			fmt.Println()
-			break // EOF (Ctrl-D)
-		}
-		line := strings.TrimSpace(in.Text())
-		if line == "" {
-			continue
-		}
-
-		// Meta commands start with '/'.
-		if strings.HasPrefix(line, "/") {
-			quit, reset := handleCommand(line, k, cfg)
-			if quit {
-				break
-			}
-			if reset {
-				_ = k.Close()
-				if k, err = newKernel(ctx, cfg, apiKey); err != nil {
-					fmt.Fprintln(os.Stderr, "reset failed:", err)
-					return
-				}
-			}
-			continue
-		}
-
-		ask(ctx, k, cfg, line)
-	}
-	_ = k.Close()
 }
 
 // newKernel wires a kernel plus all the pretty-printing event hooks. Recreated on
 // /reset to start a fresh session.
-func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, error) {
+func newKernel(ctx context.Context, cfg *config, apiKey string, emit func(string)) (*toroid.Kernel, error) {
 	k, err := toroid.NewKernel(ctx, toroid.Config{
 		Model:                cfg.model,
 		APIKey:               apiKey,
@@ -241,6 +228,7 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 		MaxIter:              cfg.maxIter,
 		Save:                 cfg.save,
 		IncludeComputerTools: true,
+		IncludeSubagentTools: true,
 
 		TotalContextSize:      cfg.contextSize,
 		CompactionBufferSize:  cfg.compactBuffer,
@@ -252,36 +240,41 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 	if err != nil {
 		return nil, err
 	}
+	if emit == nil {
+		emit = func(s string) { fmt.Print(s) }
+	}
 
-	// Tool call begins: compact one-liner, args trimmed to the configured width.
+	// Tool calls show the operation and meaningful target. Width-dependent
+	// wrapping belongs to the TUI renderer, not this formatter.
 	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
 			if reasoningActive && reasoningNeedsNewline {
-				fmt.Println()
+				emit("\n")
 				reasoningNeedsNewline = false
 			}
-			fmt.Printf("  %s⚙ %s%s%s %s\n", aBlue, aBold, p.Name, aReset, dimArgs(p.Args, cfg.trim))
+			emit(renderToolCall(p.Name, p.Args, cfg.workdir, termWidth()))
 		}
 		return nil
 	})
-	// Tool call result: a short preview, or the error in red.
+	// The matching bottom edge of the call box: shape/status instead of leaking
+	// an arbitrary first output line followed by a synthetic truncation marker.
 	k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
 			if reasoningActive && reasoningNeedsNewline {
-				fmt.Println()
+				emit("\n")
 				reasoningNeedsNewline = false
 			}
-			fmt.Printf("  %s→ %s%s\n", aDim, trimOneLine(p.Result, cfg.trim), aReset)
+			emit(toolResultLine(p.Result))
 		}
 		return nil
 	})
 	k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
 			if reasoningActive && reasoningNeedsNewline {
-				fmt.Println()
+				emit("\n")
 				reasoningNeedsNewline = false
 			}
-			fmt.Printf("  %s→ error: %s%s\n", aRed, trimOneLine(p.Error, cfg.trim), aReset)
+			emit(toolErrorLine(p.Error))
 		}
 		return nil
 	})
@@ -289,10 +282,19 @@ func newKernel(ctx context.Context, cfg config, apiKey string) (*toroid.Kernel, 
 		if p, ok := e.Payload.(*toroid.ReasoningPayload); ok {
 			if !reasoningActive {
 				reasoningActive = true
-				fmt.Println(aGray + strings.Repeat("—", termWidth()) + aReset)
+				emit(aGray + strings.Repeat("—", termWidth()) + aReset + "\n")
 			}
-			fmt.Print(aGray + aItalic + p.Text + aReset)
+			emit(aGray + aItalic + p.Text + aReset)
 			reasoningNeedsNewline = !strings.HasSuffix(p.Text, "\n")
+		}
+		return nil
+	})
+	// Capture per-turn usage for the turn footer. EventTurnCost fires once per
+	// LLM step; EventStop's UsagePayload is session-accumulated, so keep this
+	// turn's own numbers here instead.
+	k.On(toroid.EventTurnCost, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnCostPayload); ok {
+			cfg.lastTurn = p.TurnUsage
 		}
 		return nil
 	})
@@ -305,28 +307,9 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	width := termWidth()
 
 	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Put terminal in cbreak mode so ESC is readable immediately.
-	fd := int(os.Stdin.Fd())
-	oldState, err := enableCBreak(fd)
-	if err == nil {
-		done := make(chan struct{})
-		go watchEsc(ctx, fd, cancel, done)
-		// cancel() must happen, and watchEsc must have observed it and
-		// stopped touching fd, before we hand stdin back to the REPL's
-		// line-buffered scanner — otherwise both read the same fd at once.
-		defer func() {
-			cancel()
-			<-done
-			restoreCBreak(fd, oldState)
-		}()
-	} else {
-		defer cancel()
-	}
-
-	start := time.Now()
-	out, usage, err := k.Run(ctx, prompt)
-	elapsed := time.Since(start)
+	out, _, err := k.Run(ctx, prompt)
 	if reasoningActive {
 		if reasoningNeedsNewline {
 			fmt.Println()
@@ -344,34 +327,208 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 	}
 	fmt.Printf("\n%s%s ◂%s\n", aMagenta+aBold, shortModel(cfg.model), aReset)
 	fmt.Print(renderMarkdown(out, width))
-
-	// Turn footer: running cost in USD (gateway-reported) plus token usage and throughput.
-	// EventStop's UsagePayload carries the session's per-turn usage by session ID.
-	fmt.Printf("%s  $%.6f%s", aGray, k.RunningCostUSD(), aReset)
-
-	// Print token usage and cache statistics if available.
-	if u, ok := usage.Tokens[k.SessionID()]; ok && (u.Input > 0 || u.CacheRead > 0 || u.CacheWrite > 0 || u.Output > 0) {
-		var parts []string
-		if u.Input > 0 {
-			parts = append(parts, fmt.Sprintf("%d←", u.Input))
-		}
-		if u.CacheRead > 0 {
-			parts = append(parts, fmt.Sprintf("%d📥", u.CacheRead))
-		}
-		if u.CacheWrite > 0 {
-			parts = append(parts, fmt.Sprintf("%d📤", u.CacheWrite))
-		}
-		total := u.Input + u.CacheRead + u.CacheWrite + u.Output
-		parts = append(parts, fmt.Sprintf("%dΣ", total))
-		if len(parts) > 0 {
-			fmt.Printf("%s  ·  %s%s", aGray, strings.Join(parts, " "), aReset)
-		}
-	}
-
-	if outTokens := usage.Tokens[k.SessionID()].Output; outTokens > 0 && elapsed.Seconds() > 0 {
-		fmt.Printf("%s  ·  %d→ in %.1fs (%.1f tok/s)%s", aGray, outTokens, elapsed.Seconds(), float64(outTokens)/elapsed.Seconds(), aReset)
-	}
 	fmt.Println()
+}
+
+// renderToolCall draws a tool invocation as a compact box header:
+//
+//	┌─ bash  git ls-files | wc -l
+//	└─ done · 2 lines · 4 bytes
+//
+// The header shows the operation and its meaningful target; its matching
+// bottom edge (toolResultLine / toolErrorLine) reports shape/status. The
+// whole thing is width-bounded so a chatty tool never eats the screen.
+func renderToolCall(name, args, workDir string, width int) string {
+	summary := toolCallArgSummary(name, args, workDir)
+	// Leave room for the box decorations and the separating space.
+	if max := width - len([]rune(name)) - 6; max > 10 {
+		if runes := []rune(summary); len(runes) > max {
+			summary = string(runes[:max-1]) + "…"
+		}
+	}
+	if summary == "" {
+		return fmt.Sprintf("%s┌─%s %s%s%s\n", aGray, aReset, aBold+aCyan, name, aReset)
+	}
+	return fmt.Sprintf("%s┌─%s %s%s%s  %s\n", aGray, aReset, aBold+aCyan, name, aReset, summary)
+}
+
+func toolCallArgSummary(name, args, workDir string) string {
+	var summary string
+
+	switch name {
+	case "read":
+		// Extract path, offset, limit
+		path := extractJSONField(args, "path")
+		if path == "" {
+			path = extractJSONField(args, "filePath")
+		}
+		offset := extractJSONInt(args, "offset")
+		limit := extractJSONInt(args, "limit")
+		if offset > 0 || limit > 0 {
+			relPath := makeRelative(path, workDir)
+			if limit > 0 {
+				summary = fmt.Sprintf("%s [%d:%d]", relPath, offset, offset+limit)
+			} else {
+				summary = fmt.Sprintf("%s [%d:]", relPath, offset)
+			}
+		} else {
+			summary = makeRelative(path, workDir)
+		}
+	case "write":
+		path := extractJSONField(args, "path")
+		summary = makeRelative(path, workDir)
+	case "edit":
+		path := extractJSONField(args, "path")
+		if path == "" {
+			path = extractJSONField(args, "filePath")
+		}
+		summary = makeRelative(path, workDir)
+	case "multiedit":
+		path := extractJSONField(args, "path")
+		if path == "" {
+			path = extractJSONField(args, "filePath")
+		}
+		summary = makeRelative(path, workDir)
+	case "bash":
+		command := extractJSONField(args, "command")
+		summary = compactToolText(command, 500)
+	case "glob":
+		pattern := extractJSONField(args, "pattern")
+		summary = compactToolText(pattern, 500)
+	case "grep":
+		pattern := extractJSONField(args, "pattern")
+		path := extractJSONField(args, "path")
+		if path != "" {
+			summary = fmt.Sprintf("%s in %s", compactToolText(pattern, 250), makeRelative(path, workDir))
+		} else {
+			summary = compactToolText(pattern, 500)
+		}
+	case "task":
+		description := extractJSONField(args, "description")
+		summary = compactToolText(description, 500)
+	case "subagent", "subagent_async":
+		description := extractJSONField(args, "task")
+		if description == "" {
+			description = extractJSONField(args, "description")
+		}
+		summary = compactToolText(description, 500)
+	case "skill":
+		path := extractJSONField(args, "path")
+		summary = makeRelative(path, workDir)
+	case "mcp":
+		method := extractJSONField(args, "method")
+		summary = compactToolText(method, 500)
+	default:
+		summary = compactToolText(args, 500)
+	}
+
+	return strings.TrimSpace(summary)
+}
+
+// toolResultLine renders the bottom edge of a call box: a shape/status summary
+// ("done · 3 lines · 73 bytes") rather than an arbitrary result preview.
+func toolResultLine(result string) string {
+	return fmt.Sprintf("%s└─ %s%s%s\n", aGray, aDim, toolResultSummary(result), aReset)
+}
+
+// toolErrorLine renders the bottom edge of a call box for a failed tool,
+// highlighting the compacted error text.
+func toolErrorLine(errText string) string {
+	return fmt.Sprintf("%s└─ %s⨯ %s%s\n", aGray, aRed, compactToolText(errText, 400), aReset)
+}
+
+func compactToolText(s string, max int) string {
+	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	runes := []rune(s)
+	if max > 0 && len(runes) > max {
+		return string(runes[:max]) + "…"
+	}
+	return s
+}
+
+func toolResultSummary(result string) string {
+	result = strings.TrimSpace(result)
+	if result == "" {
+		return "done"
+	}
+	lines := strings.Count(result, "\n") + 1
+	bytes := len(result)
+	if lines == 1 {
+		return fmt.Sprintf("done · %d bytes", bytes)
+	}
+	return fmt.Sprintf("done · %d lines · %d bytes", lines, bytes)
+}
+
+// extractJSONField extracts a string field from a simple JSON object.
+func extractJSONField(jsonStr, field string) string {
+	// Look for "field":"value" pattern
+	search := fmt.Sprintf(`"%s":`, field)
+	idx := strings.Index(jsonStr, search)
+	if idx < 0 {
+		return ""
+	}
+	idx += len(search)
+	// Skip whitespace
+	for idx < len(jsonStr) && (jsonStr[idx] == ' ' || jsonStr[idx] == '\t') {
+		idx++
+	}
+	if idx >= len(jsonStr) || jsonStr[idx] != '"' {
+		return ""
+	}
+	idx++ // skip opening quote
+	start := idx
+	for idx < len(jsonStr) && jsonStr[idx] != '"' {
+		// Handle escaped quotes
+		if jsonStr[idx] == '\\' && idx+1 < len(jsonStr) {
+			idx += 2
+		} else {
+			idx++
+		}
+	}
+	if idx > start {
+		return jsonStr[start:idx]
+	}
+	return ""
+}
+
+// extractJSONInt extracts an integer field from a simple JSON object.
+func extractJSONInt(jsonStr, field string) int {
+	search := fmt.Sprintf(`"%s":`, field)
+	idx := strings.Index(jsonStr, search)
+	if idx < 0 {
+		return 0
+	}
+	idx += len(search)
+	// Skip whitespace
+	for idx < len(jsonStr) && (jsonStr[idx] == ' ' || jsonStr[idx] == '\t') {
+		idx++
+	}
+	if idx >= len(jsonStr) {
+		return 0
+	}
+	start := idx
+	for idx < len(jsonStr) && (jsonStr[idx] >= '0' && jsonStr[idx] <= '9') {
+		idx++
+	}
+	if idx > start {
+		val, _ := strconv.Atoi(jsonStr[start:idx])
+		return val
+	}
+	return 0
+}
+
+// makeRelative converts an absolute path to a relative path from workDir.
+func makeRelative(path, workDir string) string {
+	if path == "" {
+		return ""
+	}
+	// First, try to make it relative to workDir
+	rel, err := filepath.Rel(workDir, path)
+	if err == nil && !strings.HasPrefix(rel, "..") {
+		return rel
+	}
+	// If it's outside workDir, return just the filename
+	return filepath.Base(path)
 }
 
 // dimArgs renders tool args as compact dim text, trimmed. Tool args are JSON;
@@ -407,7 +564,7 @@ func banner(cfg config) {
 	fmt.Printf("%s┌─────────────────────────────────────────────%s\n", aCyan, aReset)
 	fmt.Printf("%s│ toroid repl%s  %s%s%s\n", aCyan+aBold, aReset, aGray, shortModel(cfg.model), aReset)
 	fmt.Printf("%s│%s thinking=%s save=%v workdir=%s\n", aCyan, aReset, cfg.thinking, cfg.save, displayWorkdir(cfg.workdir))
-	fmt.Printf("%s└ %stype a message, or /help · /exit%s\n", aCyan, aGray, aReset)
+	fmt.Printf("%s└ %sEnter=send  Shift+Enter=newline  multiline paste supported  /help%s\n", aCyan, aGray, aReset)
 }
 
 func printHelp() {
@@ -418,6 +575,13 @@ func printHelp() {
   /reset       start a fresh session (clears history)
   /clear       clear the screen
   /exit        quit (or Ctrl-D)
+
+input:
+  Enter            send
+  Shift+Enter      new line
+  Multiline paste  preserved as one message
+  Ctrl-C           interrupt current input
+  Ctrl-D           exit (empty input)
 
 config via env:   TOROID_MODEL, TOROID_LLM_TOKEN, TOROID_MAX_ITER, TOROID_TRIM
 config via flags: --model, --save, --thinking (none|low|high), --no-colour
@@ -469,5 +633,224 @@ func printModelExtras(cfg config) {
 	}
 	if len(parts) > 0 {
 		fmt.Printf("  %s%s%s\n", aGray, strings.Join(parts, " | "), aReset)
+	}
+}
+
+// runLineMode is the fallback when cbreak mode isn't available.
+func runLineMode(ctx context.Context, k *toroid.Kernel, cfg config) {
+	in := bufio.NewScanner(os.Stdin)
+	in.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	for {
+		fmt.Print(aGreen + aBold + "\nyou ▸ " + aReset)
+		if !in.Scan() {
+			fmt.Println()
+			break // EOF (Ctrl-D)
+		}
+		line := strings.TrimSpace(in.Text())
+		if line == "" {
+			continue
+		}
+
+		if strings.HasPrefix(line, "/") {
+			quit, reset := handleCommand(line, k, cfg)
+			if quit {
+				break
+			}
+			if reset {
+				return // caller will recreate kernel
+			}
+			continue
+		}
+
+		ask(ctx, k, cfg, line)
+	}
+}
+
+var bracketedPasteEnd = []byte("\x1b[201~")
+
+// readEscapeSequence reads one complete CSI/Alt sequence after ESC was read.
+func readEscapeSequence(fd int) []byte {
+	seq := []byte{27}
+	for {
+		rfds := &unix.FdSet{}
+		rfds.Set(fd)
+		tv := &unix.Timeval{Sec: 0, Usec: 30000}
+		n, _ := unix.Select(fd+1, rfds, nil, nil, tv)
+		if n == 0 {
+			return seq
+		}
+		b := []byte{0}
+		nr, _ := unix.Read(fd, b)
+		if nr == 0 {
+			return seq
+		}
+		seq = append(seq, b[0])
+		// The '[' introduces CSI; it is not itself the final byte.
+		if len(seq) > 2 && b[0] >= 0x40 && b[0] <= 0x7e {
+			return seq
+		}
+		if len(seq) == 2 && seq[1] != '[' {
+			return seq
+		}
+	}
+}
+
+func readBracketedPaste(fd int) ([]byte, error) {
+	var pasted []byte
+	for {
+		b := []byte{0}
+		n, err := unix.Read(fd, b)
+		if err != nil || n == 0 {
+			return pasted, err
+		}
+		pasted = append(pasted, b[0])
+		if len(pasted) >= len(bracketedPasteEnd) && bytes.Equal(pasted[len(pasted)-len(bracketedPasteEnd):], bracketedPasteEnd) {
+			return pasted[:len(pasted)-len(bracketedPasteEnd)], nil
+		}
+	}
+}
+
+func modifiedEnter(seq []byte) (modifier string, ok bool) {
+	s := string(seq)
+	// CSI-u keyboard protocol: ESC [ 13 ; modifier u
+	if strings.HasPrefix(s, "\x1b[13;") && strings.HasSuffix(s, "u") {
+		return strings.TrimSuffix(strings.TrimPrefix(s, "\x1b[13;"), "u"), true
+	}
+	// xterm modifyOtherKeys level 2: ESC [ 27 ; modifier ; 13 ~
+	if strings.HasPrefix(s, "\x1b[27;") && strings.HasSuffix(s, ";13~") {
+		return strings.TrimSuffix(strings.TrimPrefix(s, "\x1b[27;"), ";13~"), true
+	}
+	return "", false
+}
+
+func displayInputText(text string) {
+	fmt.Print(strings.ReplaceAll(text, "\n", "\n"+strings.Repeat(" ", 8)))
+}
+
+// runCBreakMode reads chat-style input: Enter submits, Shift+Enter adds a
+// newline, and bracketed paste adds its complete payload without submitting.
+func runCBreakMode(ctx context.Context, k *toroid.Kernel, cfg config, fd int) {
+	var buf []byte
+	promptPrinted := false
+
+	// modifyOtherKeys (CSI > 4 ; 2 m) emits sequences like:
+	//   Enter:         \x1b[13;5u  (Ctrl+Enter)
+	//   Enter:         \x1b[13;2u  (Shift+Enter)
+	//   Enter:         \x1b[13;6u  (Ctrl+Shift+Enter)
+	//   Normal Enter:  \n or \r
+	// We'll parse these escape sequences to detect modifier+Enter.
+
+	for {
+		if !promptPrinted {
+			fmt.Print(aGreen + aBold + "\nyou ▸ " + aReset)
+			promptPrinted = true
+		}
+
+		// Read one byte at a time in cbreak mode
+		b := make([]byte, 1)
+		n, err := unix.Read(fd, b)
+		if err != nil || n == 0 {
+			if err == unix.EINTR {
+				continue
+			}
+			fmt.Println()
+			break
+		}
+
+		ch := b[0]
+
+		// Handle Ctrl-C (SIGINT) - interrupt current input
+		if ch == 3 {
+			fmt.Println(aYellow + "\n[interrupted]" + aReset)
+			buf = nil
+			promptPrinted = false
+			continue
+		}
+
+		// Handle Ctrl-D (EOF) - exit
+		if ch == 4 {
+			if len(buf) == 0 {
+				fmt.Println()
+				break
+			}
+			// If there's content, treat as submit
+			ch = '\n'
+		}
+
+		// Handle escape sequences for bracketed paste and modified Enter.
+		if ch == 27 { // ESC
+			seq := readEscapeSequence(fd)
+			if bytes.Equal(seq, []byte("\x1b[200~")) {
+				pasted, err := readBracketedPaste(fd)
+				if err != nil {
+					fmt.Println()
+					return
+				}
+				text := strings.ReplaceAll(strings.ReplaceAll(string(pasted), "\r\n", "\n"), "\r", "\n")
+				buf = append(buf, text...)
+				displayInputText(text)
+				continue
+			}
+			if modifier, ok := modifiedEnter(seq); ok {
+				if modifier == "2" {
+					buf = append(buf, '\n')
+					fmt.Print("\n" + strings.Repeat(" ", 8))
+					continue
+				}
+				// Other modified Enter variants retain send behavior.
+				ch = '\n'
+			} else {
+				// Other escape sequences (arrow keys, etc.): add to buffer.
+				buf = append(buf, seq...)
+				fmt.Print(string(seq))
+				continue
+			}
+		}
+
+		// Plain Enter sends the complete buffered message.
+		if ch == '\n' || ch == '\r' {
+			line := strings.TrimSpace(string(buf))
+			if line != "" {
+				buf = nil
+				promptPrinted = false
+
+				if strings.HasPrefix(line, "/") {
+					quit, reset := handleCommand(line, k, cfg)
+					if quit {
+						return
+					}
+					if reset {
+						return // caller will recreate kernel
+					}
+					continue
+				}
+
+				ask(ctx, k, cfg, line)
+				continue
+			}
+
+			// Ignore Enter on an empty input.
+			continue
+		}
+
+		// Handle backspace/delete
+		if ch == 127 || ch == 8 { // DEL or BS
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+				fmt.Print("\b \b") // erase char visually
+			}
+			continue
+		}
+
+		// Printable character
+		if ch >= 32 && ch < 127 {
+			buf = append(buf, ch)
+			fmt.Printf("%c", ch)
+			continue
+		}
+
+		// Other control chars: ignore but keep in buffer for completeness
+		buf = append(buf, ch)
 	}
 }

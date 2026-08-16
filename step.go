@@ -54,10 +54,11 @@ func GenerateSchema(t reflect.Type) Schema { return llm.GenerateSchema(t) }
 // available for this call. Keeping system out of Messages preserves a stable
 // cache prefix and avoids double-billing the system text.
 type Context struct {
-	System   string
-	Messages []llm.Message
-	Tools    []llm.Tool
-	Metadata llm.RequestMetadata
+	SystemPrefix string // invariant, independently cacheable instructions
+	System       string // run-specific system context
+	Messages     []llm.Message
+	Tools        []llm.Tool
+	Metadata     llm.RequestMetadata
 }
 
 // AssistantMessage is the result of one non-streaming llm-step: the assistant

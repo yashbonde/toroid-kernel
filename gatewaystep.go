@@ -28,12 +28,13 @@ func NewGatewayStep(client llm.Chat) *GatewayStep { return &GatewayStep{Client: 
 // buildRequest maps a Step call onto one llm.Request.
 func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 	req := llm.Request{
-		Model:       model.ID,
-		System:      c.System,
-		Messages:    c.Messages,
-		Tools:       c.Tools,
-		Metadata:    c.Metadata,
-		CachePrompt: model.PromptCache && !opts.DisablePromptCache,
+		Model:        model.ID,
+		SystemPrefix: c.SystemPrefix,
+		System:       c.System,
+		Messages:     c.Messages,
+		Tools:        c.Tools,
+		Metadata:     c.Metadata,
+		CachePrompt:  model.PromptCache && !opts.DisablePromptCache,
 	}
 	if opts.MaxOutputTokens != nil {
 		mt := int(*opts.MaxOutputTokens)

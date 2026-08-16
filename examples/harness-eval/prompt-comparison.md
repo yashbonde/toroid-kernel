@@ -1,5 +1,11 @@
 # Claude Code vs Toroid wire-prompt comparison
 
+> The `~1,910` pi figure above is an **estimate from source**, not a captured
+> wire measurement, and should not be compared byte-for-byte with the captured
+> Claude/Toroid rows; see the footnote. A full content/strategy comparison
+> across all three agents lives in `interop-prompt-analysis.md` in this
+> directory.
+
 The exact full captures are published in the private aidocs document
 [Claude Code System Prompt](https://aidocs.razorpay.com/app/d/doc_wfmao3n3fn3naruh).
 
@@ -13,7 +19,14 @@ the Toroid static-prefix count.
 | Claude, configured user environment | 7,572 | 16,365 | 59,093 | 24,049 | 29 | 107,079 |
 | Claude `--safe-mode` | 5,175 | 7,937 | 57,302 | 22,812 | 27 | 93,226 |
 | Claude `--bare` | 1,593 | 471 | 86 | 2,685 | 3 | 4,835 |
+| pi (estimated from source) | ~1,910 | 0 | 0¹ | 0¹ | 4 | ~1,910 |
 | Toroid working tree | 5,269 | 0 | 3,178 | 2,483 | 9 | 10,930 |
+
+¹ pi has no separate tool-description/schema payload: tools are a one-line
+snippet list embedded inside the system text itself, with no JSON Schema on the
+wire. The row is sized from `system-prompt.ts` (standard read/bash/edit/write
+toolset + its docs/guidelines block); treat it as an estimate, not a captured
+wire measurement.
 
 The configured Claude probe reported 22,979 input tokens on its first real
 request. It was not a vanilla Claude Code prompt: global instructions added an
@@ -22,6 +35,13 @@ agent and skill inventories. `--safe-mode` removes those custom instructions,
 hooks, and MCP servers, but the built-in tool catalog remains the dominant
 payload. `--bare` is much smaller but is a materially different harness with
 only Bash, Edit, and Read available.
+
+pi was not captured in the same harness run, so its row is an estimate derived
+from `system-prompt.ts` rather than a measured request. pi trims its prompt to
+the tools actually wired up, keeps its system text small (~1.9 KB with the four
+default tools), and embeds tool one-liners in the prose instead of a separate
+schema catalog — the mirror image of Claude's tool-catalog-heavy payload and a
+middle path between Claude and Toroid.
 
 ## Configured Claude tool catalog
 

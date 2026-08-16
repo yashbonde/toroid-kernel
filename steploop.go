@@ -50,10 +50,11 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 
 		metadata := k.nextRequestMetadata(ctx)
 		stepCtx := Context{
-			System:   k.SystemPrompt,
-			Messages: k.History,
-			Tools:    wireTools,
-			Metadata: metadata,
+			SystemPrefix: k.SystemPromptPrefix,
+			System:       k.SystemPrompt,
+			Messages:     k.History,
+			Tools:        wireTools,
+			Metadata:     metadata,
 		}
 		k.fireTurnStarted(ctx, metadata)
 		k.fireLLMStep(ctx, model.ID, stepCtx, "")

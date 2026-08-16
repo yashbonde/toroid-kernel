@@ -11,7 +11,9 @@ import (
 )
 
 type cbreakState struct {
-	termios *unix.Termios
+	termios         *unix.Termios
+	modifyOtherKeys bool
+	bracketedPaste  bool
 }
 
 func enableCBreak(fd int) (*cbreakState, error) {
@@ -26,12 +28,32 @@ func enableCBreak(fd int) (*cbreakState, error) {
 	if err := unix.IoctlSetTermios(fd, setTermios(), t); err != nil {
 		return nil, err
 	}
-	return &cbreakState{termios: &old}, nil
+
+	// Try to enable modifyOtherKeys (CSI > 4 ; 2 m) for modifier detection
+	// This lets us detect Ctrl+Enter, Cmd+Enter, Shift+Enter
+	// Supported by: iTerm2, Terminal.app (macOS), Kitty, WezTerm, Contour, etc.
+	modifyOtherKeys := false
+	if _, err := unix.Write(fd, []byte("\x1b[>4;2m")); err == nil {
+		modifyOtherKeys = true
+	}
+	bracketedPaste := false
+	if _, err := unix.Write(fd, []byte("\x1b[?2004h")); err == nil {
+		bracketedPaste = true
+	}
+
+	return &cbreakState{termios: &old, modifyOtherKeys: modifyOtherKeys, bracketedPaste: bracketedPaste}, nil
 }
 
 func restoreCBreak(fd int, s *cbreakState) error {
 	if s == nil || s.termios == nil {
 		return nil
+	}
+	// Disable modifyOtherKeys (CSI > 4 ; 0 m)
+	if s.modifyOtherKeys {
+		unix.Write(fd, []byte("\x1b[>4;0m"))
+	}
+	if s.bracketedPaste {
+		unix.Write(fd, []byte("\x1b[?2004l"))
 	}
 	return unix.IoctlSetTermios(fd, setTermios(), s.termios)
 }

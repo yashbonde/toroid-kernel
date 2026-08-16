@@ -59,12 +59,23 @@ func (c *AnthropicClient) buildBody(req Request, stream bool) ([]byte, error) {
 		maxTokens = *req.MaxTokens
 	}
 
-	if req.System != "" {
-		sys := map[string]any{"type": "text", "text": req.System}
-		if req.CachePrompt {
-			sys["cache_control"] = map[string]any{"type": "ephemeral"}
+	if req.SystemPrefix != "" || req.System != "" {
+		var system []map[string]any
+		if req.SystemPrefix != "" {
+			prefix := map[string]any{"type": "text", "text": req.SystemPrefix}
+			if req.CachePrompt {
+				prefix["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+			system = append(system, prefix)
 		}
-		body["system"] = []map[string]any{sys}
+		if req.System != "" {
+			suffix := map[string]any{"type": "text", "text": req.System}
+			if req.CachePrompt && req.SystemPrefix == "" {
+				suffix["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+			system = append(system, suffix)
+		}
+		body["system"] = system
 	}
 
 	if len(req.Tools) > 0 {

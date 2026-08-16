@@ -60,6 +60,7 @@ func runOneShot(cfg config, apiKey string) error {
 		MaxIter:              cfg.maxIter,
 		Save:                 cfg.save,
 		IncludeComputerTools: true,
+		IncludeSubagentTools: true,
 
 		TotalContextSize:      cfg.contextSize,
 		CompactionBufferSize:  cfg.compactBuffer,
@@ -74,14 +75,38 @@ func runOneShot(cfg config, apiKey string) error {
 	defer k.Close()
 
 	if cfg.plain {
-		// --plain: skip the event stream entirely and print just the final
-		// answer. This is the same text the AssistantTurn event carries —
-		// Run already returns it directly, so there's nothing to subscribe to.
+		// --plain skips the event stream and renders the complete final answer
+		// through the same spacing/wrapping path as the interactive transcript.
+		// Unlike the viewport it is not clipped, so it also serves as a faithful
+		// headless rendering probe.
+		//
+		// stdout stays purely the final answer; live tool activity goes to
+		// stderr through the same box renderer the REPL uses.
+		emitPlain := func(s string) { fmt.Fprint(os.Stderr, s) }
+		k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
+			if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
+				emitPlain(renderToolCall(p.Name, p.Args, cfg.workdir, termWidth()))
+			}
+			return nil
+		})
+		k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
+			if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+				emitPlain(toolResultLine(p.Result))
+			}
+			return nil
+		})
+		k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
+			if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+				emitPlain(toolErrorLine(p.Error))
+			}
+			return nil
+		})
+
 		out, _, err := k.Run(ctx, cfg.run)
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
-		fmt.Println(out)
+		fmt.Println(renderAssistantText(out, max(1, termWidth())))
 		return nil
 	}
 

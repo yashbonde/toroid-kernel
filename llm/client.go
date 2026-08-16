@@ -68,6 +68,7 @@ type RequestMetadata struct {
 // message (never duplicated in Messages) for a stable cache prefix.
 type Request struct {
 	Model           string
+	SystemPrefix    string
 	System          string
 	Messages        []Message
 	Tools           []Tool
@@ -357,13 +358,23 @@ func doWithRetry(ctx context.Context, client *http.Client, build func() (*http.R
 // buildBody marshals a Request into the OpenAI chat-completions JSON body.
 func (c *Client) buildBody(req Request, stream bool) ([]byte, error) {
 	msgs := make([]wireMessage, 0, len(req.Messages)+1)
-	if req.System != "" {
+	if req.SystemPrefix != "" || req.System != "" {
 		if req.CachePrompt {
-			msgs = append(msgs, wireMessage{Role: string(RoleSystem), Content: []map[string]any{
-				{"type": "text", "text": req.System, "cache_control": map[string]any{"type": "ephemeral"}},
-			}})
+			var blocks []map[string]any
+			if req.SystemPrefix != "" {
+				blocks = append(blocks, map[string]any{"type": "text", "text": req.SystemPrefix, "cache_control": map[string]any{"type": "ephemeral"}})
+			}
+			if req.System != "" {
+				block := map[string]any{"type": "text", "text": req.System}
+				if req.SystemPrefix == "" {
+					block["cache_control"] = map[string]any{"type": "ephemeral"}
+				}
+				blocks = append(blocks, block)
+			}
+			msgs = append(msgs, wireMessage{Role: string(RoleSystem), Content: blocks})
 		} else {
-			msgs = append(msgs, wireMessage{Role: string(RoleSystem), Content: req.System})
+			system := strings.TrimSpace(req.SystemPrefix + "\n\n" + req.System)
+			msgs = append(msgs, wireMessage{Role: string(RoleSystem), Content: system})
 		}
 	}
 	for _, m := range req.Messages {

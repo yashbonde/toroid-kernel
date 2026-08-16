@@ -31,17 +31,18 @@ type Kernel struct {
 	Cfg  Config
 	Step Step // one-llm-step backend; defaults to GatewayStep over the llm client
 
-	Hooks          *HookRegistry
-	Tools          *tools.Registry
-	Store          *Store
-	seq            atomic.Uint64
-	SystemPrompt   string
-	History        []llm.Message
-	Sessions       map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
-	usageMu        sync.Mutex
-	currentTokens  int
-	runningCostUSD float64
-	mcpClients     []io.Closer // open connections to configured MCP servers, closed in Close()
+	Hooks              *HookRegistry
+	Tools              *tools.Registry
+	Store              *Store
+	seq                atomic.Uint64
+	SystemPromptPrefix string
+	SystemPrompt       string
+	History            []llm.Message
+	Sessions           map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
+	usageMu            sync.Mutex
+	currentTokens      int
+	runningCostUSD     float64
+	mcpClients         []io.Closer // open connections to configured MCP servers, closed in Close()
 
 	// message queue — callers enqueue messages that are injected at the next
 	// safe interruption point (turn boundary), causing the loop to continue
@@ -65,7 +66,7 @@ type Config struct {
 	// Model is the primary agent model (provider/model form). All models are
 	// reached through the LiteLLM gateway ("llmgateway/<name>"); ids with other
 	// prefixes are passed to the gateway verbatim for it to route.
-	Model string `json:"model" description:"primary llm model name" default:"llmgateway/claude-haiku-4-5"`
+	Model string `json:"model" description:"primary llm model name" default:"lfm-2.5-2.6b:free"`
 	// SmallerModel is an optional cheaper model for cost-sensitive work:
 	// conversation compaction and subagents (sync + async). Empty means those
 	// paths use Model.
@@ -88,7 +89,7 @@ type Config struct {
 	// IncludeSubagentTools opts into synchronous and background delegation.
 	// It is separate from the core file/shell tools so ordinary runs keep a
 	// smaller, more relevant tool prefix.
-	IncludeSubagentTools bool            `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"false"`
+	IncludeSubagentTools bool            `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"true"`
 	Tools                *tools.Registry `json:"tools,omitempty" description:"custom tools"`
 
 	// Skills: if unset or true, scan ~/.toroid/skills/*.md at startup for
@@ -189,6 +190,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	if cfg.MaxIter <= 0 {
 		cfg.MaxIter = 100
 	}
+	if cfg.SmallerModel == "" {
+		cfg.SmallerModel = "deepseek/deepseek-v4-flash-0731"
+	}
 
 	// Kernel object
 	k := &Kernel{
@@ -275,8 +279,8 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	// Compile one stable system prefix after every startup capability is known.
-	k.SystemPrompt = buildSystemPrompt(cfg.WorkDir, skills, len(cfg.MCPServers) > 0,
-		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel)
+	k.SystemPromptPrefix, k.SystemPrompt = buildSystemPrompt(cfg.WorkDir, skills, len(cfg.MCPServers) > 0,
+		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel, cfg.TotalContextSize, cfg.CompactionBufferSize)
 
 	// Step is the one-llm-step backend over the in-repo wire client (OpenAI
 	// chat completions, or native Anthropic messages for anthropic/ ids). Tests
@@ -364,11 +368,11 @@ func (k *Kernel) fireTurnFailed(ctx context.Context, metadata llm.RequestMetadat
 
 // recordUsage adds a single LLM call's usage to session cost accounting.
 func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
-	if !u.PricingOK {
-		// The gateway did not report a cost for this step (streamed, or header
-		// missing) — make the unbilled step visible instead of silently $0.
-		k.Logf("llm-step recorded with unknown cost (no gateway cost header)")
-	}
+	// if !u.PricingOK {
+	// 	// The gateway did not report a cost for this step (streamed, or header
+	// 	// missing) — make the unbilled step visible instead of silently $0.
+	// 	k.Logf("llm-step recorded with unknown cost (no gateway cost header)")
+	// }
 	runningCost := k.UpdateUse(u, "")
 	if k.Store != nil {
 		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
@@ -648,9 +652,10 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 		// layer so its usage is priced and billed like any other llm-step.
 		schemaMsgs := append(k.History, llm.NewUserMessage("Now return your findings in the required JSON format."))
 		res, err := k.Step.CompleteObject(ctx, ResolveModel(k.Cfg.Model), Context{
-			System:   k.SystemPrompt,
-			Messages: schemaMsgs,
-			Metadata: k.nextRequestMetadata(ctx),
+			SystemPrefix: k.SystemPromptPrefix,
+			System:       k.SystemPrompt,
+			Messages:     schemaMsgs,
+			Metadata:     k.nextRequestMetadata(ctx),
 		}, ro.schema, ro.schemaName, ro.schemaDescription, k.stepOpts())
 		if err != nil {
 			return err
@@ -813,9 +818,10 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	compactModel := ResolveModel(compactModelID)
 	histForCompact := TransformForHandoff(k.History, ResolveModel(k.Cfg.Model), compactModel)
 	compactCtx := Context{
-		System:   k.SystemPrompt,
-		Messages: append(histForCompact, llm.NewUserMessage(string(prompt))),
-		Metadata: k.nextRequestMetadata(ctx),
+		SystemPrefix: k.SystemPromptPrefix,
+		System:       k.SystemPrompt,
+		Messages:     append(histForCompact, llm.NewUserMessage(string(prompt))),
+		Metadata:     k.nextRequestMetadata(ctx),
 	}
 	k.fireLLMStep(ctx, compactModel.ID, compactCtx, "")
 	opts := k.stepOpts()
@@ -846,7 +852,7 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	// usage lands). ~4 chars/token is a coarse estimate of the summary's size; the
 	// next stream replaces it with the real measured value.
 	k.usageMu.Lock()
-	k.currentTokens = (len(k.SystemPrompt) + len(summary)) / 4
+	k.currentTokens = (len(k.SystemPromptPrefix) + len(k.SystemPrompt) + len(summary)) / 4
 	k.usageMu.Unlock()
 
 	// Fire post-compact event so history can be reconstructed from events alone.
