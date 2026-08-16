@@ -187,10 +187,8 @@ func buildLangfuseRequest(td TraceData) otlpRequest {
 			firstPrompt  string
 			lastOutput   string
 			pendingTools = map[string]int{} // callID -> child span index
-			turnUsage    Usage              // TurnCost accumulated since last turn
-			turnCost     float64            // cost USD accumulated since last turn
 			n            int
-			genCount     int // assistant-turn generations emitted
+			genCount     int // turn-completed generations emitted
 		)
 
 		for _, ev := range sp.Events {
@@ -200,22 +198,16 @@ func buildLangfuseRequest(td TraceData) otlpRequest {
 					firstPrompt = p.Prompt
 				}
 
-			case EventTurnCost:
-				if p, ok := payloadOf[TurnCostPayload](ev); ok {
-					turnUsage.Input += p.TurnUsage.Input
-					turnUsage.Output += p.TurnUsage.Output
-					turnUsage.Reasoning += p.TurnUsage.Reasoning
-					turnUsage.CacheRead += p.TurnUsage.CacheRead
-					turnUsage.CacheWrite += p.TurnUsage.CacheWrite
-					turnCost += p.TurnCostUSD
-				}
-
-			case EventAssistantTurn:
-				p, ok := payloadOf[AssistantTurnPayload](ev)
+			case EventTurnCompleted:
+				// One event now carries both the turn's content (what
+				// EventAssistantTurn used to report) and its usage/cost (what
+				// EventTurnCost used to report) — no accumulate-then-consume
+				// dance across two events needed.
+				p, ok := payloadOf[TurnPayload](ev)
 				if !ok {
 					continue
 				}
-				tv := summarizeTurn(p.Messages)
+				tv := summarizeTurn(p.Content)
 				if tv.Text != "" {
 					lastOutput = tv.Text
 				}
@@ -233,13 +225,12 @@ func buildLangfuseRequest(td TraceData) otlpRequest {
 						attr("gen_ai.request.model", sp.Model),
 						jsonAttr("langfuse.observation.input", map[string]any{"role": "user", "content": firstPrompt}),
 						jsonAttr("langfuse.observation.output", tv),
-						jsonAttr("langfuse.observation.usage_details", usageDetails(turnUsage)),
-						jsonAttr("langfuse.observation.cost_details", map[string]any{"total": turnCost}),
+						jsonAttr("langfuse.observation.usage_details", usageDetails(p.TurnUsage)),
+						jsonAttr("langfuse.observation.cost_details", map[string]any{"total": p.TurnCostUSD}),
 					},
 				}
 				children = append(children, gen)
 				genCount++
-				turnUsage, turnCost = Usage{}, 0 // reset for the next turn
 
 			case EventPreToolUse:
 				p, ok := payloadOf[ToolUsePayload](ev)

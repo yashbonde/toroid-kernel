@@ -73,7 +73,9 @@ func ReconstructHistory(traceID, spanID, systemPrompt, workDir, model string) ([
 
 	history := append([]llm.Message{}, compactedBase...)
 
-	// Replay UserPromptSubmit and AssistantTurn events from startIdx.
+	// Replay UserPromptSubmit and TurnCompleted events from startIdx.
+	// TurnCompleted.Content carries the turn's full structured content — what
+	// EventAssistantTurn used to carry as its own event kind.
 	for _, ev := range events[startIdx:] {
 		switch ev.Kind {
 		case EventUserPromptSubmit:
@@ -91,17 +93,17 @@ func ReconstructHistory(traceID, spanID, systemPrompt, workDir, model string) ([
 			msg, _, _ := parseUserMessage(p.Prompt, workDir, ResolveModel(model))
 			history = append(history, msg)
 
-		case EventAssistantTurn:
+		case EventTurnCompleted:
 			raw, err := json.Marshal(ev.Payload)
 			if err != nil {
 				continue
 			}
-			var p AssistantTurnPayload
-			if err := json.Unmarshal(raw, &p); err != nil {
+			var p TurnPayload
+			if err := json.Unmarshal(raw, &p); err != nil || len(p.Content) == 0 {
 				continue
 			}
 			var msgs []llm.Message
-			if err := json.Unmarshal(p.Messages, &msgs); err != nil {
+			if err := json.Unmarshal(p.Content, &msgs); err != nil {
 				continue
 			}
 			history = append(history, msgs...)

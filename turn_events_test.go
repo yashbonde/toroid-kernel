@@ -59,13 +59,16 @@ func TestTurnLifecycleEventsCompleteExactlyOnce(t *testing.T) {
 		{Text: "done"},
 	}}
 
-	var started, completed, failed []TurnPayload
+	// v2: scope ids (TranscriptID/ChatID/TurnID/LLMStepID) live on the Event
+	// envelope, not the TurnPayload, so capture full events to check them.
+	var started, completed []Event
+	var failed []TurnPayload
 	k.OnAll(func(_ context.Context, event Event) error {
 		switch event.Kind {
 		case EventTurnStarted:
-			started = append(started, *event.Payload.(*TurnPayload))
+			started = append(started, event)
 		case EventTurnCompleted:
-			completed = append(completed, *event.Payload.(*TurnPayload))
+			completed = append(completed, event)
 		case EventTurnFailed:
 			failed = append(failed, *event.Payload.(*TurnPayload))
 		}
@@ -92,11 +95,12 @@ func TestTurnLifecycleEventsCompleteExactlyOnce(t *testing.T) {
 			t.Errorf("turn %d terminal event changed hierarchy: start=%+v end=%+v", i, start, end)
 		}
 	}
-	if completed[0].StopReason != StopReasonToolUse || completed[0].ToolCalls != 2 {
-		t.Errorf("tool turn completion = %+v", completed[0])
+	completedPayload := func(e Event) TurnPayload { return *e.Payload.(*TurnPayload) }
+	if p := completedPayload(completed[0]); p.StopReason != StopReasonToolUse || p.ToolCalls != 2 {
+		t.Errorf("tool turn completion = %+v", p)
 	}
-	if completed[1].StopReason != StopReasonStop || completed[1].ToolCalls != 0 {
-		t.Errorf("final turn completion = %+v", completed[1])
+	if p := completedPayload(completed[1]); p.StopReason != StopReasonStop || p.ToolCalls != 0 {
+		t.Errorf("final turn completion = %+v", p)
 	}
 }
 
@@ -105,18 +109,18 @@ func TestTurnLifecycleEventFailsExactlyOnce(t *testing.T) {
 	k := newTurnEventTestKernel(t, tools.NewRegistry())
 	k.Step = &failingCompleteStep{FauxStep: &FauxStep{}, err: wantErr}
 
-	var started, completed, failed []TurnPayload
+	var started, failed []Event
+	var completed []Event
 	for _, kind := range []EventKind{EventTurnStarted, EventTurnCompleted, EventTurnFailed} {
 		kind := kind
 		k.On(kind, func(_ context.Context, event Event) error {
-			payload := *event.Payload.(*TurnPayload)
 			switch kind {
 			case EventTurnStarted:
-				started = append(started, payload)
+				started = append(started, event)
 			case EventTurnCompleted:
-				completed = append(completed, payload)
+				completed = append(completed, event)
 			case EventTurnFailed:
-				failed = append(failed, payload)
+				failed = append(failed, event)
 			}
 			return nil
 		})
@@ -128,10 +132,12 @@ func TestTurnLifecycleEventFailsExactlyOnce(t *testing.T) {
 	if len(started) != 1 || len(completed) != 0 || len(failed) != 1 {
 		t.Fatalf("turn events: started=%d completed=%d failed=%d, want 1/0/1", len(started), len(completed), len(failed))
 	}
+	// v2: scope ids live on the Event envelope, not the TurnPayload.
 	if failed[0].TurnID != started[0].TurnID || failed[0].LLMStepID != started[0].LLMStepID {
 		t.Errorf("failed event does not terminate started turn: start=%+v failed=%+v", started[0], failed[0])
 	}
-	if failed[0].StopReason != StopReasonError || failed[0].Error != wantErr.Error() {
-		t.Errorf("failure payload = %+v", failed[0])
+	failedPayload := *failed[0].Payload.(*TurnPayload)
+	if failedPayload.StopReason != StopReasonError || failedPayload.Error != wantErr.Error() {
+		t.Errorf("failure payload = %+v", failedPayload)
 	}
 }

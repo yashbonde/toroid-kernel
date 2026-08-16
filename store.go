@@ -437,7 +437,7 @@ func ListSessions() ([]SessionInfo, error) {
 			info.DurationNs = maxTS - info.StartedAt
 		}
 
-		// Agent time: sum of step durations (UserPromptSubmit → TurnCost) per span.
+		// Agent time: sum of step durations (UserPromptSubmit → TurnCompleted) per span.
 		spanRows, err := db.Query(`SELECT span_id FROM spans WHERE trace_id = ?`, info.ID)
 		if err != nil {
 			continue
@@ -460,7 +460,7 @@ func ListSessions() ([]SessionInfo, error) {
 				switch e.Kind {
 				case EventUserPromptSubmit:
 					stepStart = e.EmitTS
-				case EventTurnCost:
+				case EventTurnCompleted:
 					if stepStart > 0 {
 						info.AgentTimeNs += e.EmitTS - stepStart
 					}
@@ -626,7 +626,23 @@ func spanTreeEvents(traceID oteltrace.TraceID, rootID oteltrace.SpanID, sp SpanD
 				Events:       []OTELEvent{oe},
 			})
 
-		case EventTurnCompleted, EventTurnFailed:
+		case EventTurnCompleted:
+			// One event now closes the turn span and carries its cost — what
+			// EventTurnCost used to report separately.
+			if currentTurn < 0 {
+				rootEvents = append(rootEvents, oe)
+				continue
+			}
+			t := &children[currentTurn]
+			if p, ok := payloadOf[TurnPayload](ev); ok {
+				t.CostUSD = p.TurnCostUSD
+				t.Attributes = append(t.Attributes, usageAttributes(p.TurnUsage, p.TurnCostUSD)...)
+			}
+			t.EndUnix = ev.EmitTS
+			t.Events = append(t.Events, oe)
+			currentTurn = -1 // turn closed
+
+		case EventTurnFailed:
 			if currentTurn < 0 {
 				rootEvents = append(rootEvents, oe)
 				continue
@@ -635,18 +651,6 @@ func spanTreeEvents(traceID oteltrace.TraceID, rootID oteltrace.SpanID, sp SpanD
 			t.EndUnix = ev.EmitTS
 			t.Events = append(t.Events, oe)
 			currentTurn = -1 // turn closed
-
-		case EventTurnCost:
-			if currentTurn < 0 {
-				rootEvents = append(rootEvents, oe)
-				continue
-			}
-			t := &children[currentTurn]
-			if p, ok := payloadOf[TurnCostPayload](ev); ok {
-				t.CostUSD = p.TurnCostUSD
-				t.Attributes = append(t.Attributes, usageAttributes(p.TurnUsage, p.TurnCostUSD)...)
-			}
-			t.Events = append(t.Events, oe)
 
 		case EventPreToolUse:
 			parent := rootID
@@ -696,16 +700,6 @@ func spanTreeEvents(traceID oteltrace.TraceID, rootID oteltrace.SpanID, sp SpanD
 			t.Events = append(t.Events, oe)
 			delete(toolIdx, p.CallID)
 
-		case EventLLMStep, EventAssistantTurn:
-			// The request the step sent and the content it produced belong to
-			// that step, not to the whole run — without this the waterfall shows
-			// turn spans with nothing but lifecycle markers on them.
-			if currentTurn < 0 {
-				rootEvents = append(rootEvents, oe)
-				continue
-			}
-			children[currentTurn].Events = append(children[currentTurn].Events, oe)
-
 		default:
 			// Everything else (session, user prompt, compaction, task, …) stays
 			// attached to the root kernel.run span.
@@ -746,16 +740,17 @@ func usageAttributes(u Usage, cost float64) []OTELKeyValue {
 	return attrs
 }
 
-// aggregateUsage sums per-turn token usage recorded on a span's TurnCost events.
-// Loaded events carry Payload as a decoded map, so it is re-marshaled into the
-// typed payload rather than type-asserted.
+// aggregateUsage sums per-turn token usage recorded on a span's TurnCompleted
+// events (what a dedicated TurnCost event used to carry). Loaded events carry
+// Payload as a decoded map, so it is re-marshaled into the typed payload
+// rather than type-asserted.
 func aggregateUsage(sp SpanData) Usage {
 	var total Usage
 	for _, ev := range sp.Events {
-		if ev.Kind != EventTurnCost || ev.Payload == nil {
+		if ev.Kind != EventTurnCompleted || ev.Payload == nil {
 			continue
 		}
-		var p TurnCostPayload
+		var p TurnPayload
 		b, err := json.Marshal(ev.Payload)
 		if err != nil {
 			continue

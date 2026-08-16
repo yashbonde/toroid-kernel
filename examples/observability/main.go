@@ -4,7 +4,7 @@
 // using the public API (no LLM calls needed), then exports it to Langfuse with
 // toroid.LangfuseOTLP. It exercises the full projection: a user prompt (with an
 // inline image ref), several tool calls including a failing one, token usage and
-// cost, a nested subagent span, and compaction + notification events.
+// cost, a nested subagent span, and compaction.
 //
 // Run it to verify the export end to end against a real Langfuse project:
 //
@@ -72,7 +72,10 @@ func main() {
 	ev := func(span string, seq uint64, ts int64, kind toroid.EventKind, payload any) {
 		must(st.AppendEvent(trace, span, toroid.Event{Kind: kind, TraceID: trace, SpanID: span, EmitTS: ts, Seq: seq, Payload: payload}))
 	}
-	assistant := func(text, reasoning string, calls ...llm.ToolCallPart) toroid.AssistantTurnPayload {
+	// turnCompleted builds one EventTurnCompleted payload — content, stop
+	// reason, tool count, and cost together, what separate AssistantTurn and
+	// TurnCost events used to carry.
+	turnCompleted := func(text, reasoning string, toolCalls int, usage toroid.Usage, turnCostUSD, totalCostUSD float64, calls ...llm.ToolCallPart) toroid.TurnPayload {
 		content := []llm.Part{}
 		if reasoning != "" {
 			content = append(content, llm.ReasoningPart{Text: reasoning})
@@ -82,7 +85,14 @@ func main() {
 			content = append(content, c)
 		}
 		b, _ := json.Marshal([]llm.Message{{Role: llm.RoleAssistant, Parts: content}})
-		return toroid.AssistantTurnPayload{Messages: b}
+		return toroid.TurnPayload{
+			StopReason:   "stop",
+			ToolCalls:    toolCalls,
+			Content:      b,
+			TurnUsage:    usage,
+			TurnCostUSD:  turnCostUSD,
+			TotalCostUSD: totalCostUSD,
+		}
 	}
 
 	// Root span: turn 1 (read + failing vet), delegate to subagent, then final turn.
@@ -93,31 +103,33 @@ func main() {
 	ev(trace, 3, now+360*ms, toroid.EventPostToolUse, toroid.ToolUseResultPayload{CallID: "c1", Name: "read", Result: "<path>utils.go</path> … 350 lines …"})
 	ev(trace, 4, now+900*ms, toroid.EventPreToolUse, toroid.ToolUsePayload{CallID: "c2", Name: "bash", Args: `{"cmd":"go vet ./..."}`})
 	ev(trace, 5, now+1500*ms, toroid.EventPostToolUseFailure, toroid.ToolUseResultPayload{CallID: "c2", Name: "bash", Error: "Error: exit 1: vet: utils.go:131:2: undefined: fooBar"})
-	ev(trace, 6, now+1800*ms, toroid.EventTurnCost, toroid.TurnCostPayload{TurnUsage: toroid.Usage{Input: 4200, Output: 310, Reasoning: 120, CacheRead: 2000}, TurnCostUSD: 0.0061, TotalCostUSD: 0.0061})
-	ev(trace, 7, now+1850*ms, toroid.EventAssistantTurn, assistant(
+	ev(trace, 6, now+1850*ms, toroid.EventTurnCompleted, turnCompleted(
 		"Found the duplication; fixing it, then delegating the test run.",
 		"wrapInLogWidth and PrettyPrintHistory both re-pad — they can share one indent helper.",
+		1, toroid.Usage{Input: 4200, Output: 310, Reasoning: 120, CacheRead: 2000}, 0.0061, 0.0061,
 		llm.ToolCallPart{ID: "c3", Name: "subagent_async", Arguments: `{"task":"run the test suite and report failures"}`},
 	))
-	ev(trace, 8, now+2900*ms, toroid.EventSubagentStart, toroid.SubagentPayload{SessionID: sub, Prompt: "run the test suite and report failures"})
+	ev(trace, 7, now+2900*ms, toroid.EventSubagentStart, toroid.SubagentPayload{SessionID: sub, Prompt: "run the test suite and report failures", Async: true, TaskID: "c3"})
 
 	// Subagent span: its own prompt, a tool call, a turn.
 	ev(sub, 1, now+3100*ms, toroid.EventUserPromptSubmit, toroid.UserPromptPayload{Prompt: "run the test suite and report failures"})
 	ev(sub, 2, now+3400*ms, toroid.EventPreToolUse, toroid.ToolUsePayload{CallID: "s1", Name: "bash", Args: `{"cmd":"go test ./..."}`})
 	ev(sub, 3, now+5200*ms, toroid.EventPostToolUse, toroid.ToolUseResultPayload{CallID: "s1", Name: "bash", Result: "ok  github.com/yashbonde/toroid-kernel  11 passed"})
-	ev(sub, 4, now+5600*ms, toroid.EventTurnCost, toroid.TurnCostPayload{TurnUsage: toroid.Usage{Input: 1800, Output: 90}, TurnCostUSD: 0.0033, TotalCostUSD: 0.0033})
-	ev(sub, 5, now+5700*ms, toroid.EventAssistantTurn, assistant("All 11 tests pass.", ""))
+	ev(sub, 4, now+5700*ms, toroid.EventTurnCompleted, turnCompleted("All 11 tests pass.", "", 0, toroid.Usage{Input: 1800, Output: 90}, 0.0033, 0.0033))
 
-	// Root span: subagent completes, compaction happens, final turn.
-	ev(trace, 9, now+6100*ms, toroid.EventTaskCompleted, toroid.TaskPayload{TaskID: "c3", Title: "run the test suite", Status: "completed"})
-	ev(trace, 10, now+6200*ms, toroid.EventPreCompact, toroid.CompactPayload{MessageCount: 22, TokenCount: 41000})
-	ev(trace, 11, now+6500*ms, toroid.EventPostCompact, toroid.CompactSummaryPayload{
+	// Root span: subagent completes (one EventSubagentStop, Async — what a
+	// separate TaskCompleted event used to report), compaction, final turn.
+	ev(trace, 8, now+6100*ms, toroid.EventSubagentStop, toroid.SubagentPayload{
+		SessionID: sub, Prompt: "run the test suite and report failures", Output: "All 11 tests pass.", Async: true, TaskID: "c3",
+	})
+	ev(trace, 9, now+6200*ms, toroid.EventPreCompact, toroid.CompactPayload{MessageCount: 22, TokenCount: 41000})
+	ev(trace, 10, now+6500*ms, toroid.EventPostCompact, toroid.CompactSummaryPayload{
 		Summary: "Refactored utils.go to share an indent helper; subagent confirmed all tests pass.", MessagesBefore: 22, MessagesAfter: 3, TokensBefore: 41000,
 	})
-	ev(trace, 12, now+7000*ms, toroid.EventNotification, toroid.NotificationPayload{Title: "Task done", Message: "Refactor complete and tests green."})
-	ev(trace, 13, now+7600*ms, toroid.EventTurnCost, toroid.TurnCostPayload{TurnUsage: toroid.Usage{Input: 3100, Output: 210}, TurnCostUSD: 0.0063, TotalCostUSD: 0.0124})
-	ev(trace, 14, now+7700*ms, toroid.EventAssistantTurn, assistant(
-		"Done: removed the duplicated indent logic in utils.go and the subagent confirmed all 11 tests pass.", ""))
+	ev(trace, 11, now+7700*ms, toroid.EventTurnCompleted, turnCompleted(
+		"Done: removed the duplicated indent logic in utils.go and the subagent confirmed all 11 tests pass.", "", 0,
+		toroid.Usage{Input: 3100, Output: 210}, 0.0063, 0.0124,
+	))
 
 	if err := toroid.LangfuseOTLP(ctx, trace, base, pub, sec); err != nil {
 		panic(err)

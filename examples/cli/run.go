@@ -124,16 +124,13 @@ func runOneShot(cfg config, apiKey string) error {
 		return enc.Encode(e) // Encode appends a newline -> NDJSON
 	}
 
-	// OnAll covers most of the lifecycle, but it deliberately omits the events
-	// that carry the model's actual output — AssistantTurn (the full final text
-	// and structured content) and TurnCost — so subscribe to those explicitly.
-	// Without this you'd see tool calls and a Stop event but never the answer.
+	// OnAll now covers the full lifecycle, including the model's actual output:
+	// TurnCompleted carries the turn's structured content and cost directly
+	// (what separate AssistantTurn/TurnCost subscriptions used to be needed for).
 	k.OnAll(emit)
-	k.On(toroid.EventAssistantTurn, emit)
-	k.On(toroid.EventTurnCost, emit)
 
 	// Drive the loop. We discard the writer copy of the final text because the
-	// EventStop / EventAssistantTurn events already carry it on the stream.
+	// EventStop / EventTurnCompleted events already carry it on the stream.
 	if _, _, err := k.Run(ctx, cfg.run); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}

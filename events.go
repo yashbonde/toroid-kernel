@@ -5,39 +5,45 @@ import "encoding/json"
 type EventKind string
 
 const (
-	EventTraceLog           EventKind = "TraceLog" // structured log entry stored in the trace; visible in UI and readable by follow-on agents
 	EventSessionStart       EventKind = "SessionStart"
 	EventUserPromptSubmit   EventKind = "UserPromptSubmit"
 	EventPreToolUse         EventKind = "PreToolUse"         // before a tool is called
 	EventPostToolUse        EventKind = "PostToolUse"        // after a tool call is completed
 	EventPostToolUseFailure EventKind = "PostToolUseFailure" // after a tool call fails
 	EventSubagentStart      EventKind = "SubagentStart"      // before the subagent is started
-	EventSubagentStop       EventKind = "SubagentStop"       // before the subagent is stopped
+	EventSubagentStop       EventKind = "SubagentStop"       // after the subagent finishes, sync or async (Payload.Async)
 	EventMasterIdle         EventKind = "MasterIdle"         // after the main agent is idle
-	EventNotification       EventKind = "Notification"       // before the notification is sent
-	EventTaskCompleted      EventKind = "TaskCompleted"      // before the task is completed
 	EventReasoning          EventKind = "Reasoning"          // streamed reasoning/thinking tokens (display only, not stored)
-	EventTurnStarted        EventKind = "TurnStarted"        // before one agent loop turn begins
-	EventTurnCompleted      EventKind = "TurnCompleted"      // after the LLM response and any requested tools finish
+	EventTurnStarted        EventKind = "TurnStarted"        // before one agent loop turn begins; carries the outbound llm-step shape
+	EventTurnCompleted      EventKind = "TurnCompleted"      // after the LLM response and any requested tools finish; carries content and cost
 	EventTurnFailed         EventKind = "TurnFailed"         // when a turn cannot reach its normal boundary
-	EventAssistantTurn      EventKind = "AssistantTurn"      // full structured content blocks for the turn (thinking+text+tool_use)
-	EventTurnCost           EventKind = "TurnCost"           // after each LLM turn, with incremental cost
+	EventGuardTriggered     EventKind = "GuardTriggered"     // a loop guard acted: inspection/validation/completion nudge, repeat-call guard, or MaxIter
 	EventStop               EventKind = "Stop"               // when the agent is stopped
 	EventPreCompact         EventKind = "PreCompact"         // before compacting the memory
 	EventPostCompact        EventKind = "PostCompact"        // after compaction; payload contains the LLM-generated summary
 	EventSessionEnd         EventKind = "SessionEnd"         // after the session ends
 	EventQueueInterrupt     EventKind = "QueueInterrupt"     // fired when queued messages interrupt the stream at a step boundary
-	EventLLMStep            EventKind = "LLMStep"            // before each outbound llm-step; debug view of the request shape
 )
 
+// Event is the envelope fired for every kernel occurrence. TranscriptID,
+// ChatID, TurnID, and LLMStepID identify where in the transcript -> chat ->
+// turn -> llm-step scope hierarchy this event sits; they are set whenever the
+// scope is known and left empty otherwise (e.g. SessionStart/SessionEnd have
+// no chat yet). Every event kind carries them uniformly, so a consumer can
+// fold the flat stream back into the scope tree without special-casing which
+// kinds happen to carry ids in their payload.
 type Event struct {
-	Kind      EventKind `json:"kind"`
-	SessionID string    `json:"session_id"`
-	TraceID   string    `json:"trace_id"`
-	SpanID    string    `json:"span_id"`
-	EmitTS    int64     `json:"emit_ts"` // UnixNano wall clock
-	Seq       uint64    `json:"seq"`     // monotonic counter within a span
-	Payload   any       `json:"payload,omitempty"`
+	Kind         EventKind `json:"kind"`
+	SessionID    string    `json:"session_id"`
+	TraceID      string    `json:"trace_id"`
+	SpanID       string    `json:"span_id"`
+	TranscriptID string    `json:"transcript_id,omitempty"`
+	ChatID       string    `json:"chat_id,omitempty"`
+	TurnID       string    `json:"turn_id,omitempty"`
+	LLMStepID    string    `json:"llm_step_id,omitempty"`
+	EmitTS       int64     `json:"emit_ts"` // UnixNano wall clock
+	Seq          uint64    `json:"seq"`     // monotonic counter within a span
+	Payload      any       `json:"payload,omitempty"`
 }
 
 // nonObservableKinds are display-only and control-plane signals that are not part
@@ -70,20 +76,6 @@ func (e Event) OTEL() OTELEvent {
 	return oe
 }
 
-// kernel event to Swarm Buddy event Map
-
-const (
-	TraceLogInfo    = "info"
-	TraceLogWarning = "warning"
-	TraceLogError   = "error"
-)
-
-// TraceLogPayload is attached to EventTraceLog.
-type TraceLogPayload struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
 // Payload types
 
 type UserPromptPayload struct {
@@ -95,18 +87,33 @@ type ReasoningPayload struct {
 }
 
 // TurnPayload is attached to EventTurnStarted, EventTurnCompleted, and
-// EventTurnFailed. The IDs mirror the outbound request hierarchy so hosts can
-// correlate a hook with its transcript, chat, turn, and individual LLM call.
-// A completed turn may still contain failed tool results; those are reported by
-// EventPostToolUseFailure and remain valid input for the next turn.
+// EventTurnFailed — the one event describing everything about a turn.
+//
+// On EventTurnStarted: Model, Messages, Tools, Schema describe the outbound
+// llm-step about to be sent (what EventLLMStep used to carry separately).
+//
+// On EventTurnCompleted: StopReason, ToolCalls, Messages (the turn's full
+// structured content, JSON-serialized []llm.Message — what EventAssistantTurn
+// used to carry) and TurnUsage/TurnCostUSD/TotalCostUSD (what EventTurnCost
+// used to carry) are populated.
+//
+// On EventTurnFailed: StopReason and Error are populated.
 type TurnPayload struct {
-	TranscriptID string `json:"transcript_id"`
-	ChatID       string `json:"chat_id"`
-	TurnID       string `json:"turn_id"`
-	LLMStepID    string `json:"llm_step_id"`
-	StopReason   string `json:"stop_reason,omitempty"`
-	ToolCalls    int    `json:"tool_calls,omitempty"`
-	Error        string `json:"error,omitempty"`
+	StopReason string `json:"stop_reason,omitempty"`
+	ToolCalls  int    `json:"tool_calls,omitempty"`
+	Error      string `json:"error,omitempty"`
+
+	// TurnStarted fields
+	Model    string   `json:"model,omitempty"`
+	Messages int      `json:"messages,omitempty"` // outbound message count (system excluded)
+	Tools    []string `json:"tools,omitempty"`
+	Schema   string   `json:"schema,omitempty"`
+
+	// TurnCompleted fields
+	Content      json.RawMessage `json:"content,omitempty"` // []llm.Message, full structured content for the turn
+	TurnUsage    Usage           `json:"turn_usage,omitempty"`
+	TurnCostUSD  float64         `json:"turn_cost_usd,omitempty"`
+	TotalCostUSD float64         `json:"total_cost_usd,omitempty"`
 }
 
 type ToolUsePayload struct {
@@ -122,16 +129,17 @@ type ToolUseResultPayload struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// SubagentPayload is attached to EventSubagentStart and EventSubagentStop.
+// Async and TaskID are set on the async path (SpawnBackground) — what
+// EventTaskCompleted used to report as a separate event kind — and left zero
+// on the synchronous RunSubagent path.
 type SubagentPayload struct {
 	SessionID    string       `json:"session_id"`
 	Prompt       string       `json:"prompt"`
 	Output       string       `json:"output,omitempty"`
 	UsagePayload UsagePayload `json:"usage,omitempty"`
-}
-
-type NotificationPayload struct {
-	Title   string `json:"title"`
-	Message string `json:"message"`
+	Async        bool         `json:"async,omitempty"`
+	TaskID       string       `json:"task_id,omitempty"`
 }
 
 type CompactPayload struct {
@@ -149,31 +157,17 @@ type CompactSummaryPayload struct {
 	TokensBefore   int    `json:"tokens_before,omitempty"`
 }
 
-// AssistantTurnPayload is attached to EventAssistantTurn.
-// Messages is a JSON-serialized []llm.Message containing the full structured
-// content blocks (thinking, text, tool_use, tool_result) from all steps of the turn.
-type AssistantTurnPayload struct {
-	Messages json.RawMessage `json:"messages"`
-}
-
 type StopPayload struct {
 	Reason string `json:"reason"`
 }
 
-// LLMStepPayload is the debug view of one outbound llm-step, fired as
-// EventLLMStep just before the request is sent: enough to verify the model,
-// tool set, schema, and single-system-prompt invariant without raw bytes.
-type LLMStepPayload struct {
-	Model    string   `json:"model"`
-	Messages int      `json:"messages"` // message count (system excluded)
-	Tools    []string `json:"tools,omitempty"`
-	Schema   string   `json:"schema,omitempty"` // schema name for object calls
-}
-
-type TaskPayload struct {
-	TaskID string `json:"task_id"`
-	Title  string `json:"title"`
-	Status string `json:"status"`
+// GuardTriggeredPayload is attached to EventGuardTriggered — the one event
+// covering every loop guard: the inspection, validation, and completion
+// nudges, the repeat-call loop guard, and MaxIter. Name identifies which
+// guard fired; Reason is a short human-readable explanation.
+type GuardTriggeredPayload struct {
+	Name   string `json:"name"`
+	Reason string `json:"reason"`
 }
 
 // UsagePayload is attached to EventStop and contains the total token usage
@@ -186,11 +180,4 @@ type UsagePayload struct {
 // Messages contains the injected messages that caused the stream restart.
 type QueueInterruptPayload struct {
 	Messages []string `json:"messages"`
-}
-
-// TurnCostPayload is attached to EventTurnCost, fired after each LLM turn.
-type TurnCostPayload struct {
-	TurnUsage    Usage   `json:"turn_usage"`     // tokens consumed in this single turn
-	TurnCostUSD  float64 `json:"turn_cost_usd"`  // cost of this turn in USD
-	TotalCostUSD float64 `json:"total_cost_usd"` // cumulative cost so far in USD
 }

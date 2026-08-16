@@ -125,9 +125,13 @@ func TestKernelE2E(t *testing.T) {
 	}}
 	k.Step = step
 
+	// v2: a turn's structured content is TurnCompleted.Content — what a
+	// separate AssistantTurn event used to carry.
 	var turnPayloads []json.RawMessage
-	k.On(toroid.EventAssistantTurn, func(_ context.Context, e toroid.Event) error {
-		turnPayloads = append(turnPayloads, e.Payload.(*toroid.AssistantTurnPayload).Messages)
+	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if content := e.Payload.(*toroid.TurnPayload).Content; len(content) > 0 {
+			turnPayloads = append(turnPayloads, content)
+		}
 		return nil
 	})
 
@@ -155,13 +159,13 @@ func TestKernelE2E(t *testing.T) {
 	}
 
 	if len(turnPayloads) < 4 {
-		t.Fatalf("expected at least 4 AssistantTurn events, got %d", len(turnPayloads))
+		t.Fatalf("expected at least 4 TurnCompleted events with content, got %d", len(turnPayloads))
 	}
 	var sawToolCall bool
 	for _, raw := range turnPayloads {
 		var messages []llm.Message
 		if err := json.Unmarshal(raw, &messages); err != nil {
-			t.Fatalf("AssistantTurn payload does not parse as []llm.Message: %v", err)
+			t.Fatalf("TurnCompleted content does not parse as []llm.Message: %v", err)
 		}
 		for _, message := range messages {
 			sawToolCall = sawToolCall || len(message.ToolCalls()) > 0

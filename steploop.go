@@ -3,6 +3,7 @@ package toroid
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"sort"
@@ -56,8 +57,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			Tools:        wireTools,
 			Metadata:     metadata,
 		}
-		k.fireTurnStarted(ctx, metadata)
-		k.fireLLMStep(ctx, model.ID, stepCtx, "")
+		k.fireTurnStarted(ctx, metadata, model.ID, stepCtx, "")
 		res, err := k.Step.Complete(ctx, model, stepCtx, k.stepOpts())
 		if err != nil {
 			k.fireTurnFailed(ctx, metadata, err)
@@ -69,17 +69,17 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// Reasoning parts stay in history for observability; the wire layer drops
 		// them when replaying (OpenAI assistant messages carry text + tool calls).
 		normalizeToolCallPaths(res.Content, k.Cfg.WorkDir)
-		k.appendStepMessages(ctx, []llm.Message{{Role: llm.RoleAssistant, Parts: res.Content}})
-		k.recordUsage(ctx, res.Usage) // also refreshes the window-occupancy gauge
+		persist := k.appendStepMessages(ctx, []llm.Message{{Role: llm.RoleAssistant, Parts: res.Content}})
+		totalCostUSD := k.recordUsage(res.Usage) // also refreshes the window-occupancy gauge
 		if budget.reached(k) {
 			k.Logf("spend limit reached; stopping agent loop")
-			k.fireTurnCompleted(ctx, metadata, res.StopReason, len(res.ToolCalls()))
+			k.fireTurnCompleted(ctx, metadata, res.StopReason, len(res.ToolCalls()), marshalMessages(persist), res.Usage, totalCostUSD)
 			return nil
 		}
 
 		for _, p := range res.Content {
 			if rp, ok := p.(llm.ReasoningPart); ok && rp.Text != "" {
-				_ = k.Fire(ctx, string(EventReasoning), &ReasoningPayload{Text: rp.Text})
+				_ = k.FireInTurn(ctx, string(EventReasoning), metadata, &ReasoningPayload{Text: rp.Text})
 			}
 		}
 
@@ -89,7 +89,8 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		// (no tools) is the user-visible answer.
 		if len(toolCalls) == 0 {
 			if workspaceMutated && !validationSinceMutation && !completionGuardSent {
-				k.fireTurnCompleted(ctx, metadata, res.StopReason, 0)
+				k.fireTurnCompleted(ctx, metadata, res.StopReason, 0, marshalMessages(persist), res.Usage, totalCostUSD)
+				k.fireGuard(ctx, metadata, "completion", "files changed without an intervening validation run")
 				k.History = append(k.History, llm.NewUserMessage(
 					"Completion guard: files changed without validation after the last edit. "+
 						"Run relevant validation, or verify that none applies, then finish.",
@@ -101,14 +102,14 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 				k.fireTurnFailed(ctx, metadata, err)
 				return err
 			}
-			k.fireTurnCompleted(ctx, metadata, res.StopReason, 0)
+			k.fireTurnCompleted(ctx, metadata, res.StopReason, 0, marshalMessages(persist), res.Usage, totalCostUSD)
 			return nil // end of chat
 		}
 
 		// Execute tools locally (not an llm-step) and append their results.
 		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
-		k.appendStepMessages(ctx, []llm.Message{toolMsg})
-		k.fireTurnCompleted(ctx, metadata, res.StopReason, len(toolCalls))
+		persist = append(persist, k.appendStepMessages(ctx, []llm.Message{toolMsg})...)
+		k.fireTurnCompleted(ctx, metadata, res.StopReason, len(toolCalls), marshalMessages(persist), res.Usage, totalCostUSD)
 
 		// GLM can remain in repository-archeology mode long after it has enough
 		// evidence to act. After a bounded inspection phase, inject one neutral
@@ -124,6 +125,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		} else if !workspaceMutated {
 			inspectionTurns++
 			if inspectionTurns >= 8 && !inspectionGuardSent {
+				k.fireGuard(ctx, metadata, "inspection", "8 inspection turns with no edit")
 				k.History = append(k.History, llm.NewUserMessage(
 					"8 inspection turns, no edit. If evidence is sufficient, implement now; "+
 						"otherwise do one targeted check for the missing fact.",
@@ -135,6 +137,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			validationSinceMutation = true
 			validationTurns++
 			if validationTurns >= 2 && !validationGuardSent {
+				k.fireGuard(ctx, metadata, "validation", "validation ran twice without an intervening edit")
 				k.History = append(k.History, llm.NewUserMessage(
 					"Validation guard: validation ran twice without an intervening edit. "+
 						"Use those results; rerun only after a change or for a specific new reason.",
@@ -151,14 +154,18 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 				recentSigs = recentSigs[len(recentSigs)-n:]
 			}
 			if allEqual(recentSigs, n) {
-				k.Logf("loop guard: stopping after %d consecutive identical tool calls with identical results", n)
+				reason := fmt.Sprintf("%d consecutive identical tool calls with identical results", n)
+				k.fireGuard(ctx, metadata, "loop_guard", reason)
+				k.Logf("loop guard: stopping after " + reason)
 				return nil
 			}
 		}
 
 		// MaxIter cap on tool-call turns.
 		if k.Cfg.MaxIter > 0 && turns >= k.Cfg.MaxIter {
-			k.Logf("step loop: reached MaxIter=%d", k.Cfg.MaxIter)
+			reason := fmt.Sprintf("reached MaxIter=%d", k.Cfg.MaxIter)
+			k.fireGuard(ctx, metadata, "max_iter", reason)
+			k.Logf("step loop: " + reason)
 			return nil
 		}
 
@@ -168,7 +175,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			for _, qm := range queued {
 				k.History = append(k.History, llm.NewUserMessage(qm))
 			}
-			_ = k.Fire(ctx, string(EventQueueInterrupt), &QueueInterruptPayload{Messages: queued})
+			_ = k.FireInTurn(ctx, string(EventQueueInterrupt), metadata, &QueueInterruptPayload{Messages: queued})
 			continue
 		}
 
@@ -278,9 +285,9 @@ func (k *Kernel) wireTools() []llm.Tool {
 // bytes are stripped from the persisted payload — an image the model saw would
 // otherwise be duplicated into SQLite (and the event bus) as base64 every time
 // it appears in a turn; a resumed session gets a text stub instead.
-func (k *Kernel) appendStepMessages(ctx context.Context, msgs []llm.Message) {
+func (k *Kernel) appendStepMessages(ctx context.Context, msgs []llm.Message) []llm.Message {
 	if len(msgs) == 0 {
-		return
+		return nil
 	}
 	k.History = append(k.History, msgs...)
 	persist := make([]llm.Message, len(msgs))
@@ -315,9 +322,22 @@ func (k *Kernel) appendStepMessages(ctx context.Context, msgs []llm.Message) {
 		}
 		persist[i].Parts = parts
 	}
-	if b, err := json.Marshal(persist); err == nil {
-		_ = k.Fire(ctx, string(EventAssistantTurn), &AssistantTurnPayload{Messages: json.RawMessage(b)})
+	return persist
+}
+
+// marshalMessages serializes a turn's persist-ready messages for
+// TurnPayload.Content — what EventAssistantTurn used to carry as its own
+// event. Returns nil (omitted from the payload) on marshal failure or an
+// empty slice, rather than emitting a separate event just to report "none".
+func marshalMessages(msgs []llm.Message) json.RawMessage {
+	if len(msgs) == 0 {
+		return nil
 	}
+	b, err := json.Marshal(msgs)
+	if err != nil {
+		return nil
+	}
+	return json.RawMessage(b)
 }
 
 // runToolCalls executes each tool call via the registry, firing pre/post events,

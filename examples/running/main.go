@@ -156,8 +156,8 @@ func main() {
 		}
 		return nil
 	})
-	k.On(toroid.EventTurnCost, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TurnCostPayload); ok {
+	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
 			fmt.Printf("$ turn=$%.6f total=$%.6f\n", p.TurnCostUSD, p.TotalCostUSD)
 		}
 		return nil
@@ -197,9 +197,9 @@ func main() {
 	// --- DELEGATION: asynchronous background agent (fire-and-wake). ---
 	fmt.Println("\n== delegation: background (asynchronous) ==")
 	done := make(chan struct{})
-	k.On(toroid.EventTaskCompleted, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TaskPayload); ok {
-			fmt.Printf("[background %s] %s\n", p.TaskID, p.Status)
+	k.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
+			fmt.Printf("[background %s] done\n", p.TaskID)
 		}
 		return nil
 	})

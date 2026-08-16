@@ -318,56 +318,64 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	return k, nil
 }
 
-// fireLLMStep emits the EventLLMStep debug view of an outbound llm-step just
-// before the kernel issues it: model, message count, tool names, schema name.
-func (k *Kernel) fireLLMStep(ctx context.Context, model string, c Context, schema string) {
+// fireTurnStarted emits EventTurnStarted just before the kernel issues the
+// turn's llm-step: model, message count, tool names, schema name — what
+// EventLLMStep used to carry as a separate event kind, folded in here because
+// the two always fired together, at the same point, every time.
+func (k *Kernel) fireTurnStarted(ctx context.Context, metadata llm.RequestMetadata, model string, c Context, schema string) {
 	names := make([]string, 0, len(c.Tools))
 	for _, t := range c.Tools {
 		names = append(names, t.Name)
 	}
-	_ = k.Fire(ctx, string(EventLLMStep), &LLMStepPayload{
+	payload := TurnPayload{
 		Model:    model,
 		Messages: len(c.Messages),
 		Tools:    names,
 		Schema:   schema,
-	})
-}
-
-func turnPayload(metadata llm.RequestMetadata) TurnPayload {
-	return TurnPayload{
-		TranscriptID: metadata.TranscriptID,
-		ChatID:       metadata.ChatID,
-		TurnID:       metadata.TurnID,
-		LLMStepID:    metadata.TraceID,
 	}
+	_ = k.FireInTurn(ctx, string(EventTurnStarted), metadata, &payload)
 }
 
-func (k *Kernel) fireTurnStarted(ctx context.Context, metadata llm.RequestMetadata) {
-	payload := turnPayload(metadata)
-	_ = k.Fire(ctx, string(EventTurnStarted), &payload)
-}
-
-func (k *Kernel) fireTurnCompleted(ctx context.Context, metadata llm.RequestMetadata, stopReason string, toolCalls int) {
-	payload := turnPayload(metadata)
-	payload.StopReason = stopReason
-	payload.ToolCalls = toolCalls
-	_ = k.Fire(ctx, string(EventTurnCompleted), &payload)
+// fireTurnCompleted emits EventTurnCompleted with the turn's outcome: what
+// EventTurnCompleted, EventAssistantTurn (content), and EventTurnCost (usage)
+// used to report as three separate events at overlapping moments are now one.
+// content is the turn's full structured content, already JSON-serialized by
+// the caller (media-stripped for persistence).
+func (k *Kernel) fireTurnCompleted(ctx context.Context, metadata llm.RequestMetadata, stopReason string, toolCalls int, content json.RawMessage, usage Usage, totalCostUSD float64) {
+	payload := TurnPayload{
+		StopReason:   stopReason,
+		ToolCalls:    toolCalls,
+		Content:      content,
+		TurnUsage:    usage,
+		TurnCostUSD:  usage.Cost,
+		TotalCostUSD: totalCostUSD,
+	}
+	_ = k.FireInTurn(ctx, string(EventTurnCompleted), metadata, &payload)
 }
 
 func (k *Kernel) fireTurnFailed(ctx context.Context, metadata llm.RequestMetadata, err error) {
-	payload := turnPayload(metadata)
-	payload.StopReason = StopReasonError
+	payload := TurnPayload{StopReason: StopReasonError}
 	if ctx.Err() != nil {
 		payload.StopReason = StopReasonAborted
 	}
 	if err != nil {
 		payload.Error = err.Error()
 	}
-	_ = k.Fire(ctx, string(EventTurnFailed), &payload)
+	_ = k.FireInTurn(ctx, string(EventTurnFailed), metadata, &payload)
 }
 
-// recordUsage adds a single LLM call's usage to session cost accounting.
-func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
+// fireGuard emits EventGuardTriggered — the single event kind covering every
+// loop guard (previously silent, Logf-only, five separate inline blocks):
+// the inspection, validation, and completion nudges, the repeat-call loop
+// guard, and MaxIter.
+func (k *Kernel) fireGuard(ctx context.Context, metadata llm.RequestMetadata, name, reason string) {
+	_ = k.FireInTurn(ctx, string(EventGuardTriggered), metadata, &GuardTriggeredPayload{Name: name, Reason: reason})
+}
+
+// recordUsage adds a single LLM call's usage to session cost accounting and
+// returns the running total, so the caller can fold it into TurnCompleted's
+// payload instead of this firing its own event.
+func (k *Kernel) recordUsage(u Usage) float64 {
 	// if !u.PricingOK {
 	// 	// The gateway did not report a cost for this step (streamed, or header
 	// 	// missing) — make the unbilled step visible instead of silently $0.
@@ -377,11 +385,7 @@ func (k *Kernel) recordUsage(ctx context.Context, u Usage) {
 	if k.Store != nil {
 		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
 	}
-	_ = k.Fire(ctx, string(EventTurnCost), &TurnCostPayload{
-		TurnUsage:    u,
-		TurnCostUSD:  u.Cost,
-		TotalCostUSD: runningCost,
-	})
+	return runningCost
 }
 
 // Implement tools.Agent interface
@@ -411,15 +415,35 @@ func (k *Kernel) LogErr(msg string, args ...any) {
 	LogError("["+k.Cfg.TraceID+"] "+msg, args...)
 }
 
+// Fire records an event scoped to the transcript only — used outside a turn
+// (SessionStart, UserPromptSubmit, Stop, MasterIdle, SessionEnd, compaction,
+// subagent start/stop). Use FireInTurn for anything happening inside a turn.
 func (k *Kernel) Fire(ctx context.Context, kind string, payload any) error {
+	return k.fireEvent(ctx, kind, "", "", "", payload)
+}
+
+// FireInTurn records an event carrying full chat/turn/llm-step scope on its
+// envelope — used for everything fired inside a turn (TurnStarted,
+// TurnCompleted, TurnFailed, Reasoning, PreToolUse, PostToolUse,
+// PostToolUseFailure, GuardTriggered, QueueInterrupt), so a consumer can fold
+// the whole event, not just Turn* payloads, back into the scope tree.
+func (k *Kernel) FireInTurn(ctx context.Context, kind string, metadata llm.RequestMetadata, payload any) error {
+	return k.fireEvent(ctx, kind, metadata.ChatID, metadata.TurnID, metadata.TraceID, payload)
+}
+
+func (k *Kernel) fireEvent(ctx context.Context, kind, chatID, turnID, llmStepID string, payload any) error {
 	event := Event{
-		Kind:      EventKind(kind),
-		SessionID: k.Cfg.SessionID,
-		TraceID:   k.Cfg.TraceID,
-		SpanID:    k.Cfg.SessionID,
-		EmitTS:    time.Now().UnixNano(),
-		Seq:       k.seq.Add(1),
-		Payload:   payload,
+		Kind:         EventKind(kind),
+		SessionID:    k.Cfg.SessionID,
+		TraceID:      k.Cfg.TraceID,
+		SpanID:       k.Cfg.SessionID,
+		TranscriptID: k.Cfg.TraceID,
+		ChatID:       chatID,
+		TurnID:       turnID,
+		LLMStepID:    llmStepID,
+		EmitTS:       time.Now().UnixNano(),
+		Seq:          k.seq.Add(1),
+		Payload:      payload,
 	}
 	if k.Store != nil && event.Kind != EventReasoning {
 		_ = k.Store.AppendEvent(k.Cfg.TraceID, k.Cfg.SessionID, event)
@@ -508,18 +532,16 @@ func (k *Kernel) OnAll(fn HookFn) {
 		EventSubagentStart,
 		EventSubagentStop,
 		EventMasterIdle,
-		EventNotification,
-		EventTaskCompleted,
 		EventReasoning,
 		EventTurnStarted,
 		EventTurnCompleted,
 		EventTurnFailed,
+		EventGuardTriggered,
 		EventStop,
 		EventPreCompact,
 		EventPostCompact,
 		EventQueueInterrupt,
 		EventSessionEnd,
-		EventLLMStep,
 	} {
 		k.On(kind, fn)
 	}
@@ -619,7 +641,6 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// so a dropped image is visible rather than silently missing (M8).
 	for _, w := range mediaWarnings {
 		k.LogErr("multimodal: %s", w)
-		_ = k.Fire(ctx, string(EventTraceLog), &TraceLogPayload{Type: "warn", Message: "multimodal: " + w})
 	}
 
 	// history validation — last message must be the user turn we just appended.
@@ -661,7 +682,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 			return err
 		}
 		// Bill the object llm-step and roll it into transcript totals (M7).
-		k.recordUsage(ctx, res.Usage)
+		k.recordUsage(res.Usage)
 		budget.reached(k)
 		b, err := json.Marshal(res.Object)
 		if err != nil {
@@ -681,12 +702,12 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 // race on history.
 func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBudget) error {
 	k.runMu.Lock()
-	defer k.runMu.Unlock()
 	k.running.Store(true)
 	k.lastWriter = w
-	defer k.running.Store(false)
 
 	if err := k.streamViaStep(ctx, w, budget); err != nil {
+		k.running.Store(false)
+		k.runMu.Unlock()
 		return err
 	}
 
@@ -714,14 +735,14 @@ func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBu
 		}
 	}
 
-	// If no background completions are queued, the kernel is now idle.
-	k.queueMu.Lock()
-	idle := len(k.messageQueue) == 0
-	k.queueMu.Unlock()
-	if idle {
-		_ = k.Fire(ctx, string(EventMasterIdle), nil)
-	}
-	return nil
+	// Mark not-running and release runMu *before* asking tryResume whether to
+	// resume: tryResume may itself re-enter streamCurrent (a background
+	// goroutine's result arrived while we were finishing this turn), and that
+	// recursive call needs to acquire runMu fresh, not find it still held by
+	// this call's own now-finished execution.
+	k.running.Store(false)
+	k.runMu.Unlock()
+	return k.tryResume(ctx)
 }
 
 // Close releases kernel-held resources. It flushes the trace store; the shared
@@ -823,7 +844,6 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		Messages:     append(histForCompact, llm.NewUserMessage(string(prompt))),
 		Metadata:     k.nextRequestMetadata(ctx),
 	}
-	k.fireLLMStep(ctx, compactModel.ID, compactCtx, "")
 	opts := k.stepOpts()
 	opts.DisablePromptCache = true
 	res, err := k.Step.Complete(ctx, compactModel, compactCtx, opts)
@@ -832,8 +852,10 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	}
 	summary := res.Text()
 
-	// Bill the compact llm-step.
-	k.recordUsage(ctx, res.Usage)
+	// Bill the compact llm-step. PreCompact/PostCompact already fully describe
+	// this call (message/token counts, the summary) — no separate debug-view
+	// event needed for a one-off request outside the turn loop.
+	k.recordUsage(res.Usage)
 
 	// Reset history. System stays out of History — the Step layer re-injects it
 	// as the single leading system message on every call.
@@ -869,6 +891,15 @@ func (k *Kernel) Compact(ctx context.Context) error {
 
 // RunSubagent runs a subagent synchronously and returns its output.
 func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
+	return k.runSubagent(ctx, task, "")
+}
+
+// runSubagent is shared by the synchronous (RunSubagent) and asynchronous
+// (SpawnBackground) subagent paths. taskID is empty on the synchronous path;
+// non-empty on the async path, where it also sets SubagentPayload.Async —
+// what EventTaskCompleted used to report as a separate event kind, now just
+// a field on the same EventSubagentStop every subagent already fires.
+func (k *Kernel) runSubagent(ctx context.Context, task, taskID string) (string, error) {
 	// Inherit config from parent; pin the child to SmallerModel when set so
 	// exploratory side work does not burn the primary model.
 	subCfg := k.Cfg
@@ -893,14 +924,18 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 		return "", fmt.Errorf("failed to initialize subagent: %w", err)
 	}
 
+	async := taskID != ""
+
 	// Fire an event to let the system know a subagent is starting
 	_ = k.Fire(ctx, string(EventSubagentStart), &SubagentPayload{
 		SessionID: subKernel.Cfg.SessionID,
 		Prompt:    task,
+		Async:     async,
+		TaskID:    taskID,
 	})
 
 	// Run the subagent on the task
-	output, usage, err := subKernel.Run(ctx, task)
+	output, usage, runErr := subKernel.Run(ctx, task)
 
 	// Fire stop event for the subagent
 	_ = k.Fire(ctx, string(EventSubagentStop), &SubagentPayload{
@@ -908,6 +943,8 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 		Prompt:       task,
 		Output:       output,
 		UsagePayload: usage,
+		Async:        async,
+		TaskID:       taskID,
 	})
 
 	// Roll child spend into the parent total so RunningCostUSD is honest.
@@ -923,8 +960,8 @@ func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
 		}
 	}
 
-	if err != nil {
-		return "", fmt.Errorf("subagent failed: %w", err)
+	if runErr != nil {
+		return "", fmt.Errorf("subagent failed: %w", runErr)
 	}
 
 	return fmt.Sprintf("Subagent completed task. Output:\n%s", output), nil
@@ -977,37 +1014,45 @@ func (k *Kernel) SpawnBackground(task string) string {
 	id := fmt.Sprintf("bg-%d", k.bgSeq.Add(1))
 	go func() {
 		bctx := context.Background()
-		out, err := k.RunSubagent(bctx, task)
+		out, err := k.runSubagent(bctx, task, id)
 		result := out
 		status := "completed"
 		if err != nil {
 			result = fmt.Sprintf("background task %s failed: %v", id, err)
 			status = "failed"
 		}
-		_ = k.Fire(bctx, string(EventTaskCompleted), &TaskPayload{TaskID: id, Title: task, Status: status})
 		k.Enqueue(fmt.Sprintf("[background task %s %s]\n%s", id, status, result))
-		// If a loop is already running it will drain the queue at the next turn
-		// boundary; otherwise wake the idle kernel to process the result.
-		if !k.running.Load() {
-			_ = k.Wake(bctx)
-		}
+		// tryResume is the single decision point: if a loop is already running
+		// it will drain the queue itself at its next turn boundary and this is
+		// a no-op; otherwise it drains and resumes right here.
+		_ = k.tryResume(bctx)
 	}()
 	return id
 }
 
-// Wake re-enters the agent loop to process any queued messages when the kernel
-// is idle. It is a no-op if a loop is already running (that loop will drain the
-// queue itself) or if there is nothing queued. Output is streamed to the writer
-// from the kernel's most recent Stream call, falling back to io.Discard.
-func (k *Kernel) Wake(ctx context.Context) error {
+// tryResume is the single answer to "should the kernel resume?" — called both
+// at the end of a turn (streamCurrent, once its own run has ended) and by a
+// finishing background goroutine (SpawnBackground). It replaces two
+// independent, unlocked checks — running.Load() in SpawnBackground and a
+// queue-length read in streamCurrent — with one function under one lock, so
+// there is no longer a gap between them for a message to land in unseen.
+//
+// If the kernel is idle and the queue is empty, it fires MasterIdle. If the
+// kernel is idle and something is queued, it drains and resumes the loop
+// itself, streaming to the writer from the kernel's most recent Stream call
+// (falling back to io.Discard). If the kernel is still running, it is a
+// no-op: that live loop will drain the queue itself at its next turn
+// boundary (QueueInterrupt).
+func (k *Kernel) tryResume(ctx context.Context) error {
 	k.wakeMu.Lock()
 	defer k.wakeMu.Unlock()
 
 	if k.running.Load() {
-		return nil // a live loop will drain the queue
+		return nil // a live loop will drain the queue itself
 	}
 	msgs := k.drainQueue()
 	if len(msgs) == 0 {
+		_ = k.Fire(ctx, string(EventMasterIdle), nil)
 		return nil
 	}
 	ctx = WithGatewayTrace(ctx)
