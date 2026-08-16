@@ -289,11 +289,12 @@ func newKernel(ctx context.Context, cfg *config, apiKey string, emit func(string
 		}
 		return nil
 	})
-	// Capture per-turn usage for the turn footer. EventTurnCost fires once per
-	// LLM step; EventStop's UsagePayload is session-accumulated, so keep this
+	// Capture per-turn usage for the turn footer. TurnCompleted carries the
+	// turn's own usage directly (what a separate TurnCost event used to
+	// carry); EventStop's UsagePayload is session-accumulated, so keep this
 	// turn's own numbers here instead.
-	k.On(toroid.EventTurnCost, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TurnCostPayload); ok {
+	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
 			cfg.lastTurn = p.TurnUsage
 		}
 		return nil
