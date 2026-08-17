@@ -175,3 +175,91 @@ func TestViewLeavesMouseAvailableForTerminalSelection(t *testing.T) {
 		t.Fatalf("mouse mode = %v; terminal selection requires MouseModeNone", got)
 	}
 }
+
+func TestToolCallLabelIsSingleLineWithoutBoxArt(t *testing.T) {
+	got := toolCallLabel("bash", `{"command":"git ls-files | wc -l"}`, "/work")
+	if !strings.HasPrefix(got, "bash  ") {
+		t.Fatalf("label = %q, want it to start with the tool name", got)
+	}
+	if strings.Contains(got, "┌") || strings.Contains(got, "└") {
+		t.Fatalf("label retained box art: %q", got)
+	}
+	if strings.Contains(got, "\n") {
+		t.Fatalf("label is not a single line: %q", got)
+	}
+}
+
+func TestClipToolLabelCapsAtFiftyChars(t *testing.T) {
+	long := strings.Repeat("x", 120)
+	got := clipToolLabel(long)
+	if len([]rune(got)) != maxToolLabelWidth {
+		t.Fatalf("clipped label length = %d, want %d: %q", len([]rune(got)), maxToolLabelWidth, got)
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Fatalf("clipped label missing ellipsis: %q", got)
+	}
+	short := "bash  git status"
+	if got := clipToolLabel(short); got != short {
+		t.Fatalf("short label should be unchanged, got %q", got)
+	}
+	exact := strings.Repeat("y", maxToolLabelWidth)
+	if got := clipToolLabel(exact); got != exact {
+		t.Fatalf("exactly-%d-char label should be unchanged, got %q", maxToolLabelWidth, got)
+	}
+}
+
+func TestToolLifecycleShowsLiveAndCommittedRows(t *testing.T) {
+	input := textarea.New()
+	input.DynamicHeight = true
+	input.MinHeight = 3
+	input.MaxContentHeight = 10000
+	transcript := viewport.New()
+	m := &tuiModel{
+		width: 80, height: 24, input: input, transcript: transcript,
+		cfg: &config{model: "test"}, kernel: &toroid.Kernel{Cfg: toroid.Config{TotalContextSize: 200000}},
+	}
+	m.resize()
+	m.busy = true
+
+	m.startTool("id1", "read  foo.go")
+	m.startTool("id2", "bash  ls")
+	m.spinnerFrame = 0
+	live := ansi.Strip(m.transcript.View())
+	// Both concurrent tools should show a live working row at once.
+	if !strings.Contains(live, "read  foo.go") {
+		t.Fatalf("live tool row missing first call text:\n%q", live)
+	}
+	if !strings.Contains(live, "bash  ls") {
+		t.Fatalf("live tool row missing second call text:\n%q", live)
+	}
+	if len(m.runningTools) != 2 {
+		t.Fatalf("runningTools = %d, want 2", len(m.runningTools))
+	}
+
+	// Finishing one call removes only that row and commits it in bold (no
+	// "done!" suffix); the other stays live.
+	m.finishTool("id1", "")
+	committed := ansi.Strip(m.transcript.View())
+	if strings.Contains(committed, "done!") {
+		t.Fatalf("committed tool row should have no 'done!' suffix:\n%q", committed)
+	}
+	if !strings.Contains(committed, "read  foo.go") {
+		t.Fatalf("committed tool row missing call text:\n%q", committed)
+	}
+	if len(m.runningTools) != 1 || m.runningTools[0].id != "id2" {
+		t.Fatalf("runningTools after first finish = %#v, want only id2", m.runningTools)
+	}
+	if !strings.Contains(ansi.Strip(m.transcript.View()), "bash  ls") {
+		t.Fatalf("second live tool row vanished after first finish:\n%q", committed)
+	}
+
+	// A failed call commits with its error text.
+	m.finishTool("id2", "boom")
+	errored := ansi.Strip(m.transcript.View())
+	if !strings.Contains(errored, "bash  ls ⨯ boom") {
+		t.Fatalf("failed tool row missing error text:\n%q", errored)
+	}
+	if len(m.runningTools) != 0 {
+		t.Fatalf("runningTools not cleared after all finish: %#v", m.runningTools)
+	}
+}

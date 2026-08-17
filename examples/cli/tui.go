@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/key"
@@ -22,12 +23,50 @@ import (
 
 type tuiOutputMsg string
 
+// tuiStreamMsg carries a chunk of the assistant's answer produced live by
+// Stream, so the transcript is updated token-by-turn instead of only after the
+// whole agent loop finishes. It is rendered into the assistant entry below.
+type tuiStreamMsg string
+
+// tuiToolMsg announces a tool call that has just started. id is the stable
+// tool_call_id from the LLM (links the Pre and Post events); label is the
+// single-row display text (operation + trimmed target) shown with an animated
+// "…" while it runs.
+type tuiToolMsg struct {
+	id    string
+	label string
+}
+
+// tuiToolDoneMsg marks a running tool (by id) as finished. A non-empty err
+// carries the failure text; otherwise the call succeeded and a "done!" suffix
+// is shown.
+type tuiToolDoneMsg struct {
+	id  string
+	err string
+}
+
+// writerFunc adapts a plain func to io.Writer so Stream can push answer text
+// into the TUI event loop.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
 type tuiTurnDoneMsg struct {
-	answer     string
 	err        error
 	elapsed    time.Duration
 	grandTotal int64
 }
+
+// spinnerTick requests the next animation frame while the kernel is busy.
+type spinnerTick struct{}
+
+func spin() tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTick{}
+	})
+}
+
+var spinnerFrames = []string{".  ", ".. ", "...", " ..", "  .", "   "}
 
 type transcriptKind uint8
 
@@ -35,6 +74,7 @@ const (
 	transcriptUser transcriptKind = iota
 	transcriptAssistant
 	transcriptActivity
+	transcriptTool
 )
 
 type transcriptEntry struct {
@@ -53,14 +93,26 @@ type tuiModel struct {
 	cancelTurn context.CancelFunc
 	kernel     *toroid.Kernel
 	cfg        *config
-	events     <-chan tea.Msg
+	apiKey     string
+	events     chan tea.Msg
 	input      textarea.Model
 	transcript viewport.Model
 	entries    []transcriptEntry
 	username   string
 	width      int
 	height     int
-	busy       bool
+	busy         bool
+	spinnerFrame int
+	// runningTools holds every tool call currently in flight, in start order, so
+	// concurrent parallel calls each get their own live "…" indicator that
+	// animates with the spinner. A tool is removed (and committed to the
+	// transcript) when its matching done event arrives.
+	runningTools []runningTool
+	// lastInputHeight is the composer's visual row count from the previous
+	// layout pass. With a known terminal width and a monospace font the
+	// composer only needs a new height when its content wraps to a new visual
+	// row, so the viewport is re-derived only when this actually changes.
+	lastInputHeight int
 }
 
 var (
@@ -116,7 +168,7 @@ func runTUI(cfg config, apiKey string) error {
 	if out, err := exec.Command("whoami").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
 		username = strings.TrimSpace(string(out))
 	}
-	m := &tuiModel{ctx: ctx, cancel: cancel, kernel: k, cfg: &cfg, events: events, input: input, transcript: transcript, username: username}
+	m := &tuiModel{ctx: ctx, cancel: cancel, kernel: k, cfg: &cfg, apiKey: apiKey, events: events, input: input, transcript: transcript, username: username}
 
 	_, err = tea.NewProgram(m).Run()
 	if errors.Is(err, tea.ErrInterrupted) {
@@ -156,6 +208,72 @@ func (m *tuiModel) appendActivity(text string) {
 	m.transcript.GotoBottom()
 }
 
+// toolCallMaxLabel caps a tool call to a single display row of at most
+// maxToolLabelWidth chars, so chatty operations never span the screen.
+const maxToolLabelWidth = 50
+
+// runningTool is one tool call in flight while its handler is executing.
+type runningTool struct {
+	id    string
+	label string
+}
+
+// startTool records a tool call that just began so renderTranscript can draw it
+// as a live "<call> …" line with the spinner animating the dots. The label is
+// clipped to a single row so the working indicator stays compact. Multiple
+// calls can be in flight at once (parallel tool execution); each is tracked by
+// its stable call id so the right row is committed when it finishes.
+func (m *tuiModel) startTool(id, label string) {
+	label = clipToolLabel(label)
+	for i := range m.runningTools {
+		if m.runningTools[i].id == id {
+			m.runningTools[i].label = label
+			m.renderTranscript()
+			m.transcript.GotoBottom()
+			return
+		}
+	}
+	m.runningTools = append(m.runningTools, runningTool{id: id, label: label})
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
+
+// clipToolLabel keeps only the first maxToolLabelWidth runes of a tool label,
+// replacing anything cut with an ellipsis so the shape stays on one row.
+func clipToolLabel(label string) string {
+	runes := []rune(label)
+	if len(runes) <= maxToolLabelWidth {
+		return label
+	}
+	return string(runes[:maxToolLabelWidth-1]) + "…"
+}
+
+// finishTool commits the finished tool (matched by its call id) as a permanent
+// transcript row and removes it from the set of running tools. The grey + "…"
+// animation made clear it was working; a finished row is simply solidified in
+// bold. Only failures carry a visible ⨯ and error text — success needs no
+// "done!" marker.
+func (m *tuiModel) finishTool(id, errText string) {
+	idx := -1
+	for i := range m.runningTools {
+		if m.runningTools[i].id == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return
+	}
+	label := m.runningTools[idx].label
+	if errText != "" {
+		label = label + " ⨯ " + compactToolText(errText, 120)
+	}
+	m.runningTools = append(m.runningTools[:idx], m.runningTools[idx+1:]...)
+	m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, ts: time.Now()})
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
+
 func (m *tuiModel) appendAssistant(text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -165,6 +283,21 @@ func (m *tuiModel) appendAssistant(text string) {
 		if strings.TrimSpace(m.entries[n-1].text) != "" {
 			m.entries[n-1].text = strings.TrimRight(m.entries[n-1].text, "\n") + "\n\n"
 		}
+		m.entries[n-1].text += text
+		m.entries[n-1].rendered = ""
+	} else {
+		m.entries = append(m.entries, transcriptEntry{kind: transcriptAssistant, text: text, ts: time.Now()})
+	}
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
+
+// appendStream appends a live-assistant chunk to the current assistant entry.
+// Unlike appendAssistant it preserves the chunk verbatim (no TrimSpace on the
+// whole message) so code fences and indentation survive incremental delivery;
+// renderTranscript normalizes spacing when it builds the display.
+func (m *tuiModel) appendStream(text string) {
+	if n := len(m.entries); n > 0 && m.entries[n-1].kind == transcriptAssistant {
 		m.entries[n-1].text += text
 		m.entries[n-1].rendered = ""
 	} else {
@@ -258,9 +391,19 @@ func (m *tuiModel) renderTranscript() {
 			entry.rendered = lipgloss.NewStyle().Foreground(inkColor).Render(body) + "\n"
 		case transcriptActivity:
 			entry.rendered = dimStyle.Render(renderAssistantText(text, availableWidth))
+		case transcriptTool:
+			entry.rendered = accentStyle.Render("⚙ ") + boldInkStyle.Render(text)
 		}
 		entry.renderedWidth = availableWidth
 		rendered = append(rendered, entry.rendered)
+	}
+	// Running tool calls are drawn as live animated rows below the settled
+	// transcript — one per in-flight call, each with its dots cycling via the
+	// spinner frames. Parallel calls all show their own working row.
+	for i := range m.runningTools {
+		dots := spinnerFrames[(m.spinnerFrame+i)%len(spinnerFrames)]
+		toolLine := accentStyle.Render("⚙ ") + dimStyle.Render(m.runningTools[i].label) + " " + accentStyle.Render(dots)
+		rendered = append(rendered, toolLine)
 	}
 	m.transcript.SetContent(strings.Join(rendered, "\n"))
 }
@@ -371,12 +514,18 @@ func (m *tuiModel) resize() {
 	if widthChanged {
 		m.transcript.SetWidth(w)
 	}
-	// Reserve the fixed rows outside the viewport: the two-line header, the
-	// separator under it, user label, separator, status bar, and Bubble Tea's
-	// final materialization row. Exact accounting keeps the status on the last row.
-	viewportHeight := max(1, m.height-inputHeight-7)
-	if m.transcript.Height() != viewportHeight {
-		m.transcript.SetHeight(viewportHeight)
+	// The viewport only needs a new height when the composer's visual height
+	// changed (or the terminal resized). Because the width is known and the
+	// font is monospace, the composer height only changes when its content
+	// wraps to a new visual row — not per keystroke — so skip the reflow while
+	// typing otherwise.
+	needsViewportResize := widthChanged || inputHeight != m.lastInputHeight
+	m.lastInputHeight = inputHeight
+	if needsViewportResize {
+		viewportHeight := max(1, m.height-inputHeight-7)
+		if m.transcript.Height() != viewportHeight {
+			m.transcript.SetHeight(viewportHeight)
+		}
 	}
 	if widthChanged {
 		m.renderTranscript()
@@ -414,15 +563,82 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.addEntry(transcriptAssistant, "")
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.cancelTurn = cancel
-	return func() tea.Msg {
-		start := time.Now()
-		out, usage, err := m.kernel.Run(turnCtx, prompt)
-		var grand int64
-		if total, ok := usage.Tokens[m.kernel.SessionID()]; ok {
-			grand = total.Input + total.CacheRead + total.CacheWrite + total.Output
+
+	// Session usage arrives via EventStop (Run's internal hook captured it too);
+	// Stream hands the answer to the writer instead of returning a string, so we
+	// subscribe here for the turn footer's grand-total line.
+	var (
+		mu    sync.Mutex
+		usage toroid.UsagePayload
+	)
+	m.kernel.On(toroid.EventStop, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.UsagePayload); ok {
+			mu.Lock()
+			usage = *p
+			mu.Unlock()
 		}
-		return tuiTurnDoneMsg{answer: out, err: err, elapsed: time.Since(start), grandTotal: grand}
+		return nil
+	})
+	m.kernel.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
+			label := toolCallLabel(p.Name, p.Args, m.cfg.workdir)
+			m.events <- tuiToolMsg{id: p.CallID, label: label}
+		}
+		return nil
+	})
+	m.kernel.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+			m.events <- tuiToolDoneMsg{id: p.CallID}
+		}
+		return nil
+	})
+	m.kernel.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+			m.events <- tuiToolDoneMsg{id: p.CallID, err: p.Error}
+		}
+		return nil
+	})
+
+	return tea.Batch(
+		func() tea.Msg {
+			start := time.Now()
+			err := m.kernel.Stream(turnCtx, prompt, writerFunc(func(p []byte) (int, error) {
+				m.events <- tuiStreamMsg(string(p))
+				return len(p), nil
+			}))
+			var grand int64
+			mu.Lock()
+			if total, ok := usage.Tokens[m.kernel.SessionID()]; ok {
+				grand = total.Input + total.CacheRead + total.CacheWrite + total.Output
+			}
+			mu.Unlock()
+			return tuiTurnDoneMsg{err: err, elapsed: time.Since(start), grandTotal: grand}
+		},
+		spin(),
+	)
+}
+
+// newSession tears down the current kernel and creates a fresh one with a new
+// session id, so /new starts a clean conversation (new transcript, new persisted
+// session, history reset) rather than merely clearing history on the same one.
+func (m *tuiModel) newSession() {
+	if m.cancelTurn != nil {
+		m.cancelTurn()
+		m.cancelTurn = nil
 	}
+	_ = m.kernel.Close()
+	emit := func(s string) { m.events <- tuiOutputMsg(s) }
+	k, err := newKernel(m.ctx, m.cfg, m.apiKey, emit)
+	if err != nil {
+		m.addEntry(transcriptActivity, "new session failed: "+err.Error())
+		return
+	}
+	m.kernel = k
+	m.entries = nil
+	m.transcript.SetContent("")
+	m.busy = false
+	m.runningTools = nil
+	m.addEntry(transcriptActivity, "— new session —")
 }
 
 func (m *tuiModel) command(line string) (tea.Cmd, bool) {
@@ -438,9 +654,12 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 		m.entries = nil
 		m.transcript.SetContent("")
 		return nil, true
-	case "/reset", "/new":
+	case "/reset":
 		m.kernel.History = nil
 		m.addEntry(transcriptActivity, "— started a fresh conversation —")
+		return nil, true
+	case "/new":
+		m.newSession()
 		return nil, true
 	case "/cost":
 		m.addEntry(transcriptActivity, fmt.Sprintf("cost so far: $%.6f", m.kernel.RunningCostUSD()))
@@ -449,7 +668,7 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 		m.addEntry(transcriptActivity, fmt.Sprintf("model: %s · workdir: %s · thinking: %s", m.cfg.model, displayWorkdir(m.cfg.workdir), m.cfg.thinking))
 		return nil, true
 	case "/help", "/?":
-		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /reset /clear /exit")
+		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /new /reset /clear /exit")
 		return nil, true
 	default:
 		m.addEntry(transcriptActivity, fmt.Sprintf("unknown command %q — try /help", line))
@@ -511,6 +730,21 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tuiOutputMsg:
 		m.appendActivity(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
+	case tuiStreamMsg:
+		m.appendStream(string(msg))
+		cmds = append(cmds, waitTUIEvent(m.events))
+	case tuiToolMsg:
+		m.startTool(msg.id, msg.label)
+		cmds = append(cmds, waitTUIEvent(m.events))
+	case tuiToolDoneMsg:
+		m.finishTool(msg.id, msg.err)
+		cmds = append(cmds, waitTUIEvent(m.events))
+	case spinnerTick:
+		if m.busy {
+			m.spinnerFrame++
+			m.renderTranscript() // advance the live tool "…" animation too
+			cmds = append(cmds, spin())
+		}
 	case tuiTurnDoneMsg:
 		m.busy = false
 		m.cancelTurn = nil
@@ -521,9 +755,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addEntry(transcriptActivity, "— turn cancelled —")
 			}
 		} else {
-			m.appendAssistant(msg.answer)
-			// Mark the assistant entry complete and record how long the turn took
-			// so the grey timestamp/duration suffix renders after the answer.
+			// The answer streamed into the assistant entry live; just mark it
+			// complete and record how long the turn took so the grey
+			// timestamp/duration suffix renders after the last chunk.
 			if n := len(m.entries); n > 0 && m.entries[n-1].kind == transcriptAssistant {
 				m.entries[n-1].done = true
 				m.entries[n-1].elapsed = msg.elapsed
@@ -572,7 +806,7 @@ func (m *tuiModel) renderUsageBar() string {
 
 	statusText := dimStyle.Render("ready")
 	if m.busy {
-		statusText = accentStyle.Render("working") + dimStyle.Render("  Esc cancel")
+		statusText = accentStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)] + " working") + dimStyle.Render("  Esc cancel")
 	}
 
 	// Layout: [TOROID model] [path · keys] ... [cost] [progress] [tokens] [status]

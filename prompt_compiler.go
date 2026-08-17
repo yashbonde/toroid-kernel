@@ -75,6 +75,13 @@ Follow this sequence for every file operation:
 3. EXECUTE — use edit for single changes, multiedit for 2+ changes in same file.
 4. VERIFY — read the modified region to confirm.
 
+Parallel tool calls are supported and encouraged when the calls are truly
+independent (no shared file state, no ordering dependency): emit them together
+in one assistant message so they run concurrently. Emit sequentially when one
+call depends on another's result, or when several calls mutate the same file
+(write/edit/multiedit) — mutating calls are serialized by the runtime, so a
+later edit can never assume an earlier one has landed if their order matters.
+
 Search protocol:
 - Use bash with rg/grep for code search (not read).
 - One search per distinct question. Stop when you have the answer.

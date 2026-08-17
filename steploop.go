@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/yashbonde/toroid-kernel/llm"
 )
@@ -343,14 +344,36 @@ func marshalMessages(msgs []llm.Message) json.RawMessage {
 // runToolCalls executes each tool call via the registry, firing pre/post events,
 // and returns a tool-role message with the results plus a signature of
 // (name, input, result) pairs for the loop guard.
+//
+// When a model replies with several tool calls in one assistant message they
+// are executed concurrently, but not blindly: calls that mutate shared
+// filesystem state (write/edit/multiedit) are isolated from the parallel wave
+// so a dependent read or a test run never sees a half-written file.
+//
+// Execution order within a batch:
+//   - Announced: every PreToolUse fires up front, in input order.
+//   - Mutating calls run strictly sequentially (one at a time, in input order).
+//   - Read-only calls run in parallel goroutines after the mutators, and
+//     overlap with each other.
+//   - Results are reassembled in the caller's original order and each call's
+//     completion event fires, so the tool-role message and the loop-guard
+//     signature stay deterministic no matter the interleaving.
 func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.ToolCallPart) (llm.Message, string) {
-	var parts []llm.Part
-	var sig string
+	// Announce every call before any of them start, in input order, so
+	// consumers see the full batch begin as a unit.
 	for _, call := range calls {
 		_ = k.Fire(ctx, string(EventPreToolUse), &ToolUsePayload{
 			CallID: call.ID, Name: call.Name, Args: call.Arguments,
 		})
+	}
 
+	type result struct {
+		resultText string
+		files      []llm.FilePart
+	}
+	results := make([]result, len(calls))
+
+	execute := func(i int, call llm.ToolCallPart) {
 		var resultText string
 		var files []llm.FilePart
 		tool, ok := k.Tools.Lookup(call.Name)
@@ -373,6 +396,40 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 			files = nil
 			resultText += " [media omitted: model does not accept image input]"
 		}
+		results[i] = result{resultText: resultText, files: files}
+	}
+
+	// Separate mutating calls so they run first and strictly sequentially —
+	// a paired read or go test in the same batch must observe the finished edit.
+	var mutating, readonly []int
+	for i, call := range calls {
+		if mutatingTool(call.Name) {
+			mutating = append(mutating, i)
+		} else {
+			readonly = append(readonly, i)
+		}
+	}
+	for _, i := range mutating {
+		execute(i, calls[i])
+	}
+
+	var wg sync.WaitGroup
+	for _, i := range readonly {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			execute(i, calls[i])
+		}(i)
+	}
+	wg.Wait()
+
+	// Reassemble results in the original call order and fire each call's
+	// completion event.
+	var parts []llm.Part
+	var sig string
+	for i, call := range calls {
+		resultText := results[i].resultText
+		files := results[i].files
 
 		parts = append(parts, llm.ToolResultPart{
 			ToolCallID: call.ID,
@@ -398,6 +455,17 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 		sig += strconv.FormatUint(h.Sum64(), 16) + "\n"
 	}
 	return llm.Message{Role: llm.RoleTool, Parts: parts}, sig
+}
+
+// mutatingTool reports whether a tool name mutates shared filesystem state.
+// These are run sequentially (never concurrently) so a batch's dependent reads
+// and validation see deterministic file state.
+func mutatingTool(name string) bool {
+	switch name {
+	case "write", "edit", "multiedit":
+		return true
+	}
+	return false
 }
 
 // allEqual reports whether the last n entries of sigs are all identical and

@@ -16,7 +16,8 @@
 //	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 100)
 //	env  TOROID_TRIM       max chars per tool arg/result line (default 120)
 //	flag --model           override TOROID_MODEL  (default "")
-//	flag --save            persist events/costs to the SQLite store (default off)
+//	flag --save            persist events/costs to the SQLite store (default on)
+//	flag --no-save         disable persistence
 //	flag --thinking        none | low | high      (default low)
 //	flag --no-colour       disable all ANSI styling (default off)
 //	flag --context-size    total context window size (0 = use kernel default)
@@ -29,7 +30,7 @@
 //	export TOROID_LLM_TOKEN=your_api_key
 //	go run ./examples/cli --model openai/gpt-4o --thinking high --save
 //
-// In-REPL commands: /help /cost /model /reset /clear /exit  (or Ctrl-D to quit).
+// In-REPL commands: /help /cost /model /new /reset /clear /exit  (or Ctrl-D to quit).
 package main
 
 import (
@@ -85,7 +86,7 @@ type config struct {
 }
 
 // loadConfig reads env vars (model/token/iter/trim) and parses the flags
-// (--model, --save, --thinking, --no-colour, --run, --plain, --tokens). It
+// (--model, --save, --no-save, --thinking, --no-colour, --run, --plain, --tokens). It
 // returns the config plus the resolved API key. Flags win for the per-run
 // toggles; env wins for the targeting knobs.
 //
@@ -95,7 +96,8 @@ type config struct {
 // --model before Parse.
 func loadConfig() (config, string) {
 	model := flag.String("model", "", "override TOROID_MODEL (provider/model)")
-	save := flag.Bool("save", false, "persist events, costs and metadata to the SQLite store")
+	save := flag.Bool("save", true, "persist events, costs and metadata to the SQLite store")
+	noSave := flag.Bool("no-save", false, "disable persistence (overrides --save)")
 	thinking := flag.String("thinking", "low", "thinking budget: none | low | high")
 	noColour := flag.Bool("no-colour", false, "disable ANSI colour/styling")
 	run := flag.String("run", "", "one-shot: run this prompt, emit NDJSON events, and exit (non-interactive)")
@@ -148,7 +150,7 @@ func loadConfig() (config, string) {
 		model:    modelStr,
 		workdir:  absWd,
 		thinking: toroid.Thinking(*thinking),
-		save:     *save,
+		save:     *save && !*noSave,
 		trim:     120,
 		run:      strings.TrimSpace(*run),
 		plain:    *plain,
@@ -194,6 +196,21 @@ func termWidth() int {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "models" {
+		if err := runModels(context.Background(), os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "trk models:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "sessions" {
+		if err := runSessions(context.Background(), os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "trk sessions:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	// apiKey may be empty: NewKernel resolves the key per provider prefix
 	// (LLM_GATEWAY_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY); TOROID_LLM_TOKEN
 	// is an explicit override.
@@ -244,40 +261,10 @@ func newKernel(ctx context.Context, cfg *config, apiKey string, emit func(string
 		emit = func(s string) { fmt.Print(s) }
 	}
 
-	// Tool calls show the operation and meaningful target. Width-dependent
-	// wrapping belongs to the TUI renderer, not this formatter.
-	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
-			if reasoningActive && reasoningNeedsNewline {
-				emit("\n")
-				reasoningNeedsNewline = false
-			}
-			emit(renderToolCall(p.Name, p.Args, cfg.workdir, termWidth()))
-		}
-		return nil
-	})
-	// The matching bottom edge of the call box: shape/status instead of leaking
-	// an arbitrary first output line followed by a synthetic truncation marker.
-	k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			if reasoningActive && reasoningNeedsNewline {
-				emit("\n")
-				reasoningNeedsNewline = false
-			}
-			emit(toolResultLine(p.Result))
-		}
-		return nil
-	})
-	k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			if reasoningActive && reasoningNeedsNewline {
-				emit("\n")
-				reasoningNeedsNewline = false
-			}
-			emit(toolErrorLine(p.Error))
-		}
-		return nil
-	})
+	// Tool activity is rendered by the consuming front-end (the TUI animates a
+	// live "… working" line; --run's one-shot prints box art via
+	// renderToolCall/toolResultLine) rather than via this shared emit path, so
+	// it is wired up at the call site instead of here.
 	k.On(toroid.EventReasoning, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ReasoningPayload); ok {
 			if !reasoningActive {
@@ -339,6 +326,18 @@ func ask(ctx context.Context, k *toroid.Kernel, cfg config, prompt string) {
 // The header shows the operation and its meaningful target; its matching
 // bottom edge (toolResultLine / toolErrorLine) reports shape/status. The
 // whole thing is width-bounded so a chatty tool never eats the screen.
+// toolCallLabel renders a tool call as a single, width-bounded display line
+// ("bash  git ls-files | wc -l") without any box art. The TUI uses it for its
+// live animated tool rows; renderToolCall/toolResultLine keep the box form for
+// the print-only --run path.
+func toolCallLabel(name, args, workDir string) string {
+	summary := toolCallArgSummary(name, args, workDir)
+	if summary == "" {
+		return name
+	}
+	return name + "  " + summary
+}
+
 func renderToolCall(name, args, workDir string, width int) string {
 	summary := toolCallArgSummary(name, args, workDir)
 	// Leave room for the box decorations and the separating space.
@@ -585,7 +584,7 @@ input:
   Ctrl-D           exit (empty input)
 
 config via env:   TOROID_MODEL, TOROID_LLM_TOKEN, TOROID_MAX_ITER, TOROID_TRIM
-config via flags: --model, --save, --thinking (none|low|high), --no-colour
+config via flags: --model, --save, --no-save, --thinking (none|low|high), --no-colour
                   --context-size, --compact-buffer, --max-iter, --max-repeat-calls,
                   --smaller-model, --max-spend
 ` + aReset)

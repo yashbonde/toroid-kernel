@@ -57,6 +57,7 @@ Choose one provider:
 # LiteLLM gateway
 export LLM_GATEWAY_BASE_URL=https://gateway.example.com/v1
 export LLM_GATEWAY_KEY=your_gateway_key
+./trk models
 ./trk --model llmgateway/claude-haiku-4-5
 
 # OpenAI direct
