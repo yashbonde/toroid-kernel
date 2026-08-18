@@ -1,9 +1,8 @@
 package llm
 
 // Usage is the token accounting for one llm-step, as reported by the gateway.
-// It holds token counts only — dollar cost is computed a layer up (toroid's
-// pricing table) or taken from the gateway's authoritative cost header, so this
-// package stays free of any pricing policy.
+// It holds token counts only — dollar cost is computed a layer up from the
+// model catalog, so this package stays free of any pricing policy.
 type Usage struct {
 	Input      int64 // fresh (non-cached) prompt tokens
 	Output     int64 // completion tokens (includes Reasoning)

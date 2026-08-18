@@ -376,11 +376,6 @@ func (k *Kernel) fireGuard(ctx context.Context, metadata llm.RequestMetadata, na
 // returns the running total, so the caller can fold it into TurnCompleted's
 // payload instead of this firing its own event.
 func (k *Kernel) recordUsage(u Usage) float64 {
-	// if !u.PricingOK {
-	// 	// The gateway did not report a cost for this step (streamed, or header
-	// 	// missing) — make the unbilled step visible instead of silently $0.
-	// 	k.Logf("llm-step recorded with unknown cost (no gateway cost header)")
-	// }
 	runningCost := k.UpdateUse(u, "")
 	if k.Store != nil {
 		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, runningCost)
@@ -827,8 +822,8 @@ func (k *Kernel) Compact(ctx context.Context) error {
 		return err
 	}
 
-	// Summarization is one llm-step on the cost-sensitive model, billed like any
-	// other (and preferring the gateway cost header on non-stream). Cross-model
+	// Summarization is one llm-step on the cost-sensitive model, billed from the
+	// model catalog like any other. Cross-model
 	// handoff (M9): when the compact model differs from the main chat model,
 	// adapt history for the target's wire API — a no-op while all in-scope
 	// models share openai-completions.

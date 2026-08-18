@@ -24,7 +24,7 @@ type FauxStep struct {
 }
 
 // FauxReply scripts one assistant message plus its fake usage and stop reason.
-// Cost stands in for the gateway-reported per-call cost.
+// Cost is the per-call cost.
 type FauxReply struct {
 	Text       string
 	ToolCalls  []FauxToolCall // when set, the assistant content includes these tool calls

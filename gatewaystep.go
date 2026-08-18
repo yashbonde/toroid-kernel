@@ -14,8 +14,7 @@ import (
 // onto a single wire call via an in-repo llm client — the OpenAI-compatible
 // Client (LiteLLM gateway, OpenAI direct) or the native AnthropicClient. No
 // third-party model SDK. The kernel keeps owning tools, turns, and compaction;
-// GatewayStep performs the one call and prices it (gateway cost header when
-// present, catalog rates otherwise).
+// GatewayStep performs the one call and prices it from the model's catalog rates.
 type GatewayStep struct {
 	Client llm.Chat
 }
@@ -49,11 +48,10 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 	return req
 }
 
-// usageFrom copies the wire token counts and prices the step: the gateway's
-// reported cost wins when present (non-stream via LiteLLM); otherwise the
-// catalog's cached per-token rates price it (direct provider routes,
-// streaming). With neither, cost stays honestly unknown.
-func usageFrom(model Model, wire llm.Usage, gatewayCost *float64) Usage {
+// usageFrom copies the wire token counts and prices the step from the model's
+// cached per-token rates. When the model has no price entry, cost stays honestly
+// unknown (PricingOK is false).
+func usageFrom(model Model, wire llm.Usage) Usage {
 	u := Usage{
 		Input:      wire.Input,
 		Output:     wire.Output,
@@ -61,11 +59,7 @@ func usageFrom(model Model, wire llm.Usage, gatewayCost *float64) Usage {
 		CacheRead:  wire.CacheRead,
 		CacheWrite: wire.CacheWrite,
 	}
-	switch {
-	case gatewayCost != nil:
-		u.Cost = *gatewayCost
-		u.PricingOK = true
-	case model.Price != nil:
+	if model.Price != nil {
 		p := model.Price
 		u.Cost = float64(u.Input)*p.In + float64(u.Output)*p.Out +
 			float64(u.CacheRead)*p.CacheRead + float64(u.CacheWrite)*p.CacheWrite
@@ -82,7 +76,7 @@ func (s *GatewayStep) Complete(ctx context.Context, model Model, c Context, opts
 	}
 	return &AssistantMessage{
 		Content:    resp.Content,
-		Usage:      usageFrom(model, resp.Usage, resp.GatewayCostUSD),
+		Usage:      usageFrom(model, resp.Usage),
 		StopReason: stopReasonFromFinish(resp.FinishReason),
 	}, nil
 }
@@ -129,7 +123,7 @@ func (s *GatewayStep) CompleteObject(ctx context.Context, model Model, c Context
 	return &ObjectResult{
 		Object:     obj,
 		RawText:    raw,
-		Usage:      usageFrom(model, resp.Usage, resp.GatewayCostUSD),
+		Usage:      usageFrom(model, resp.Usage),
 		StopReason: stopReasonFromFinish(resp.FinishReason),
 	}, nil
 }
@@ -137,8 +131,7 @@ func (s *GatewayStep) CompleteObject(ctx context.Context, model Model, c Context
 // Stream runs one streaming llm-step. It forwards text/reasoning deltas on the
 // returned channel and assembles the final assistant message. If ctx is
 // cancelled mid-step the partial content is preserved and StopReason is
-// "aborted" so the caller can keep or continue it. Streaming responses carry
-// no gateway cost header, so Usage has tokens only.
+// "aborted" so the caller can keep or continue it.
 func (s *GatewayStep) Stream(ctx context.Context, model Model, c Context, opts StepOptions) (*StreamResult, error) {
 	stream, err := s.Client.StreamComplete(ctx, buildRequest(model, c, opts))
 	if err != nil {
@@ -165,7 +158,7 @@ func (s *GatewayStep) Stream(ctx context.Context, model Model, c Context, opts S
 		var u Usage
 		reason := StopReasonOther
 		if resp != nil {
-			u = usageFrom(model, resp.Usage, nil)
+			u = usageFrom(model, resp.Usage)
 			reason = stopReasonFromFinish(resp.FinishReason)
 		}
 		if errors.Is(err, context.Canceled) || (err == nil && ctx.Err() != nil) {

@@ -554,6 +554,9 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 		printModelExtras(cfg)
 	case "/help", "/?":
 		printHelp()
+	case "/delegate":
+		// Handled at the input loop before handleCommand; provide a fallback help.
+		fmt.Println(aGreen + "Type /delegate <task> to dispatch a task to another agent" + aReset)
 	default:
 		fmt.Printf("%sunknown command %q — try /help%s\n", aRed, line, aReset)
 	}
@@ -574,6 +577,7 @@ func printHelp() {
   /model       show active model & config
   /reset       start a fresh session (clears history)
   /clear       clear the screen
+  /delegate    dispatch a task to another agent (Slack, Codex, or trk)
   /exit        quit (or Ctrl-D)
 
 input:
@@ -653,6 +657,17 @@ func runLineMode(ctx context.Context, k *toroid.Kernel, cfg config) {
 		}
 
 		if strings.HasPrefix(line, "/") {
+			if strings.HasPrefix(line, "/delegate") {
+				line = strings.TrimSpace(strings.TrimPrefix(line, "/delegate"))
+				fmt.Printf("%s🛟 delegate identified%s\n", aGreen, aReset)
+				out, err := delegate(k, line)
+				if err != nil {
+					fmt.Printf("%sdelegation error: %v%s\n", aRed, err, aReset)
+				} else {
+					fmt.Println(out)
+				}
+				continue
+			}
 			quit, reset := handleCommand(line, k, cfg)
 			if quit {
 				break
@@ -816,6 +831,17 @@ func runCBreakMode(ctx context.Context, k *toroid.Kernel, cfg config, fd int) {
 				promptPrinted = false
 
 				if strings.HasPrefix(line, "/") {
+					if strings.HasPrefix(line, "/delegate") {
+						line = strings.TrimSpace(strings.TrimPrefix(line, "/delegate"))
+						fmt.Printf("%s🛟 delegate identified%s\n", aGreen, aReset)
+						out, err := delegate(k, line)
+						if err != nil {
+							fmt.Printf("%sdelegation error: %v%s\n", aRed, err, aReset)
+						} else {
+							fmt.Println(out)
+						}
+						continue
+					}
 					quit, reset := handleCommand(line, k, cfg)
 					if quit {
 						return

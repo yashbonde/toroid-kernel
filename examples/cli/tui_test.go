@@ -221,8 +221,8 @@ func TestToolLifecycleShowsLiveAndCommittedRows(t *testing.T) {
 	m.resize()
 	m.busy = true
 
-	m.startTool("id1", "read  foo.go")
-	m.startTool("id2", "bash  ls")
+	m.startTool("id1", "read  foo.go", 1)
+	m.startTool("id2", "bash  ls", 2)
 	m.spinnerFrame = 0
 	live := ansi.Strip(m.transcript.View())
 	// Both concurrent tools should show a live working row at once.

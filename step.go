@@ -62,7 +62,7 @@ type Context struct {
 }
 
 // AssistantMessage is the result of one non-streaming llm-step: the assistant
-// content, its Usage (tokens + gateway-reported cost), and why it stopped.
+// content, its Usage (tokens + cost), and why it stopped.
 type AssistantMessage struct {
 	Content    []llm.Part
 	Usage      Usage

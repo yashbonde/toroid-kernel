@@ -31,10 +31,19 @@ type tuiStreamMsg string
 // tuiToolMsg announces a tool call that has just started. id is the stable
 // tool_call_id from the LLM (links the Pre and Post events); label is the
 // single-row display text (operation + trimmed target) shown with an animated
-// "…" while it runs.
+// "…" while it runs. num is the monotonic call number within the turn.
 type tuiToolMsg struct {
 	id    string
 	label string
+	num   int
+}
+
+// tuiSubagentMsg announces a subagent start or stop.
+type tuiSubagentMsg struct {
+	id     string // session ID
+	prompt string
+	start  bool // true = start, false = stop
+	async  bool
 }
 
 // tuiToolDoneMsg marks a running tool (by id) as finished. A non-empty err
@@ -85,6 +94,10 @@ type transcriptEntry struct {
 	ts            time.Time
 	done          bool
 	elapsed       time.Duration
+	// num is the tool call number for transcriptTool rows (0 for non-tool
+	// entries such as subagents) so the number stays visible once a tool's
+	// live row is committed on finish.
+	num int
 }
 
 type tuiModel struct {
@@ -108,6 +121,12 @@ type tuiModel struct {
 	// animates with the spinner. A tool is removed (and committed to the
 	// transcript) when its matching done event arrives.
 	runningTools []runningTool
+	// runningSubagents tracks in-flight async subagents (sessionID -> start time)
+	// so their running indicators show elapsed time with a blue icon.
+	runningSubagents map[string]time.Time
+	// toolCallSeq is the monotonic counter for tool calls within the current
+	// turn, reset to 0 on each new turn.
+	toolCallSeq int
 	// lastInputHeight is the composer's visual row count from the previous
 	// layout pass. With a known terminal width and a monospace font the
 	// composer only needs a new height when its content wraps to a new visual
@@ -120,9 +139,11 @@ var (
 	inputColor   = lipgloss.Color("#FFFFFF")
 	userColor    = lipgloss.Color("#ECFDF3")
 	inkColor     = lipgloss.Color("#18212F")
+	blueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
 	accentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
 	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
 	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
+	errorBoldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156")).Bold(true)
 	boldInkStyle = lipgloss.NewStyle().Foreground(inkColor).Bold(true)
 )
 
@@ -216,28 +237,49 @@ const maxToolLabelWidth = 50
 type runningTool struct {
 	id    string
 	label string
+	num   int       // monotonic call number, e.g. 1, 2, 3
+	start time.Time // when the running animation started
 }
 
 // startTool records a tool call that just began so renderTranscript can draw it
-// as a live "<call> …" line with the spinner animating the dots. The label is
-// clipped to a single row so the working indicator stays compact. Multiple
-// calls can be in flight at once (parallel tool execution); each is tracked by
-// its stable call id so the right row is committed when it finishes.
-func (m *tuiModel) startTool(id, label string) {
+// as a live "<num> <call> …" line with the spinner animating the dots. num is
+// the monotonic call counter since the turn started.
+func (m *tuiModel) startTool(id, label string, num int) {
 	label = clipToolLabel(label)
 	for i := range m.runningTools {
 		if m.runningTools[i].id == id {
 			m.runningTools[i].label = label
+			m.runningTools[i].num = num
 			m.renderTranscript()
 			m.transcript.GotoBottom()
 			return
 		}
 	}
-	m.runningTools = append(m.runningTools, runningTool{id: id, label: label})
+	m.runningTools = append(m.runningTools, runningTool{id: id, label: label, num: num, start: time.Now()})
 	m.renderTranscript()
 	m.transcript.GotoBottom()
 }
 
+// startSubagent tracks an async subagent start so it renders as a blue
+// animated row with elapsed time.
+func (m *tuiModel) startSubagent(id, prompt string) {
+	if m.runningSubagents == nil {
+		m.runningSubagents = make(map[string]time.Time)
+	}
+	m.runningSubagents[id] = time.Now()
+	// Commit a permanent entry so the start time anchor is visible.
+	label := accentStyle.Render("⚡ ") + boldInkStyle.Render("subagent "+compactToolText(prompt, 60))
+	m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, ts: time.Now()})
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
+
+// stopSubagent removes the async subagent from the running set.
+func (m *tuiModel) stopSubagent(id string) {
+	delete(m.runningSubagents, id)
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
 // clipToolLabel keeps only the first maxToolLabelWidth runes of a tool label,
 // replacing anything cut with an ellipsis so the shape stays on one row.
 func clipToolLabel(label string) string {
@@ -268,8 +310,9 @@ func (m *tuiModel) finishTool(id, errText string) {
 	if errText != "" {
 		label = label + " ⨯ " + compactToolText(errText, 120)
 	}
+	num := m.runningTools[idx].num
 	m.runningTools = append(m.runningTools[:idx], m.runningTools[idx+1:]...)
-	m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, ts: time.Now()})
+	m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, num: num, ts: time.Now()})
 	m.renderTranscript()
 	m.transcript.GotoBottom()
 }
@@ -392,17 +435,35 @@ func (m *tuiModel) renderTranscript() {
 		case transcriptActivity:
 			entry.rendered = dimStyle.Render(renderAssistantText(text, availableWidth))
 		case transcriptTool:
-			entry.rendered = accentStyle.Render("⚙ ") + boldInkStyle.Render(text)
+			numPrefix := ""
+			if entry.num > 0 {
+				numPrefix = dimStyle.Render(fmt.Sprintf("%d ", entry.num))
+			}
+			if idx := strings.Index(text, " ⨯ "); idx >= 0 {
+				entry.rendered = numPrefix + accentStyle.Render("⚙ ") + errorBoldStyle.Render(text[:idx]) + boldInkStyle.Render(text[idx:])
+			} else {
+				entry.rendered = numPrefix + accentStyle.Render("⚙ ") + boldInkStyle.Render(text)
+			}
 		}
 		entry.renderedWidth = availableWidth
 		rendered = append(rendered, entry.rendered)
 	}
 	// Running tool calls are drawn as live animated rows below the settled
 	// transcript — one per in-flight call, each with its dots cycling via the
-	// spinner frames. Parallel calls all show their own working row.
+	// spinner frames. Parallel calls all show their own working row. The
+	// monotonic call number is shown as a left-aligned prefix.
 	for i := range m.runningTools {
 		dots := spinnerFrames[(m.spinnerFrame+i)%len(spinnerFrames)]
-		toolLine := accentStyle.Render("⚙ ") + dimStyle.Render(m.runningTools[i].label) + " " + accentStyle.Render(dots)
+		elapsed := dimStyle.Render(" · " + formatDuration(time.Since(m.runningTools[i].start)))
+		numPrefix := dimStyle.Render(fmt.Sprintf("%d ", m.runningTools[i].num))
+		toolLine := numPrefix + accentStyle.Render("⚙ ") + dimStyle.Render(m.runningTools[i].label) + " " + accentStyle.Render(dots) + elapsed
+		rendered = append(rendered, toolLine)
+	}
+	// Running async subagents draw as blue animated rows with elapsed time.
+	for id, start := range m.runningSubagents {
+		dots := spinnerFrames[(m.spinnerFrame+len(m.runningTools))%len(spinnerFrames)]
+		elapsed := dimStyle.Render(" · " + formatDuration(time.Since(start)))
+		toolLine := blueStyle.Render("⚡ ") + dimStyle.Render("subagent "+id[:12]+"…") + " " + blueStyle.Render(dots) + elapsed
 		rendered = append(rendered, toolLine)
 	}
 	m.transcript.SetContent(strings.Join(rendered, "\n"))
@@ -555,8 +616,16 @@ func paintInputSurface(content string, width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
+// tuiDelegationDoneMsg marks a /delegate task as finished.
+type tuiDelegationDoneMsg struct {
+	result  string
+	err     error
+	elapsed time.Duration
+}
+
 func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.busy = true
+	m.toolCallSeq = 0
 	m.input.Reset()
 	m.addEntry(transcriptUser, prompt)
 	// Place the assistant header before any tool activity streams in.
@@ -581,8 +650,9 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	})
 	m.kernel.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
+			m.toolCallSeq++
 			label := toolCallLabel(p.Name, p.Args, m.cfg.workdir)
-			m.events <- tuiToolMsg{id: p.CallID, label: label}
+			m.events <- tuiToolMsg{id: p.CallID, label: label, num: m.toolCallSeq}
 		}
 		return nil
 	})
@@ -595,6 +665,18 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.kernel.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
 			m.events <- tuiToolDoneMsg{id: p.CallID, err: p.Error}
+		}
+		return nil
+	})
+	m.kernel.On(toroid.EventSubagentStart, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
+			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: true, async: true}
+		}
+		return nil
+	})
+	m.kernel.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
+			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: false, async: true}
 		}
 		return nil
 	})
@@ -616,6 +698,20 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 		},
 		spin(),
 	)
+}
+
+// delegate runs a /delegate task synchronously in the TUI and returns a done
+// message carrying the human-readable summary. It records the task under
+// TOROID_HOME like the non-interactive path.
+func (m *tuiModel) delegate(prompt string) tea.Cmd {
+	m.busy = true
+	m.addEntry(transcriptUser, "/delegate "+prompt)
+	m.addEntry(transcriptAssistant, "")
+	return func() tea.Msg {
+		start := time.Now()
+		out, err := delegate(m.kernel, prompt)
+		return tuiDelegationDoneMsg{result: out, err: err, elapsed: time.Since(start)}
+	}
 }
 
 // newSession tears down the current kernel and creates a fresh one with a new
@@ -667,8 +763,11 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 	case "/model":
 		m.addEntry(transcriptActivity, fmt.Sprintf("model: %s · workdir: %s · thinking: %s", m.cfg.model, displayWorkdir(m.cfg.workdir), m.cfg.thinking))
 		return nil, true
+	case "/delegate":
+		m.addEntry(transcriptActivity, "Type /delegate <task> to dispatch a task to another agent")
+		return nil, true
 	case "/help", "/?":
-		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /new /reset /clear /exit")
+		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /new /reset /clear /exit /delegate")
 		return nil, true
 	default:
 		m.addEntry(transcriptActivity, fmt.Sprintf("unknown command %q — try /help", line))
@@ -699,8 +798,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "esc":
 			if m.busy && m.cancelTurn != nil {
 				m.cancelTurn()
+				return m, nil
 			}
-			return m, nil
+			if !m.busy && strings.TrimSpace(m.input.Value()) != "" {
+				m.input.Reset()
+				return m, nil
+			}
+			// Otherwise let the textarea handle Esc (cursor movement, etc.).
 		case "ctrl+d":
 			if !m.busy && strings.TrimSpace(m.input.Value()) == "" {
 				m.cancel()
@@ -713,6 +817,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			prompt := strings.TrimSpace(m.input.Value())
 			if prompt == "" {
 				return m, nil
+			}
+			if strings.HasPrefix(prompt, "/delegate") {
+				m.input.Reset()
+				prompt = strings.TrimSpace(strings.TrimPrefix(prompt, "/delegate"))
+				m.addEntry(transcriptActivity, aGreen+"🛟 delegate identified"+aReset)
+				return m, m.delegate(prompt)
 			}
 			if strings.HasPrefix(prompt, "/") {
 				m.input.Reset()
@@ -734,16 +844,37 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendStream(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiToolMsg:
-		m.startTool(msg.id, msg.label)
+		m.startTool(msg.id, msg.label, msg.num)
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiToolDoneMsg:
 		m.finishTool(msg.id, msg.err)
+		cmds = append(cmds, waitTUIEvent(m.events))
+	case tuiSubagentMsg:
+		if msg.start {
+			m.startSubagent(msg.id, msg.prompt)
+		} else {
+			m.stopSubagent(msg.id)
+		}
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case spinnerTick:
 		if m.busy {
 			m.spinnerFrame++
 			m.renderTranscript() // advance the live tool "…" animation too
 			cmds = append(cmds, spin())
+		}
+	case tuiDelegationDoneMsg:
+		m.busy = false
+		if msg.err != nil {
+			m.addEntry(transcriptActivity, "delegation error: "+msg.err.Error())
+		} else {
+			m.appendAssistant(msg.result)
+			if n := len(m.entries); n > 0 && m.entries[n-1].kind == transcriptAssistant {
+				m.entries[n-1].done = true
+				m.entries[n-1].elapsed = msg.elapsed
+				m.entries[n-1].ts = time.Now()
+				m.renderTranscript()
+				m.transcript.GotoBottom()
+			}
 		}
 	case tuiTurnDoneMsg:
 		m.busy = false
@@ -798,11 +929,27 @@ func (m *tuiModel) renderUsageBar() string {
 	// USD with 2 decimal places.
 	costStr := fmt.Sprintf("$%.2f", cost)
 
-	// Tokens: used / total (in k if large).
-	tokStr := fmt.Sprintf("%dk/%dk", used/1000, total/1000)
-	if used < 1000 || total < 1000 {
-		tokStr = fmt.Sprintf("%d/%d", used, total)
+	// compactNum turns a raw token count into a short human label: 350, 1.2k,
+	// 47k, 1.2M, 350M. One decimal is used only in the 1.0k–9.9k and 1.0M–9.9M
+	// ranges; otherwise integer kilo/mega with the suffix.
+	compact := func(n int) string {
+		switch {
+		case n < 1000:
+			return fmt.Sprintf("%d", n)
+		case n < 10_000:
+			v := float64(n) / 1000
+			return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", v), "0"), ".") + "k"
+		case n < 1_000_000:
+			return fmt.Sprintf("%dk", n/1000)
+		case n < 10_000_000:
+			v := float64(n) / 1_000_000
+			return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.1f", v), "0"), ".") + "M"
+		default:
+			return fmt.Sprintf("%dM", n/1_000_000)
+		}
 	}
+
+	tokStr := compact(used) + "/" + compact(total)
 
 	statusText := dimStyle.Render("ready")
 	if m.busy {

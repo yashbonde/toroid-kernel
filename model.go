@@ -4,8 +4,7 @@ import "strings"
 
 // Model is a catalog row describing one runnable model: how to reach it
 // (provider + wire api) and its capabilities (context window, input
-// modalities, reasoning). Dollar cost is NOT part of the catalog — the gateway
-// reports authoritative cost per call (see Usage).
+// modalities, reasoning). Dollar cost is computed from Model.Price.
 type Model struct {
 	// ID is the full model id as the host uses it, e.g. "llmgateway/kimi-k2p6".
 	ID string
@@ -54,9 +53,7 @@ const (
 	InputImage = "image"
 )
 
-// ModelPrice is USD per token for one model family. Used ONLY as a fallback
-// when the gateway does not report an authoritative per-call cost (direct
-// openai/ and anthropic/ routes, and streaming). Rates are cached in code
+// ModelPrice is USD per token for one model family. Rates are cached in code
 // because neither provider exposes pricing via API.
 type ModelPrice struct {
 	In         float64
@@ -136,9 +133,8 @@ var modelMetaFamilies = []struct {
 	{"deepseek", modelMeta{contextWindow: 128_000, reasoning: true}},
 	{"qwen", modelMeta{contextWindow: 128_000}},
 	{"minimax", modelMeta{contextWindow: 200_000, reasoning: true}},
-	// NVIDIA Nemotron (free tier via gateway) — 128K context, text-only.
-	// The :free suffix indicates zero cost; pricing is zero so PricingOK = true
-	// even when the gateway omits the cost header.
+	// NVIDIA Nemotron (free tier) — 128K context, text-only.
+	// The :free suffix indicates zero cost; pricing is zero so PricingOK = true.
 	{"nemotron", modelMeta{contextWindow: 128_000,
 		price: &ModelPrice{In: 0, Out: 0, CacheRead: 0, CacheWrite: 0}}},
 }

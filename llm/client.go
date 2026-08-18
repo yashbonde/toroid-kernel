@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -88,11 +87,10 @@ type Request struct {
 
 // Response is one non-streaming llm-step result.
 type Response struct {
-	Content        []Part
-	FinishReason   FinishReason
-	Usage          Usage
-	GatewayCostUSD *float64 // x-litellm-response-cost when present (non-stream)
-	CallID         string   // x-litellm-call-id
+	Content      []Part
+	FinishReason FinishReason
+	Usage        Usage
+	CallID       string // x-litellm-call-id
 }
 
 // Text returns the assistant text of the response.
@@ -101,9 +99,7 @@ func (r *Response) Text() string { return TextOf(r.Content) }
 // ToolCalls returns the tool calls in the response.
 func (r *Response) ToolCalls() []ToolCallPart { return ToolCallsOf(r.Content) }
 
-// Complete performs one non-streaming chat completion. Because the gateway
-// returns x-litellm-response-cost on non-streaming responses, this path carries
-// the gateway's authoritative dollar cost.
+// Complete performs one non-streaming chat completion.
 func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	body, err := c.buildBody(req, false)
 	if err != nil {
@@ -135,11 +131,6 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		resp.Content = ch.Message.toParts()
 		resp.FinishReason = normalizeFinishReason(ch.FinishReason)
 	}
-	if v := httpResp.Header.Get("x-litellm-response-cost"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			resp.GatewayCostUSD = &f
-		}
-	}
 	return resp, nil
 }
 
@@ -160,8 +151,7 @@ type Stream struct {
 }
 
 // StreamComplete performs one streaming chat completion over SSE. Usage arrives
-// in the final chunk (stream_options.include_usage); the gateway cost header is
-// not available on streaming responses, so cost stays a local concern upstream.
+// in the final chunk (stream_options.include_usage).
 func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, error) {
 	body, err := c.buildBody(req, true)
 	if err != nil {

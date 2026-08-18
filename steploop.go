@@ -23,8 +23,8 @@ import (
 // boundaries, mid-turn compaction under context pressure, tool events, and
 // per-turn cost.
 //
-// Turns use Step.Complete (non-streaming) so every llm-step can carry the
-// gateway's authoritative cost header: the assistant text is written after each
+// Turns use Step.Complete (non-streaming) so every llm-step carries cost via
+// the model catalog rates: the assistant text is written after each
 // turn rather than token-by-token; reasoning content is emitted as one
 // EventReasoning per turn.
 func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget) error {
