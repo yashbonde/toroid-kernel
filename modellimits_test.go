@@ -53,6 +53,22 @@ func TestApplyModelLimits(t *testing.T) {
 		}
 	})
 
+	t.Run("context_length is honoured when max_input_tokens is absent", func(t *testing.T) {
+		cfg := Config{}
+		applyModelLimits(&cfg, modelLimits{ContextLength: 200000})
+		if cfg.TotalContextSize != 200000 {
+			t.Fatalf("got context=%d, want 200000 from context_length", cfg.TotalContextSize)
+		}
+	})
+
+	t.Run("max_input_tokens wins over context_length", func(t *testing.T) {
+		cfg := Config{}
+		applyModelLimits(&cfg, modelLimits{MaxInputTokens: 131072, ContextLength: 200000})
+		if cfg.TotalContextSize != 131072 {
+			t.Fatalf("got context=%d, want 131072 (max_input_tokens)", cfg.TotalContextSize)
+		}
+	})
+
 	t.Run("max_tokens spelling is accepted for the output ceiling", func(t *testing.T) {
 		cfg := Config{}
 		applyModelLimits(&cfg, modelLimits{MaxTokens: 16384})
@@ -71,6 +87,8 @@ func TestFetchModelLimits(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/models/deepseek-v4-flash-abl":
 			w.Write([]byte(`{"id":"deepseek-v4-flash-abl","max_input_tokens":262144,"max_output_tokens":8192}`))
+		case "/v1/models/openrouter-only":
+			w.Write([]byte(`{"id":"openrouter-only","context_length":200000}`))
 		case "/v1/models/no-limits":
 			w.Write([]byte(`{"id":"no-limits","owned_by":"butter"}`))
 		default:
@@ -89,6 +107,12 @@ func TestFetchModelLimits(t *testing.T) {
 	}
 	if gotAuth != "Bearer sk-test" {
 		t.Errorf("got auth %q, want bearer token", gotAuth)
+	}
+
+	// OpenRouter spells the window as context_length with no max_input_tokens.
+	orLim, ok := fetchModelLimits(context.Background(), base, "sk-test", "llmgateway/openrouter-only")
+	if !ok || orLim.inputContext() != 200000 {
+		t.Fatalf("got %+v ok=%v, want context_length 200000 applied", orLim, ok)
 	}
 
 	if _, ok := fetchModelLimits(context.Background(), base, "sk-test", "nope"); ok {

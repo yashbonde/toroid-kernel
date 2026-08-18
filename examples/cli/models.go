@@ -17,12 +17,15 @@ const maxModelsResponseSize = 4 << 20
 
 type modelsResponse struct {
 	Data []struct {
-		ID string `json:"id"`
+		ID            string `json:"id"`
+		ContextLength int    `json:"context_length"`
 	} `json:"data"`
 }
 
 // runModels implements `trk models`. Model IDs are printed one per line so the
-// output remains useful both at a terminal and in shell pipelines.
+// output remains useful both at a terminal and in shell pipelines. When the
+// gateway reports a model's context window it is shown after the id in
+// parentheses; models without a reported window print id only.
 func runModels(ctx context.Context, out io.Writer, args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("takes no arguments")
@@ -43,12 +46,21 @@ func runModels(ctx context.Context, out io.Writer, args []string) error {
 		return err
 	}
 	for _, model := range models {
-		fmt.Fprintln(out, model)
+		if model.ContextLength > 0 {
+			fmt.Fprintf(out, "%s (%d)\n", model.ID, model.ContextLength)
+		} else {
+			fmt.Fprintln(out, model.ID)
+		}
 	}
 	return nil
 }
 
-func fetchModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]string, error) {
+type listedModel struct {
+	ID            string
+	ContextLength int
+}
+
+func fetchModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]listedModel, error) {
 	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -83,10 +95,10 @@ func fetchModels(ctx context.Context, client *http.Client, baseURL, apiKey strin
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-	models := make([]string, 0, len(payload.Data))
+	models := make([]listedModel, 0, len(payload.Data))
 	for _, model := range payload.Data {
 		if id := strings.TrimSpace(model.ID); id != "" {
-			models = append(models, id)
+			models = append(models, listedModel{ID: id, ContextLength: model.ContextLength})
 		}
 	}
 	return models, nil

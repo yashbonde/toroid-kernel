@@ -160,20 +160,26 @@ func ApplyDefaultDataTypes(cfg any) {
 	}
 }
 
-// toroidHome returns ~/.toroid, creating it if needed.
+// toroidHome returns ~/.toroid, creating it if needed. The location can be
+// relocated by setting the TOROID_HOME environment variable (analogous to
+// CODEX_HOME / CLAUDE_CONFIG_DIR); the value is used verbatim as the data
+// directory.
 func toroidHome() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
+	dir := os.Getenv("TOROID_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(home, ".toroid")
 	}
-	dir := filepath.Join(home, ".toroid")
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
 	}
 	return dir, nil
 }
 
-// SqlitePath returns ~/.toroid/sql.db
+// SqlitePath returns $TOROID_HOME/sql.db (default ~/.toroid/sql.db).
 func SqlitePath() (string, error) {
 	dir, err := toroidHome()
 	if err != nil {

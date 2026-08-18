@@ -29,6 +29,19 @@ type modelLimits struct {
 	MaxInputTokens  int `json:"max_input_tokens"`
 	MaxOutputTokens int `json:"max_output_tokens"`
 	MaxTokens       int `json:"max_tokens"`
+	// ContextLength is OpenRouter's spelling for the model's total context
+	// window. Used as the input/context ceiling when the gateway does not
+	// report max_input_tokens.
+	ContextLength int `json:"context_length"`
+}
+
+// inputContext returns the model's total context window: max_input_tokens when
+// present, otherwise OpenRouter's context_length.
+func (m modelLimits) inputContext() int {
+	if m.MaxInputTokens > 0 {
+		return m.MaxInputTokens
+	}
+	return m.ContextLength
 }
 
 // outputCeiling returns the model's max output tokens under either spelling.
@@ -80,7 +93,7 @@ func fetchModelLimits(ctx context.Context, baseURL, apiKey, model string) (model
 	if err := json.NewDecoder(resp.Body).Decode(&lim); err != nil {
 		return modelLimits{}, false
 	}
-	if lim.MaxInputTokens <= 0 && lim.outputCeiling() <= 0 {
+	if lim.inputContext() <= 0 && lim.outputCeiling() <= 0 {
 		return modelLimits{}, false // answered, but told us nothing usable
 	}
 	return lim, true
@@ -88,11 +101,12 @@ func fetchModelLimits(ctx context.Context, baseURL, apiKey, model string) (model
 
 // applyModelLimits clamps the context and output knobs to what the model can
 // actually serve. Configured values are honoured when they fit and lowered when
-// they do not; an unset knob adopts the model's own ceiling. Limits the gateway
-// did not report are left alone. Pure, so the clamping rules are testable
-// without a gateway.
+// they do not; an unset knob adopts the model's own ceiling. The context window
+// comes from max_input_tokens or, failing that, OpenRouter's context_length.
+// Limits the gateway did not report are left alone. Pure, so the clamping rules
+// are testable without a gateway.
 func applyModelLimits(cfg *Config, lim modelLimits) {
-	if in := lim.MaxInputTokens; in > 0 {
+	if in := lim.inputContext(); in > 0 {
 		if cfg.TotalContextSize <= 0 || cfg.TotalContextSize > in {
 			cfg.TotalContextSize = in
 		}

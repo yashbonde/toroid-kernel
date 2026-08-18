@@ -23,7 +23,7 @@ func TestRunModels(t *testing.T) {
 			t.Errorf("authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"object":"list","data":[{"id":"model-b"},{"id":"model-a"},{"id":""}]}`)
+		io.WriteString(w, `{"object":"list","data":[{"id":"model-b","context_length":200000},{"id":"model-a"},{"id":""}]}`)
 	}))
 	defer server.Close()
 
@@ -34,7 +34,7 @@ func TestRunModels(t *testing.T) {
 	if err := runModels(context.Background(), &out, nil); err != nil {
 		t.Fatalf("runModels: %v", err)
 	}
-	if got, want := out.String(), "model-b\nmodel-a\n"; got != want {
+	if got, want := out.String(), "model-b (200000)\nmodel-a\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
 	}
 }
