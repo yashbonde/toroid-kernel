@@ -13,7 +13,7 @@ const (
 	EventSubagentStart      EventKind = "SubagentStart"      // before the subagent is started
 	EventSubagentStop       EventKind = "SubagentStop"       // after the subagent finishes, sync or async (Payload.Async)
 	EventMasterIdle         EventKind = "MasterIdle"         // after the main agent is idle
-	EventReasoning          EventKind = "Reasoning"          // streamed reasoning/thinking tokens (display only, not stored)
+	EventReasoning          EventKind = "Reasoning"          // reasoning/thinking content, one block per turn
 	EventTurnStarted        EventKind = "TurnStarted"        // before one agent loop turn begins; carries the outbound llm-step shape
 	EventTurnCompleted      EventKind = "TurnCompleted"      // after the LLM response and any requested tools finish; carries content and cost
 	EventTurnFailed         EventKind = "TurnFailed"         // when a turn cannot reach its normal boundary
@@ -51,7 +51,7 @@ type Event struct {
 // are excluded from OTEL span events so the exported trace carries only
 // meaningful work, not UI chatter.
 var nonObservableKinds = map[EventKind]bool{
-	EventReasoning:      true, // streamed thinking deltas (also not persisted)
+	EventReasoning:      true, // display-only thinking content, excluded from the OTEL projection
 	EventMasterIdle:     true,
 	EventQueueInterrupt: true,
 }

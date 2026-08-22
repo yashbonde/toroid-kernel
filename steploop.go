@@ -25,8 +25,8 @@ import (
 //
 // Turns use Step.Complete (non-streaming) so every llm-step carries cost via
 // the model catalog rates: the assistant text is written after each
-// turn rather than token-by-token; reasoning content is emitted as one
-// EventReasoning per turn.
+// turn rather than token-by-token; reasoning content is emitted (and persisted)
+// as one EventReasoning block per turn.
 func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget) error {
 	model := ResolveModel(k.Cfg.Model)
 	wireTools := k.wireTools()

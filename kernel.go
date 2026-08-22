@@ -440,7 +440,7 @@ func (k *Kernel) fireEvent(ctx context.Context, kind, chatID, turnID, llmStepID 
 		Seq:          k.seq.Add(1),
 		Payload:      payload,
 	}
-	if k.Store != nil && event.Kind != EventReasoning {
+	if k.Store != nil {
 		_ = k.Store.AppendEvent(k.Cfg.TraceID, k.Cfg.SessionID, event)
 	}
 	return k.Hooks.Fire(ctx, event)
