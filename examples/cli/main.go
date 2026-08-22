@@ -210,6 +210,13 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "watch" {
+		if err := runWatch(os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, "trk watch:", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// apiKey may be empty: NewKernel resolves the key per provider prefix
 	// (LLM_GATEWAY_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY); TOROID_LLM_TOKEN
