@@ -22,7 +22,7 @@
 //	flag --no-colour       disable all ANSI styling (default off)
 //	flag --context-size    total context window size (0 = use kernel default)
 //	flag --compact-buffer  tokens reserved before auto-compact triggers (0 = use kernel default)
-//	flag --max-iter        max tool-call iterations per turn (0 = use env or kernel default)
+//	flag --max-iter        max tool-call iterations per turn (default 1000)
 //	flag --max-repeat-calls stop after N consecutive identical tool calls (0 or 1 disables the guard)
 //	flag --smaller-model   cheaper model for compaction/subagents (empty = use primary)
 //	flag --max-spend       max cumulative spend in USD (0 = unlimited)
@@ -107,7 +107,7 @@ func loadConfig() (config, string) {
 	// Context/compaction knobs
 	contextSize := flag.Int("context-size", 0, "total context window size (0 = kernel default 200000)")
 	compactBuffer := flag.Int("compact-buffer", 0, "tokens reserved below context-size before auto-compact fires (0 = kernel default 50000)")
-	maxIterFlag := flag.Int("max-iter", 0, "max tool-call iterations per turn (0 = use TOROID_MAX_ITER or kernel default 100)")
+	maxIterFlag := flag.Int("max-iter", 1000, "max tool-call iterations per turn (0 = use TOROID_MAX_ITER or kernel default 100)")
 	maxRepeatCalls := flag.Int("max-repeat-calls", 0, "stop after N consecutive identical tool calls (0 or 1 = guard disabled)")
 	smallerModel := flag.String("smaller-model", "", "cheaper model for compaction and subagents (empty = use primary model)")
 	maxSpend := flag.Float64("max-spend", 0, "maximum cumulative transcript spend in USD (0 = unlimited)")
