@@ -66,6 +66,13 @@ type tuiTurnDoneMsg struct {
 	grandTotal int64
 }
 
+// tuiQueueDrainedMsg announces that messages enqueued while a turn was running
+// have been injected at the next turn boundary (EventQueueInterrupt). Each
+// message is rendered as a normal user row so it does not silently disappear.
+type tuiQueueDrainedMsg struct {
+	messages []string
+}
+
 // spinnerTick requests the next animation frame while the kernel is busy.
 type spinnerTick struct{}
 
@@ -695,6 +702,12 @@ func (m *tuiModel) subscribeEvents() {
 		}
 		return nil
 	})
+	k.On(toroid.EventQueueInterrupt, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.QueueInterruptPayload); ok && len(p.Messages) > 0 {
+			m.events <- tuiQueueDrainedMsg{messages: p.Messages}
+		}
+		return nil
+	})
 }
 
 func (m *tuiModel) submit(prompt string) tea.Cmd {
@@ -840,11 +853,22 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			}
 		case "enter":
-			if m.busy {
-				return m, nil
-			}
 			prompt := strings.TrimSpace(m.input.Value())
 			if prompt == "" {
+				return m, nil
+			}
+			// While a turn is already running, queue the new message instead of
+			// dropping it: the kernel injects it at the next turn boundary
+			// (QueueInterrupt). This replaces the old "busy -> ignore" behavior.
+			if m.busy {
+				m.input.Reset()
+				if strings.HasPrefix(prompt, "/") {
+					m.addEntry(transcriptActivity, "can't run commands while busy — finished this turn first")
+					return m, nil
+				}
+				m.addEntry(transcriptUser, prompt)
+				m.addEntry(transcriptActivity, "queued — will run after this turn")
+				m.kernel.Enqueue(prompt)
 				return m, nil
 			}
 			if strings.HasPrefix(prompt, "/delegate") {
@@ -904,6 +928,15 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.renderTranscript()
 				m.transcript.GotoBottom()
 			}
+		}
+	case tuiQueueDrainedMsg:
+		// The messages were already shown as user rows at enqueue time; the
+		// kernel has now injected them at the turn boundary, so just confirm
+		// the flush rather than duplicating the content.
+		if n := len(msg.messages); n == 1 {
+			m.addEntry(transcriptActivity, "→ queued message injected")
+		} else if n > 1 {
+			m.addEntry(transcriptActivity, fmt.Sprintf("→ %d queued messages injected", n))
 		}
 	case tuiTurnDoneMsg:
 		m.busy = false
