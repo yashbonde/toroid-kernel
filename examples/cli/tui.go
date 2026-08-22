@@ -127,6 +127,10 @@ type tuiModel struct {
 	// toolCallSeq is the monotonic counter for tool calls within the current
 	// turn, reset to 0 on each new turn.
 	toolCallSeq int
+	// usageMu guards usage, the session-accumulated token usage captured from
+	// EventStop for the turn footer's grand-total line.
+	usageMu sync.Mutex
+	usage   toroid.UsagePayload
 	// lastInputHeight is the composer's visual row count from the previous
 	// layout pass. With a known terminal width and a monospace font the
 	// composer only needs a new height when its content wraps to a new visual
@@ -190,6 +194,7 @@ func runTUI(cfg config, apiKey string) error {
 		username = strings.TrimSpace(string(out))
 	}
 	m := &tuiModel{ctx: ctx, cancel: cancel, kernel: k, cfg: &cfg, apiKey: apiKey, events: events, input: input, transcript: transcript, username: username}
+	m.subscribeEvents()
 
 	_, err = tea.NewProgram(m).Run()
 	if errors.Is(err, tea.ErrInterrupted) {
@@ -623,6 +628,58 @@ type tuiDelegationDoneMsg struct {
 	elapsed time.Duration
 }
 
+// subscribeEvents registers the kernel event hooks once per kernel. It must be
+// called whenever the model gets a new kernel (initial start and /new), since
+// HookRegistry appends and never unregisters — re-registering per turn would
+// stack duplicate hooks and multiply the tool-call counter on later turns.
+func (m *tuiModel) subscribeEvents() {
+	k := m.kernel
+
+	// Session usage arrives via EventStop for the turn footer's grand-total
+	// line; Stream hands the answer to the writer instead of returning a
+	// string, so capture the totals here.
+	k.On(toroid.EventStop, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.UsagePayload); ok {
+			m.usageMu.Lock()
+			m.usage = *p
+			m.usageMu.Unlock()
+		}
+		return nil
+	})
+	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
+			m.toolCallSeq++
+			label := toolCallLabel(p.Name, p.Args, m.cfg.workdir)
+			m.events <- tuiToolMsg{id: p.CallID, label: label, num: m.toolCallSeq}
+		}
+		return nil
+	})
+	k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+			m.events <- tuiToolDoneMsg{id: p.CallID}
+		}
+		return nil
+	})
+	k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
+			m.events <- tuiToolDoneMsg{id: p.CallID, err: p.Error}
+		}
+		return nil
+	})
+	k.On(toroid.EventSubagentStart, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
+			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: true, async: true}
+		}
+		return nil
+	})
+	k.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
+			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: false, async: true}
+		}
+		return nil
+	})
+}
+
 func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.busy = true
 	m.toolCallSeq = 0
@@ -633,54 +690,6 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.cancelTurn = cancel
 
-	// Session usage arrives via EventStop (Run's internal hook captured it too);
-	// Stream hands the answer to the writer instead of returning a string, so we
-	// subscribe here for the turn footer's grand-total line.
-	var (
-		mu    sync.Mutex
-		usage toroid.UsagePayload
-	)
-	m.kernel.On(toroid.EventStop, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.UsagePayload); ok {
-			mu.Lock()
-			usage = *p
-			mu.Unlock()
-		}
-		return nil
-	})
-	m.kernel.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
-			m.toolCallSeq++
-			label := toolCallLabel(p.Name, p.Args, m.cfg.workdir)
-			m.events <- tuiToolMsg{id: p.CallID, label: label, num: m.toolCallSeq}
-		}
-		return nil
-	})
-	m.kernel.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			m.events <- tuiToolDoneMsg{id: p.CallID}
-		}
-		return nil
-	})
-	m.kernel.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
-			m.events <- tuiToolDoneMsg{id: p.CallID, err: p.Error}
-		}
-		return nil
-	})
-	m.kernel.On(toroid.EventSubagentStart, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
-			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: true, async: true}
-		}
-		return nil
-	})
-	m.kernel.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
-			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: false, async: true}
-		}
-		return nil
-	})
-
 	return tea.Batch(
 		func() tea.Msg {
 			start := time.Now()
@@ -689,11 +698,11 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 				return len(p), nil
 			}))
 			var grand int64
-			mu.Lock()
-			if total, ok := usage.Tokens[m.kernel.SessionID()]; ok {
+			m.usageMu.Lock()
+			if total, ok := m.usage.Tokens[m.kernel.SessionID()]; ok {
 				grand = total.Input + total.CacheRead + total.CacheWrite + total.Output
 			}
-			mu.Unlock()
+			m.usageMu.Unlock()
 			return tuiTurnDoneMsg{err: err, elapsed: time.Since(start), grandTotal: grand}
 		},
 		spin(),
@@ -730,6 +739,7 @@ func (m *tuiModel) newSession() {
 		return
 	}
 	m.kernel = k
+	m.subscribeEvents()
 	m.entries = nil
 	m.transcript.SetContent("")
 	m.busy = false
