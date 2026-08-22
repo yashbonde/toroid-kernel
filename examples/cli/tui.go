@@ -98,22 +98,25 @@ type transcriptEntry struct {
 	// entries such as subagents) so the number stays visible once a tool's
 	// live row is committed on finish.
 	num int
+	// userNum is the monotonic user-message index shown as "[n]" before the
+	// username, so the user can see which stage of the conversation they are on.
+	userNum int
 }
 
 type tuiModel struct {
-	ctx        context.Context
-	cancel     context.CancelFunc
-	cancelTurn context.CancelFunc
-	kernel     *toroid.Kernel
-	cfg        *config
-	apiKey     string
-	events     chan tea.Msg
-	input      textarea.Model
-	transcript viewport.Model
-	entries    []transcriptEntry
-	username   string
-	width      int
-	height     int
+	ctx          context.Context
+	cancel       context.CancelFunc
+	cancelTurn   context.CancelFunc
+	kernel       *toroid.Kernel
+	cfg          *config
+	apiKey       string
+	events       chan tea.Msg
+	input        textarea.Model
+	transcript   viewport.Model
+	entries      []transcriptEntry
+	username     string
+	width        int
+	height       int
 	busy         bool
 	spinnerFrame int
 	// runningTools holds every tool call currently in flight, in start order, so
@@ -127,6 +130,9 @@ type tuiModel struct {
 	// toolCallSeq is the monotonic counter for tool calls within the current
 	// turn, reset to 0 on each new turn.
 	toolCallSeq int
+	// userSeq is the monotonic counter for user messages across the session,
+	// shown as "[n]" before the username in the transcript header.
+	userSeq int
 	// usageMu guards usage, the session-accumulated token usage captured from
 	// EventStop for the turn footer's grand-total line.
 	usageMu sync.Mutex
@@ -139,16 +145,16 @@ type tuiModel struct {
 }
 
 var (
-	canvasColor  = lipgloss.Color("#FFFFFF")
-	inputColor   = lipgloss.Color("#FFFFFF")
-	userColor    = lipgloss.Color("#ECFDF3")
-	inkColor     = lipgloss.Color("#18212F")
-	blueStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
-	accentStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
-	dimStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
-	errorStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
+	canvasColor    = lipgloss.Color("#FFFFFF")
+	inputColor     = lipgloss.Color("#FFFFFF")
+	userColor      = lipgloss.Color("#ECFDF3")
+	inkColor       = lipgloss.Color("#18212F")
+	blueStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
+	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
+	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
+	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
 	errorBoldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156")).Bold(true)
-	boldInkStyle = lipgloss.NewStyle().Foreground(inkColor).Bold(true)
+	boldInkStyle   = lipgloss.NewStyle().Foreground(inkColor).Bold(true)
 )
 
 func runTUI(cfg config, apiKey string) error {
@@ -212,7 +218,12 @@ func (m *tuiModel) Init() tea.Cmd {
 }
 
 func (m *tuiModel) addEntry(kind transcriptKind, text string) {
-	m.entries = append(m.entries, transcriptEntry{kind: kind, text: text, ts: time.Now()})
+	entry := transcriptEntry{kind: kind, text: text, ts: time.Now()}
+	if kind == transcriptUser {
+		m.userSeq++
+		entry.userNum = m.userSeq
+	}
+	m.entries = append(m.entries, entry)
 	m.renderTranscript()
 	m.transcript.GotoBottom()
 }
@@ -285,6 +296,7 @@ func (m *tuiModel) stopSubagent(id string) {
 	m.renderTranscript()
 	m.transcript.GotoBottom()
 }
+
 // clipToolLabel keeps only the first maxToolLabelWidth runes of a tool label,
 // replacing anything cut with an ellipsis so the shape stays on one row.
 func clipToolLabel(label string) string {
@@ -389,12 +401,17 @@ func (m *tuiModel) modelLabel() string {
 	return "model"
 }
 
-// usernameLabel returns the display label for a user message header.
-func (m *tuiModel) usernameLabel() string {
-	if m.username != "" {
-		return m.username
+// usernameLabel returns the display label for a user message header, prefixed
+// with the monotonic "[n]" index when set (see userNum).
+func (m *tuiModel) usernameLabel(num int) string {
+	name := m.username
+	if name == "" {
+		name = "user"
 	}
-	return "user"
+	if num > 0 {
+		return fmt.Sprintf("[%d] %s", num, name)
+	}
+	return name
 }
 
 func (m *tuiModel) renderTranscript() {
@@ -413,7 +430,7 @@ func (m *tuiModel) renderTranscript() {
 		switch entry.kind {
 		case transcriptUser:
 			text = ansi.Hardwrap(text, availableWidth, false)
-			header := boldInkStyle.Render(m.usernameLabel() + " >")
+			header := boldInkStyle.Render(m.usernameLabel(entry.userNum) + " >")
 			entry.rendered = lipgloss.NewStyle().Background(userColor).Foreground(inkColor).Width(availableWidth).Render(header + "\n" + text + "\n" + timestampLabel(entry.ts))
 		case transcriptAssistant:
 			// Do not right-pad assistant/tool lines. The viewport owns blank cells;
@@ -744,6 +761,8 @@ func (m *tuiModel) newSession() {
 	m.transcript.SetContent("")
 	m.busy = false
 	m.runningTools = nil
+	m.userSeq = 0
+	m.toolCallSeq = 0
 	m.addEntry(transcriptActivity, "— new session —")
 }
 
@@ -963,7 +982,7 @@ func (m *tuiModel) renderUsageBar() string {
 
 	statusText := dimStyle.Render("ready")
 	if m.busy {
-		statusText = accentStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)] + " working") + dimStyle.Render("  Esc cancel")
+		statusText = accentStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]+" working") + dimStyle.Render("  Esc cancel")
 	}
 
 	// Layout: [TOROID model] [path · keys] ... [cost] [progress] [tokens] [status]
