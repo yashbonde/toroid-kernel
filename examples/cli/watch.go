@@ -93,6 +93,9 @@ td.cost { text-align: right; color: #4ade80; }
 span.muted { color: #687382; }
 .chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: #161b22; color: #9aa6b2; border: 1px solid #232a33; }
 section { margin-bottom: 34px; }
+section.subagent { border-left: 3px solid #3b82f6; padding-left: 14px; }
+section.subagent .span-title { color: #7ee2ff; }
+.chip.subagent { background: #1a2438; color: #7ee2ff; border-color: #2c3a57; }
 .span-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 6px; }
 .span-title { font-weight: 600; }
 .tool { display: flex; gap: 10px; align-items: baseline; padding: 7px 0; border-bottom: 1px solid #1c232c; }
@@ -111,6 +114,7 @@ details.tl[open] > summary { background: #151b23; }
 .badge.tool { color: #c9a2ff; }
 .badge.tool-result { color: #7d8590; }
 .tl .summary { color: #9fb0c3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl .dur { margin-left: auto; flex: none; color: #7d8590; font-size: 12px; font-variant-numeric: tabular-nums; padding-left: 12px; }
 .tl .body { color: #9fb0c3; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; padding: 0 0 12px 84px; }
 .tl .body.empty { color: #4d5560; }
 .empty { color: #4d5560; font-style: italic; padding: 18px 0; }
@@ -138,6 +142,19 @@ var tplFuncs = template.FuncMap{
 	},
 	"moneyFmt": func(v float64) string {
 		return fmt.Sprintf("$%.6f", v)
+	},
+	"toolTimeFmt": func(ns int64) string {
+		if ns <= 0 {
+			return ""
+		}
+		d := time.Duration(ns)
+		if d < time.Second {
+			return fmt.Sprintf("%dms", d.Milliseconds())
+		}
+		if d < time.Minute {
+			return fmt.Sprintf("%.1fs", d.Seconds())
+		}
+		return fmt.Sprintf("%dm%.0fs", int(d.Minutes()), d.Seconds()-float64(int(d.Minutes()))*60)
 	},
 	"shortID": func(id string) string {
 		if len(id) > 8 {
@@ -206,9 +223,10 @@ func fieldString(payload any, key string) string {
 // user prompt, assistant text, thinking/reasoning, tool call, or tool result.
 // Title is the collapsed summary; Body is the full content shown on expand.
 type spanTimelineEntry struct {
-	Label string // user | assistant | thinking | tool | tool-result
-	Title string
-	Body  string
+	Label    string // user | assistant | thinking | tool | tool-result
+	Title    string
+	Body     string
+	Duration int64 // tool-call wall time (PostToolUse.EmitTS - PreToolUse.EmitTS), 0 if unknown
 }
 
 // timelineOf flattens a span's events into a chronological conversation
@@ -218,6 +236,25 @@ type spanTimelineEntry struct {
 // The decoded payload is a generic map[string]any (not the typed struct), so
 // every field is read defensively.
 func timelineOf(sp toroid.SpanData) []spanTimelineEntry {
+	// Build a call-id -> wall-time map from the Pre/Post tool events so every
+	// tool_call timeline row can show how long its handler took.
+	durations := map[string]int64{}
+	pre := map[string]int64{}
+	for _, e := range sp.Events {
+		switch e.Kind {
+		case toroid.EventPreToolUse:
+			if id := payloadString(e.Payload, "call_id"); id != "" {
+				pre[id] = e.EmitTS
+			}
+		case toroid.EventPostToolUse, toroid.EventPostToolUseFailure:
+			if id := payloadString(e.Payload, "call_id"); id != "" {
+				if start, ok := pre[id]; ok {
+					durations[id] = e.EmitTS - start
+				}
+			}
+		}
+	}
+
 	var out []spanTimelineEntry
 	for _, e := range sp.Events {
 		switch e.Kind {
@@ -226,7 +263,7 @@ func timelineOf(sp toroid.SpanData) []spanTimelineEntry {
 				out = append(out, spanTimelineEntry{Label: "user", Title: summarize(p, 120), Body: p})
 			}
 		case toroid.EventTurnCompleted, toroid.EventKind("AssistantTurn"):
-			out = append(out, timelineFromMessages(messagesOf(e.Payload))...)
+			out = append(out, timelineFromMessages(messagesOf(e.Payload), durations)...)
 		}
 	}
 	return out
@@ -257,7 +294,8 @@ func messagesOf(payload any) []map[string]any {
 }
 
 // timelineFromMessages turns a persisted message list into timeline rows.
-func timelineFromMessages(msgs []map[string]any) []spanTimelineEntry {
+// durations maps a tool call id to its wall time (see timelineOf).
+func timelineFromMessages(msgs []map[string]any, durations map[string]int64) []spanTimelineEntry {
 	var out []spanTimelineEntry
 	for _, msg := range msgs {
 		role, _ := msg["role"].(string)
@@ -284,7 +322,12 @@ func timelineFromMessages(msgs []map[string]any) []spanTimelineEntry {
 					if s := summarize(args, 80); s != "" {
 						title = name + "  " + s
 					}
-					out = append(out, spanTimelineEntry{Label: "tool", Title: title, Body: args})
+					out = append(out, spanTimelineEntry{
+						Label:    "tool",
+						Title:    title,
+						Body:     args,
+						Duration: durations[jsonStr(p["id"])],
+					})
 				}
 			case "tool":
 				if kind == "tool_result" {
@@ -402,13 +445,13 @@ var traceTpl = newPageTemplate(`
 {{ if .Spans }}
 {{ range .Spans }}
 {{ $tl := . | timelineOf }}
-<section>
-  <div class="span-head"><span class="span-title">{{ if .Title }}{{ .Title }}{{ else }}<span class="muted">span</span>{{ end }}</span><span class="chip">{{ .SpanID | shortID }}</span>{{ if .Model }}<span class="muted">{{ .Model }}</span>{{ end }}</div>
+<section{{ if .ParentSpanID }} class="subagent"{{ end }}>
+  <div class="span-head"><span class="span-title">{{ if .ParentSpanID }}⚡ {{ end }}{{ if .Title }}{{ .Title }}{{ else }}<span class="muted">{{ if .ParentSpanID }}subagent{{ else }}span{{ end }}</span>{{ end }}</span><span class="chip{{ if .ParentSpanID }} subagent{{ end }}">{{ .SpanID | shortID }}</span>{{ if .Model }}<span class="muted">{{ .Model }}</span>{{ end }}</div>
   <div class="breadcrumb" style="margin-bottom:6px">{{ .Events | toolCount }} tool calls · {{ len .Costs }} cost records</div>
   {{ if $tl }}
     {{ range $tl }}
     <details class="tl">
-      <summary><span class="badge {{ .Label | labelClass }}">{{ .Label }}</span><span class="summary">{{ .Title }}</span></summary>
+      <summary><span class="badge {{ .Label | labelClass }}">{{ .Label }}</span><span class="summary">{{ .Title }}</span>{{ if .Duration }}<span class="dur">{{ .Duration | toolTimeFmt }}</span>{{ end }}</summary>
       <div class="body">{{ if .Body }}{{ .Body }}{{ else }}<span class="empty">(empty)</span>{{ end }}</div>
     </details>
     {{ end }}
