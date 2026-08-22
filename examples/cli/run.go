@@ -138,7 +138,7 @@ func runOneShot(cfg config, apiKey string) error {
 			return nil
 		})
 
-		out, _, err := k.Run(ctx, cfg.run)
+		out, _, err := k.Run(ctx, withAgentsReminder(cfg.run, cfg.workdir))
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
@@ -167,7 +167,7 @@ func runOneShot(cfg config, apiKey string) error {
 
 	// Drive the loop. We discard the writer copy of the final text because the
 	// EventStop / EventTurnCompleted events already carry it on the stream.
-	if _, _, err := k.Run(ctx, cfg.run); err != nil {
+	if _, _, err := k.Run(ctx, withAgentsReminder(cfg.run, cfg.workdir)); err != nil {
 		return fmt.Errorf("run: %w", err)
 	}
 	return nil

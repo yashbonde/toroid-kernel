@@ -311,17 +311,21 @@ func (m *tuiModel) startSubagent(id, prompt string) {
 	m.transcript.GotoBottom()
 }
 
-// stopSubagent removes the async subagent from the running set and commits its
-// result (if any) as a settled transcript row, so a finished background agent's
-// output is visible rather than silently discarded.
+// stopSubagent removes the async subagent from the running set and commits
+// a finished transcript row with total time taken and the first line of
+// output (if any), so a finished background agent's result is visible.
 func (m *tuiModel) stopSubagent(id, output string) {
+	start, ok := m.runningSubagents[id]
 	delete(m.runningSubagents, id)
-	if trimmed := strings.TrimSpace(output); trimmed != "" {
-		m.entries = append(m.entries, transcriptEntry{
-			kind: transcriptActivity,
-			text: "⚡ subagent " + id + ": " + compactToolText(trimmed, 120),
-			ts:   time.Now(),
-		})
+	if ok {
+		label := blueStyle.Render("⚡ ") + boldInkStyle.Render("subagent "+id[:min(12, len(id))]+"…")
+		if d := formatDuration(time.Since(start)); d != "" {
+			label += dimStyle.Render(" · " + d)
+		}
+		if trimmed := strings.TrimSpace(output); trimmed != "" {
+			label += " " + dimStyle.Render(compactToolText(trimmed, 120))
+		}
+		m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, ts: time.Now()})
 	}
 	m.renderTranscript()
 	m.transcript.GotoBottom()
@@ -339,9 +343,8 @@ func clipToolLabel(label string) string {
 
 // finishTool commits the finished tool (matched by its call id) as a permanent
 // transcript row and removes it from the set of running tools. The grey + "…"
-// animation made clear it was working; a finished row is simply solidified in
-// bold. Only failures carry a visible ⨯ and error text — success needs no
-// "done!" marker.
+// animation made clear it was working; a finished row is solidified in bold
+// with total time taken appended after " · <time>".
 func (m *tuiModel) finishTool(id, errText string) {
 	idx := -1
 	for i := range m.runningTools {
@@ -354,8 +357,12 @@ func (m *tuiModel) finishTool(id, errText string) {
 		return
 	}
 	label := m.runningTools[idx].label
+	elapsed := time.Since(m.runningTools[idx].start)
 	if errText != "" {
 		label = label + " ⨯ " + compactToolText(errText, 120)
+	}
+	if d := formatDuration(elapsed); d != "" {
+		label = label + " … " + d
 	}
 	num := m.runningTools[idx].num
 	m.runningTools = append(m.runningTools[:idx], m.runningTools[idx+1:]...)
@@ -527,7 +534,15 @@ func (m *tuiModel) renderTranscript() {
 			if entry.num > 0 {
 				numPrefix = dimStyle.Render(fmt.Sprintf("%d ", entry.num))
 			}
-			if idx := strings.Index(text, " ⨯ "); idx >= 0 {
+			// Finished async subagents are committed with a pre-styled "⚡ …" label
+			// (see stopSubagent); render them verbatim so we keep the blue icon.
+			if strings.Contains(text, "⚡") {
+				if entry.num > 0 {
+					entry.rendered = numPrefix + boldInkStyle.Render(text)
+				} else {
+					entry.rendered = boldInkStyle.Render(text)
+				}
+			} else if idx := strings.Index(text, " ⨯ "); idx >= 0 {
 				entry.rendered = numPrefix + accentStyle.Render("⚙ ") + errorBoldStyle.Render(text[:idx]) + boldInkStyle.Render(text[idx:])
 			} else {
 				entry.rendered = numPrefix + accentStyle.Render("⚙ ") + boldInkStyle.Render(text)
@@ -790,6 +805,54 @@ func (m *tuiModel) subscribeEvents() {
 		}
 		return nil
 	})
+	k.On(toroid.EventTurnStarted, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
+			tools := strings.Join(p.Tools, ",")
+			if tools == "" {
+				tools = "—"
+			}
+			model := p.Model
+			if model == "" {
+				model = m.cfg.model
+			}
+			m.events <- tuiOutputMsg(fmt.Sprintf("→ turn %s · %s · %d msgs · tools: %s", e.TurnID[:min(8, len(e.TurnID))], shortModel(model), p.Messages, tools))
+		}
+		return nil
+	})
+	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
+			u := p.TurnUsage
+			tok := u.Input + u.CacheRead + u.CacheWrite + u.Output
+			if tok > 0 || p.ToolCalls > 0 {
+				m.events <- tuiOutputMsg(fmt.Sprintf("← turn %s done · %d tool_calls · %d tokens · $%.4f (total $%.4f) · %s", e.TurnID[:min(8, len(e.TurnID))], p.ToolCalls, tok, p.TurnCostUSD, p.TotalCostUSD, p.StopReason))
+			}
+		}
+		return nil
+	})
+	k.On(toroid.EventTurnFailed, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
+			m.events <- tuiOutputMsg(fmt.Sprintf("✗ turn %s failed: %s", e.TurnID[:min(8, len(e.TurnID))], p.Error))
+		}
+		return nil
+	})
+	k.On(toroid.EventGuardTriggered, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.GuardTriggeredPayload); ok {
+			m.events <- tuiOutputMsg(fmt.Sprintf("⚑ guard %s: %s", p.Name, p.Reason))
+		}
+		return nil
+	})
+	k.On(toroid.EventPreCompact, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.CompactPayload); ok {
+			m.events <- tuiOutputMsg(fmt.Sprintf("◐ compacting · %d msgs · %d tokens", p.MessageCount, p.TokenCount))
+		}
+		return nil
+	})
+	k.On(toroid.EventPostCompact, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.CompactSummaryPayload); ok {
+			m.events <- tuiOutputMsg(fmt.Sprintf("◑ compacted %d→%d msgs · %d tokens · %s", p.MessagesBefore, p.MessagesAfter, p.TokensBefore, compactToolText(p.Summary, 120)))
+		}
+		return nil
+	})
 	k.On(toroid.EventQueueInterrupt, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.QueueInterruptPayload); ok && len(p.Messages) > 0 {
 			m.events <- tuiQueueDrainedMsg{messages: p.Messages}
@@ -806,11 +869,12 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.addEntry(transcriptUser, prompt)
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.cancelTurn = cancel
+	sendPrompt := withAgentsReminder(prompt, m.kernel.Cfg.WorkDir)
 
 	return tea.Batch(
 		func() tea.Msg {
 			start := time.Now()
-			err := m.kernel.Stream(turnCtx, prompt, writerFunc(func(p []byte) (int, error) {
+			err := m.kernel.Stream(turnCtx, sendPrompt, writerFunc(func(p []byte) (int, error) {
 				m.events <- tuiStreamMsg(string(p))
 				return len(p), nil
 			}))
@@ -955,7 +1019,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.addEntry(transcriptUser, prompt)
 				m.addEntry(transcriptActivity, "queued — will run after this turn")
-				m.kernel.Enqueue(prompt)
+				m.kernel.Enqueue(withAgentsReminder(prompt, m.kernel.Cfg.WorkDir))
 				return m, nil
 			}
 			if strings.HasPrefix(prompt, "/delegate") {
