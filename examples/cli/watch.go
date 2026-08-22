@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -100,6 +101,20 @@ section { margin-bottom: 34px; }
 .tool .n { color: #687382; width: 24px; text-align: right; flex: none; font-variant-numeric: tabular-nums; font-size: 12px; }
 .tool .name { color: #7ee2ff; font-family: ui-monospace, Menlo, monospace; }
 .tool .args { color: #687382; font-family: ui-monospace, Menlo, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+details.tl { border-bottom: 1px solid #1c232c; }
+details.tl > summary { list-style: none; cursor: pointer; display: flex; gap: 10px; align-items: baseline; padding: 7px 0; }
+details.tl > summary::-webkit-details-marker { display: none; }
+details.tl > summary:hover { background: #151b23; }
+details.tl[open] > summary { background: #151b23; }
+.tl .badge { flex: none; width: 74px; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; color: #7d8590; }
+.badge.user { color: #7ee2ff; }
+.badge.assistant { color: #4ade80; }
+.badge.thinking { color: #f0b16e; }
+.badge.tool { color: #c9a2ff; }
+.badge.tool-result { color: #7d8590; }
+.tl .summary { color: #9fb0c3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tl .body { color: #9fb0c3; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; padding: 0 0 12px 84px; }
+.tl .body.empty { color: #4d5560; }
 .empty { color: #4d5560; font-style: italic; padding: 18px 0; }
 a { color: #58a6ff; text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -148,6 +163,23 @@ var tplFuncs = template.FuncMap{
 	"toolArgs": func(e toroid.Event) string {
 		return fieldString(e.Payload, "args")
 	},
+	"timelineOf": timelineOf,
+	"labelClass": func(label string) string {
+		switch label {
+		case "user":
+			return "user"
+		case "assistant":
+			return "assistant"
+		case "thinking":
+			return "thinking"
+		case "tool":
+			return "tool"
+		case "tool-result":
+			return "tool-result"
+		default:
+			return ""
+		}
+	},
 }
 
 // fieldString extracts a string field from an event payload that may arrive
@@ -170,6 +202,135 @@ func fieldString(payload any, key string) string {
 		}
 	}
 	return ""
+}
+
+// spanTimelineEntry is one rendered row of a span's conversation timeline:
+// user prompt, assistant text, thinking/reasoning, tool call, or tool result.
+// Title is the collapsed summary; Body is the full content shown on expand.
+type spanTimelineEntry struct {
+	Label string // user | assistant | thinking | tool | tool-result
+	Title string
+	Body  string
+}
+
+// timelineOf flattens a span's events into a chronological conversation
+// timeline. User prompts come from UserPromptSubmit events; assistant text,
+// thinking, tool calls and tool results come from the structured content the
+// turn persists (TurnCompleted's content / the legacy AssistantTurn messages).
+// The decoded payload is a generic map[string]any (not the typed struct), so
+// every field is read defensively.
+func timelineOf(sp toroid.SpanData) []spanTimelineEntry {
+	var out []spanTimelineEntry
+	for _, e := range sp.Events {
+		switch e.Kind {
+		case toroid.EventUserPromptSubmit:
+			if p := payloadString(e.Payload, "prompt"); p != "" {
+				out = append(out, spanTimelineEntry{Label: "user", Title: summarize(p, 120), Body: p})
+			}
+		case toroid.EventTurnCompleted, toroid.EventKind("AssistantTurn"):
+			out = append(out, timelineFromMessages(messagesOf(e.Payload))...)
+		}
+	}
+	return out
+}
+
+// messagesOf extracts the ordered []Message from a TurnPayload/AssistantTurn
+// payload, accepting both the "content" (TurnCompleted) and "messages"
+// (legacy AssistantTurn) keys.
+func messagesOf(payload any) []map[string]any {
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, key := range []string{"content", "messages"} {
+		raw, ok := m[key].([]any)
+		if !ok {
+			continue
+		}
+		out := make([]map[string]any, 0, len(raw))
+		for _, c := range raw {
+			if cm, ok := c.(map[string]any); ok {
+				out = append(out, cm)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// timelineFromMessages turns a persisted message list into timeline rows.
+func timelineFromMessages(msgs []map[string]any) []spanTimelineEntry {
+	var out []spanTimelineEntry
+	for _, msg := range msgs {
+		role, _ := msg["role"].(string)
+		parts, _ := msg["parts"].([]any)
+		for _, p := range partMaps(parts) {
+			kind := jsonStr(p["kind"])
+			switch role {
+			case "user":
+				if kind == "text" {
+					t := jsonStr(p["text"])
+					out = append(out, spanTimelineEntry{Label: "user", Title: summarize(t, 120), Body: t})
+				}
+			case "assistant":
+				switch kind {
+				case "text":
+					t := jsonStr(p["text"])
+					out = append(out, spanTimelineEntry{Label: "assistant", Title: summarize(t, 120), Body: t})
+				case "reasoning":
+					t := jsonStr(p["text"])
+					out = append(out, spanTimelineEntry{Label: "thinking", Title: summarize(t, 120), Body: t})
+				case "tool_call":
+					name, args := jsonStr(p["name"]), jsonStr(p["arguments"])
+					title := name
+					if s := summarize(args, 80); s != "" {
+						title = name + "  " + s
+					}
+					out = append(out, spanTimelineEntry{Label: "tool", Title: title, Body: args})
+				}
+			case "tool":
+				if kind == "tool_result" {
+					c := jsonStr(p["content"])
+					out = append(out, spanTimelineEntry{Label: "tool-result", Title: summarize(c, 100), Body: c})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func partMaps(parts []any) []map[string]any {
+	out := make([]map[string]any, 0, len(parts))
+	for _, p := range parts {
+		if pm, ok := p.(map[string]any); ok {
+			out = append(out, pm)
+		}
+	}
+	return out
+}
+
+func jsonStr(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+func payloadString(payload any, key string) string {
+	if m, ok := payload.(map[string]any); ok {
+		return jsonStr(m[key])
+	}
+	return ""
+}
+
+// summarize collapses a string to a single-line, width-bounded summary.
+func summarize(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	runes := []rune(s)
+	if len(runes) > n {
+		return string(runes[:n-1]) + "…"
+	}
+	return s
 }
 
 func newPageTemplate(body string) *template.Template {
@@ -242,17 +403,20 @@ var traceTpl = newPageTemplate(`
 </div>
 {{ if .Spans }}
 {{ range .Spans }}
+{{ $tl := . | timelineOf }}
 <section>
   <div class="span-head"><span class="span-title">{{ if .Title }}{{ .Title }}{{ else }}<span class="muted">span</span>{{ end }}</span><span class="chip">{{ .SpanID | shortID }}</span>{{ if .Model }}<span class="muted">{{ .Model }}</span>{{ end }}</div>
   <div class="breadcrumb" style="margin-bottom:6px">{{ .Events | toolCount }} tool calls · {{ len .Costs }} cost records</div>
-  {{ $tools := 0 }}
-  {{ range .Events }}
-    {{ if eq .Kind "PreToolUse" }}
-      {{ $tools = addInt $tools 1 }}
-      <div class="tool"><span class="n">{{ $tools }}</span><span class="name">{{ . | toolName }}</span><span class="args">{{ . | toolArgs }}</span></div>
+  {{ if $tl }}
+    {{ range $tl }}
+    <details class="tl">
+      <summary><span class="badge {{ .Label | labelClass }}">{{ .Label }}</span><span class="summary">{{ .Title }}</span></summary>
+      <div class="body">{{ if .Body }}{{ .Body }}{{ else }}<span class="empty">(empty)</span>{{ end }}</div>
+    </details>
     {{ end }}
+  {{ else }}
+  <p class="empty">no conversation recorded</p>
   {{ end }}
-  {{ if eq $tools 0 }}<p class="empty">no tool calls recorded</p>{{ end }}
 </section>
 {{ end }}
 {{ else }}
