@@ -9,6 +9,8 @@ dist/
 /cli
 examples/cli/cli
 examples/cli/cli-tmp
+/one-shot-runner
+examples/one-shot-runner/one-shot-runner
 examples/repl/repl
 examples/toroid-cli/toroid-cli
 examples/running/running

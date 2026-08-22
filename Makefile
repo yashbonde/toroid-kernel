@@ -1,6 +1,6 @@
 # Repo-root targets.
 
-BINARY := cli
+BINARY := examples/cli/cli
 
 .PHONY: cli
 

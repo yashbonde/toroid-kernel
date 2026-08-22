@@ -26,9 +26,12 @@ import (
 // acts on. Gateways vary in spelling, so accept both the max_output_tokens and
 // max_tokens forms for the output ceiling.
 type modelLimits struct {
-	MaxInputTokens  int `json:"max_input_tokens"`
-	MaxOutputTokens int `json:"max_output_tokens"`
-	MaxTokens       int `json:"max_tokens"`
+	MaxInputTokens int `json:"max_input_tokens"`
+	// MaxOutputTokens is the common spelling; MaxCompletionTokens is
+	// OpenRouter's (reported per-endpoint).
+	MaxOutputTokens     int `json:"max_output_tokens"`
+	MaxTokens           int `json:"max_tokens"`
+	MaxCompletionTokens int `json:"max_completion_tokens"`
 	// ContextLength is OpenRouter's spelling for the model's total context
 	// window. Used as the input/context ceiling when the gateway does not
 	// report max_input_tokens.
@@ -46,16 +49,26 @@ func (m modelLimits) inputContext() int {
 
 // outputCeiling returns the model's max output tokens under either spelling.
 func (m modelLimits) outputCeiling() int {
-	if m.MaxOutputTokens > 0 {
-		return m.MaxOutputTokens
+	for _, v := range []int{m.MaxOutputTokens, m.MaxTokens, m.MaxCompletionTokens} {
+		if v > 0 {
+			return v
+		}
 	}
-	return m.MaxTokens
+	return 0
 }
 
 // modelLimitsTimeout bounds the startup probe. A gateway that cannot answer in
 // this long is not worth delaying every run for — the configured defaults are
 // a fine fallback.
 const modelLimitsTimeout = 5 * time.Second
+
+// endpointsDocument mirrors GET /v1/models/{id}/endpoints, which OpenRouter
+// serves for models missing from the plain /v1/models/{id} route.
+type endpointsDocument struct {
+	Data struct {
+		Endpoints []modelLimits `json:"endpoints"`
+	} `json:"data"`
+}
 
 // fetchModelLimits asks an OpenAI-compatible gateway for one model's metadata.
 // ok is false whenever the limits could not be established, in which case the
@@ -85,6 +98,17 @@ func fetchModelLimits(ctx context.Context, baseURL, apiKey, model string) (model
 		return modelLimits{}, false
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		// OpenRouter only exposes some models via their per-provider endpoints
+		// document; fall back before giving up.
+		if lim, ok := fetchModelLimitsViaEndpoints(ctx, base, apiKey, id); ok {
+			return lim, true
+		}
+		// A bare id like "ox-alpha" may exist only as a namespaced entry
+		// ("stealth/ox-alpha") in the plain /v1/models list; match on the
+		// trailing segment.
+		return fetchModelLimitsViaList(ctx, base, apiKey, id)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return modelLimits{}, false // no such route, unknown model, bad key
 	}
@@ -95,6 +119,75 @@ func fetchModelLimits(ctx context.Context, baseURL, apiKey, model string) (model
 	}
 	if lim.inputContext() <= 0 && lim.outputCeiling() <= 0 {
 		return modelLimits{}, false // answered, but told us nothing usable
+	}
+	return lim, true
+}
+
+// fetchModelLimitsViaList scans the gateway's /v1/models list for a single
+// entry whose id ends with "/{id}" (a bare id matching a namespaced listing,
+// e.g. "ox-alpha" -> "stealth/ox-alpha") and reads its context_length.
+func fetchModelLimitsViaList(ctx context.Context, base, apiKey, id string) (modelLimits, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models", nil)
+	if err != nil {
+		return modelLimits{}, false
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return modelLimits{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return modelLimits{}, false
+	}
+
+	var raw struct {
+		Data []struct {
+			modelLimits
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil || len(raw.Data) == 0 {
+		return modelLimits{}, false
+	}
+	for _, m := range raw.Data {
+		if strings.HasSuffix(m.ID, "/"+id) && m.inputContext() > 0 {
+			return m.modelLimits, true
+		}
+	}
+	return modelLimits{}, false
+}
+
+// fetchModelLimitsViaEndpoints reads limits from the first endpoint of
+// OpenRouter's /v1/models/{id}/endpoints document.
+func fetchModelLimitsViaEndpoints(ctx context.Context, base, apiKey, id string) (modelLimits, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/models/"+id+"/endpoints", nil)
+	if err != nil {
+		return modelLimits{}, false
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return modelLimits{}, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return modelLimits{}, false
+	}
+
+	var doc endpointsDocument
+	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil || len(doc.Data.Endpoints) == 0 {
+		return modelLimits{}, false
+	}
+	lim := doc.Data.Endpoints[0]
+	if lim.inputContext() <= 0 && lim.outputCeiling() <= 0 {
+		return modelLimits{}, false
 	}
 	return lim, true
 }
