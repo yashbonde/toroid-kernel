@@ -210,9 +210,9 @@ func main() {
 		}
 		return
 	}
-	if len(os.Args) > 1 && os.Args[1] == "watch" {
+	if len(os.Args) > 1 && os.Args[1] == "web" {
 		if err := runWatch(os.Stdout, os.Args[2:]); err != nil {
-			fmt.Fprintln(os.Stderr, "trk watch:", err)
+			fmt.Fprintln(os.Stderr, "trk web:", err)
 			os.Exit(1)
 		}
 		return

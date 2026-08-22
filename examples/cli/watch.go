@@ -18,7 +18,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// runWatch implements `trk watch`. It serves a read-only HTTP dashboard of the
+// runWatch implements `trk web`. It serves a read-only HTTP dashboard of the
 // Toroid SQLite store (sessions, traces, spans, costs, events, memories) on a
 // loopback port chosen by the OS so it can never collide with another process.
 // The database path is resolved through toroid.SqlitePath(), so TOROID_HOME is
@@ -50,7 +50,7 @@ func runWatch(out io.Writer, args []string) error {
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = server.Serve(ln) }()
 
-	fmt.Fprintf(out, "trk watch dashboard: http://%s\n", ln.Addr().String())
+	fmt.Fprintf(out, "trk web dashboard: http://%s\n", ln.Addr().String())
 	fmt.Fprintf(out, "database: %s\n", dbPath)
 	fmt.Fprintln(out, "press Ctrl-C to stop")
 
@@ -376,12 +376,12 @@ func summarize(s string, n int) string {
 
 func newPageTemplate(body string) *template.Template {
 	return template.Must(template.New("page").Funcs(tplFuncs).Parse(
-		`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>trk watch</title><style>` +
+		`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>trk web</title><style>` +
 			watchCSS + `</style></head><body><div class="wrap">` + body + `</div></body></html>`))
 }
 
 var indexTpl = newPageTemplate(`
-<header><h1><span class="dot">●</span> trk watch</h1><span class="breadcrumb">db: {{ .DBPath }}</span></header>
+<header><h1><span class="dot">●</span> trk web</h1><span class="breadcrumb">db: {{ .DBPath }}</span></header>
 <div class="cards">
   <div class="card"><div class="label">Sessions</div><div class="value">{{ .Count }}</div></div>
   <div class="card"><div class="label">Total spend</div><div class="value">{{ .Total | moneyFmt }}</div></div>
@@ -434,7 +434,7 @@ func watchIndex(w http.ResponseWriter, r *http.Request) {
 }
 
 var traceTpl = newPageTemplate(`
-<header><h1><span class="dot">●</span> trk watch</h1><span class="breadcrumb"><a href="/">← sessions</a></span></header>
+<header><h1><span class="dot">●</span> trk web</h1><span class="breadcrumb"><a href="/">← sessions</a></span></header>
 <div class="span-head"><h2 style="margin:0">{{ if .Trace.Title }}{{ .Trace.Title }}{{ else }}<span class="muted">(untitled)</span>{{ end }}</h2><span class="chip">{{ .Trace.TraceID | shortID }}</span></div>
 <div class="cards">
   <div class="card"><div class="label">Started</div><div class="value small">{{ .Trace.StartedAt | timeFmt }}</div></div>
@@ -603,7 +603,7 @@ func listTraces() (any, error) {
 
 // openWatchDB opens a second, read-only handle to the Toroid SQLite database so
 // the server can read the current on-disk state even while a kernel (or another
-// `trk watch`) holds the primary handle open.
+// `trk web`) holds the primary handle open.
 func openWatchDB() (*sql.DB, error) {
 	path, err := toroid.SqlitePath()
 	if err != nil {
