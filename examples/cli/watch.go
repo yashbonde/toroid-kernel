@@ -41,10 +41,8 @@ func runWatch(out io.Writer, args []string) error {
 	handler.HandleFunc("/api/traces", watchJSON(func() (any, error) { return listTraces() }))
 	handler.HandleFunc("/api/traces/", watchTrace)
 
-	// A fixed port could already be in use (another `trk watch`, or any app);
-	// asking the kernel for port 0 hands back a random free loopback port, which
-	// is what "random fixed port" needs: stable for this process, never colliding.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	// Fixed loopback port so the dashboard URL is stable across restarts.
+	ln, err := net.Listen("tcp", "127.0.0.1:51465")
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
