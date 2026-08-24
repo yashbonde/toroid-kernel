@@ -74,12 +74,6 @@ type tuiTurnDoneMsg struct {
 	grandTotal int64
 }
 
-// tuiQueueDrainedMsg announces that messages enqueued while a turn was running
-// have been injected at the next turn boundary (EventQueueInterrupt). Each
-// message is rendered as a normal user row so it does not silently disappear.
-type tuiQueueDrainedMsg struct {
-	messages []string
-}
 
 // spinnerTick requests the next animation frame while the kernel is busy.
 type spinnerTick struct{}
@@ -163,6 +157,9 @@ type tuiModel struct {
 	// composer only needs a new height when its content wraps to a new visual
 	// row, so the viewport is re-derived only when this actually changes.
 	lastInputHeight int
+	// sessionTitle is the auto-generated or user-renamed title for the current
+	// session, shown in green after the username in the transcript header.
+	sessionTitle string
 }
 
 var (
@@ -172,6 +169,7 @@ var (
 	inkColor       = lipgloss.Color("#18212F")
 	blueStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
 	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
+	greenStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A"))
 	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
 	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
 	errorBoldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156")).Bold(true)
@@ -359,7 +357,7 @@ func (m *tuiModel) finishTool(id, errText string) {
 	label := m.runningTools[idx].label
 	elapsed := time.Since(m.runningTools[idx].start)
 	if errText != "" {
-		label = label + " ⨯ " + compactToolText(errText, 120)
+		label = label + " ⨯ " + compactToolText(errText, 80)
 	}
 	if d := formatDuration(elapsed); d != "" {
 		label = label + " … " + d
@@ -486,6 +484,15 @@ func (m *tuiModel) usernameLabel(num int) string {
 	return name
 }
 
+// usernameLine returns the full user header line including optional session title.
+func (m *tuiModel) usernameLine(num int) string {
+	line := boldInkStyle.Render(m.usernameLabel(num) + " >")
+	if m.sessionTitle != "" {
+		line += " " + greenStyle.Render(m.sessionTitle)
+	}
+	return line
+}
+
 func (m *tuiModel) renderTranscript() {
 	availableWidth := max(1, m.width)
 	type renderedRow struct {
@@ -506,7 +513,7 @@ func (m *tuiModel) renderTranscript() {
 		switch entry.kind {
 		case transcriptUser:
 			text = ansi.Hardwrap(text, availableWidth, false)
-			header := boldInkStyle.Render(m.usernameLabel(entry.userNum) + " >")
+			header := m.usernameLine(entry.userNum)
 			entry.rendered = lipgloss.NewStyle().Background(userColor).Foreground(inkColor).Width(availableWidth).Render(header + "\n" + text + "\n" + timestampLabel(entry.ts))
 		case transcriptAssistant:
 			// Do not right-pad assistant/tool lines. The viewport owns blank cells;
@@ -853,12 +860,6 @@ func (m *tuiModel) subscribeEvents() {
 		}
 		return nil
 	})
-	k.On(toroid.EventQueueInterrupt, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.QueueInterruptPayload); ok && len(p.Messages) > 0 {
-			m.events <- tuiQueueDrainedMsg{messages: p.Messages}
-		}
-		return nil
-	})
 }
 
 func (m *tuiModel) submit(prompt string) tea.Cmd {
@@ -866,6 +867,19 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.toolCallSeq = 0
 	m.lastNarratedToolNum = 0
 	m.input.Reset()
+	// Generate a title from the first user prompt.
+	if m.userSeq == 0 && m.sessionTitle == "" {
+		words := strings.Fields(prompt)
+		if len(words) > 6 {
+			words = words[:6]
+		}
+		if title := strings.Join(words, " "); title != "" {
+			m.sessionTitle = title
+			if m.kernel != nil && m.kernel.Store != nil {
+				_ = m.kernel.Store.UpdateTraceTitle(m.kernel.SessionID(), title)
+			}
+		}
+	}
 	m.addEntry(transcriptUser, prompt)
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.cancelTurn = cancel
@@ -927,6 +941,7 @@ func (m *tuiModel) newSession() {
 	m.runningTools = nil
 	m.userSeq = 0
 	m.toolCallSeq = 0
+	m.sessionTitle = ""
 	m.addEntry(transcriptActivity, "— new session —")
 }
 
@@ -959,8 +974,24 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 	case "/delegate":
 		m.addEntry(transcriptActivity, "Type /delegate <task> to dispatch a task to another agent")
 		return nil, true
+	case "/rename":
+		rest := strings.TrimSpace(strings.TrimPrefix(line, "/rename"))
+		if rest == "" {
+			m.addEntry(transcriptActivity, "usage: /rename <title> — rename the current session (max 50 chars)")
+			return nil, true
+		}
+		runes := []rune(rest)
+		if len(runes) > 50 {
+			rest = string(runes[:50])
+		}
+		m.sessionTitle = rest
+		if m.kernel != nil && m.kernel.Store != nil {
+			_ = m.kernel.Store.UpdateTraceTitle(m.kernel.SessionID(), rest)
+		}
+		m.addEntry(transcriptActivity, fmt.Sprintf("renamed to %q", rest))
+		return nil, true
 	case "/help", "/?":
-		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /new /reset /clear /exit /delegate")
+		m.addEntry(transcriptActivity, "Enter send · Shift+Enter new line · Esc cancel turn · Ctrl+C quit\n/help /cost /model /new /reset /clear /exit /delegate /rename")
 		return nil, true
 	default:
 		m.addEntry(transcriptActivity, fmt.Sprintf("unknown command %q — try /help", line))
@@ -1008,18 +1039,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if prompt == "" {
 				return m, nil
 			}
-			// While a turn is already running, queue the new message instead of
-			// dropping it: the kernel injects it at the next turn boundary
-			// (QueueInterrupt). This replaces the old "busy -> ignore" behavior.
 			if m.busy {
-				m.input.Reset()
-				if strings.HasPrefix(prompt, "/") {
-					m.addEntry(transcriptActivity, "can't run commands while busy — finished this turn first")
-					return m, nil
-				}
-				m.addEntry(transcriptUser, prompt)
-				m.addEntry(transcriptActivity, "queued — will run after this turn")
-				m.kernel.Enqueue(withAgentsReminder(prompt, m.kernel.Cfg.WorkDir))
 				return m, nil
 			}
 			if strings.HasPrefix(prompt, "/delegate") {
@@ -1083,15 +1103,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transcript.GotoBottom()
 			}
 		}
-	case tuiQueueDrainedMsg:
-		// The messages were already shown as user rows at enqueue time; the
-		// kernel has now injected them at the turn boundary, so just confirm
-		// the flush rather than duplicating the content.
-		if n := len(msg.messages); n == 1 {
-			m.addEntry(transcriptActivity, "→ queued message injected")
-		} else if n > 1 {
-			m.addEntry(transcriptActivity, fmt.Sprintf("→ %d queued messages injected", n))
-		}
 	case tuiTurnDoneMsg:
 		m.busy = false
 		m.cancelTurn = nil
@@ -1121,7 +1132,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var inputCmd tea.Cmd
 	m.input, inputCmd = m.input.Update(msg)
 	cmds = append(cmds, inputCmd)
-	m.transcript, _ = m.transcript.Update(msg)
+	// Only forward non-keypress messages to the viewport so left/right arrow
+	// keys (which the textarea needs for cursor movement) do not trigger
+	// unwanted horizontal scroll. We handle all viewport scrolling explicitly
+	// via pgup/pgdown/ctrl+up/ctrl+down.
+	if _, ok := msg.(tea.KeyPressMsg); !ok {
+		m.transcript, _ = m.transcript.Update(msg)
+	}
 	m.resize()
 	return m, tea.Batch(cmds...)
 }
@@ -1187,6 +1204,9 @@ func (m *tuiModel) View() tea.View {
 	headerMeta = ansi.Truncate(headerMeta, max(1, m.width), "")
 	header := accentStyle.Render("TOROID KERNEL INTERFACE") + "  " + boldInkStyle.Render(shortModel(m.cfg.model)) + "\n" + headerMeta
 	label := accentStyle.Render(m.username + " >")
+	if m.sessionTitle != "" {
+		label += " " + greenStyle.Render(m.sessionTitle)
+	}
 	usageBar := ansi.Truncate(m.renderUsageBar(), max(1, m.width), "")
 	separator := dimStyle.Render(strings.Repeat("─", max(1, m.width)))
 	body := header + "\n" + separator + "\n" + m.transcript.View() + "\n" + separator + "\n" + label + "\n" + composer + "\n" + separator + "\n" + usageBar

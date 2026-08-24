@@ -107,6 +107,15 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			return nil // end of chat
 		}
 
+		// Write assistant text before executing tools so the front-end (TUI, --run)
+		// shows the model's reasoning or explanation alongside tool calls.
+		if text := llm.TextOf(res.Content); text != "" {
+			if _, err := io.WriteString(w, text); err != nil {
+				k.fireTurnFailed(ctx, metadata, err)
+				return err
+			}
+		}
+
 		// Execute tools locally (not an llm-step) and append their results.
 		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
 		persist = append(persist, k.appendStepMessages(ctx, []llm.Message{toolMsg})...)
