@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -91,6 +92,62 @@ type Response struct {
 	FinishReason FinishReason
 	Usage        Usage
 	CallID       string // x-litellm-call-id
+	Gateway      GatewayInfo
+}
+
+// GatewayInfo is the per-call telemetry an LLM gateway reports in response
+// headers. Populated best-effort: a gateway that omits a header simply leaves
+// the field zero / CostUSD nil.
+//
+//	X-LLM-Gateway-Request-Id  stable per-request identifier
+//	X-LLM-Gateway-Wall-Ms     gateway overhead in ms (excludes provider time)
+//	X-LLM-Gateway-Cost        cost in MICRO-USD (the gateway's ledger unit)
+type GatewayInfo struct {
+	RequestID string
+	WallMs    int64
+	// CostUSD is the gateway's authoritative cost for this call, converted from
+	// micro-USD to USD. nil when the gateway reported no cost header — distinct
+	// from a real zero, so pricing can honestly fall back to the catalog.
+	CostUSD *float64
+}
+
+// microUSDHeader parses a micro-USD integer cost header into USD. Returns nil
+// when the header is absent or unparseable, so a malformed value degrades to
+// "unknown cost" rather than a bogus zero.
+func microUSDHeader(h http.Header, name string) *float64 {
+	v := strings.TrimSpace(h.Get(name))
+	if v == "" {
+		return nil
+	}
+	micro, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return nil
+	}
+	usd := micro / 1e6
+	return &usd
+}
+
+// gatewayInfoFrom reads the X-LLM-Gateway-* telemetry headers. Header lookup is
+// case-insensitive (net/http canonicalizes), so the documented capitalization
+// and the wire form both resolve.
+func gatewayInfoFrom(h http.Header) GatewayInfo {
+	gi := GatewayInfo{
+		RequestID: h.Get("X-LLM-Gateway-Request-Id"),
+		CostUSD:   microUSDHeader(h, "X-LLM-Gateway-Cost"),
+	}
+	if ms, err := strconv.ParseInt(strings.TrimSpace(h.Get("X-LLM-Gateway-Wall-Ms")), 10, 64); err == nil {
+		gi.WallMs = ms
+	}
+	// LiteLLM-style gateways report cost in whole USD under a different header;
+	// honour it when the gateway-native one is absent so both routes are priced.
+	if gi.CostUSD == nil {
+		if v := strings.TrimSpace(h.Get("x-litellm-response-cost")); v != "" {
+			if usd, err := strconv.ParseFloat(v, 64); err == nil {
+				gi.CostUSD = &usd
+			}
+		}
+	}
+	return gi
 }
 
 // Text returns the assistant text of the response.
@@ -123,8 +180,9 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		return nil, fmt.Errorf("decode response: %w (%s)", err, snippet(data))
 	}
 	resp := &Response{
-		Usage:  wire.Usage.toUsage(),
-		CallID: httpResp.Header.Get("x-litellm-call-id"),
+		Usage:   wire.Usage.toUsage(),
+		CallID:  httpResp.Header.Get("x-litellm-call-id"),
+		Gateway: gatewayInfoFrom(httpResp.Header),
 	}
 	if len(wire.Choices) > 0 {
 		ch := wire.Choices[0]
@@ -278,6 +336,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 			FinishReason: normalizeFinishReason(finish),
 			Usage:        usage.toUsage(),
 			CallID:       httpResp.Header.Get("x-litellm-call-id"),
+			Gateway:      gatewayInfoFrom(httpResp.Header),
 		}
 		if aborted && finalErr == nil {
 			finalErr = ctx.Err()

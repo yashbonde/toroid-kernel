@@ -48,16 +48,27 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 	return req
 }
 
-// usageFrom copies the wire token counts and prices the step from the model's
-// cached per-token rates. When the model has no price entry, cost stays honestly
-// unknown (PricingOK is false).
-func usageFrom(model Model, wire llm.Usage) Usage {
+// usageFrom copies the wire token counts and prices the step.
+//
+// The gateway's own cost header wins when present (X-LLM-Gateway-Cost in
+// micro-USD, or the LiteLLM x-litellm-response-cost in USD): it is the
+// biller's authoritative number, already reflecting per-deployment rates,
+// discounts, and margin, none of which a client-side catalog can know. Only
+// when the gateway reports nothing do we fall back to the model's cached
+// per-token rates. With neither, cost stays honestly unknown (PricingOK false)
+// rather than silently zero.
+func usageFrom(model Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
 	u := Usage{
 		Input:      wire.Input,
 		Output:     wire.Output,
 		Reasoning:  wire.Reasoning,
 		CacheRead:  wire.CacheRead,
 		CacheWrite: wire.CacheWrite,
+	}
+	if gw.CostUSD != nil {
+		u.Cost = *gw.CostUSD
+		u.PricingOK = true
+		return u
 	}
 	if model.Price != nil {
 		p := model.Price
@@ -76,7 +87,7 @@ func (s *GatewayStep) Complete(ctx context.Context, model Model, c Context, opts
 	}
 	return &AssistantMessage{
 		Content:    resp.Content,
-		Usage:      usageFrom(model, resp.Usage),
+		Usage:      usageFrom(model, resp.Usage, resp.Gateway),
 		StopReason: stopReasonFromFinish(resp.FinishReason),
 	}, nil
 }
@@ -123,7 +134,7 @@ func (s *GatewayStep) CompleteObject(ctx context.Context, model Model, c Context
 	return &ObjectResult{
 		Object:     obj,
 		RawText:    raw,
-		Usage:      usageFrom(model, resp.Usage),
+		Usage:      usageFrom(model, resp.Usage, resp.Gateway),
 		StopReason: stopReasonFromFinish(resp.FinishReason),
 	}, nil
 }
@@ -158,7 +169,7 @@ func (s *GatewayStep) Stream(ctx context.Context, model Model, c Context, opts S
 		var u Usage
 		reason := StopReasonOther
 		if resp != nil {
-			u = usageFrom(model, resp.Usage)
+			u = usageFrom(model, resp.Usage, resp.Gateway)
 			reason = stopReasonFromFinish(resp.FinishReason)
 		}
 		if errors.Is(err, context.Canceled) || (err == nil && ctx.Err() != nil) {
