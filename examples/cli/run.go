@@ -39,10 +39,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
+	"github.com/yashbonde/toroid-kernel/llm"
 	toroid "github.com/yashbonde/toroid-kernel"
 )
+
+// assistantTextFromTurn extracts the assistant's written text from a completed
+// turn's structured content ([]llm.Message). The kernel streams a turn's text
+// to the writer only for the final, no-tool turn; for tool-calling turns that
+// text lives solely in the TurnCompleted event payload, so the CLI renders it
+// from there. Returns "" when the payload carries no assistant text.
+func assistantTextFromTurn(p *toroid.TurnPayload) string {
+	if len(p.Content) == 0 {
+		return ""
+	}
+	var msgs []llm.Message
+	if err := json.Unmarshal(p.Content, &msgs); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, m := range msgs {
+		if m.Role == llm.RoleAssistant {
+			sb.WriteString(m.Text())
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
 
 // runOneShot implements `toroid --run '<prompt>'`. It reuses the shared config
 // (so --model/--thinking/--save/etc. apply) and the resolved API key.
@@ -83,6 +107,18 @@ func runOneShot(cfg config, apiKey string) error {
 		// stdout stays purely the final answer; live tool activity goes to
 		// stderr through the same box renderer the REPL uses.
 		emitPlain := func(s string) { fmt.Fprint(os.Stderr, s) }
+		// The kernel writes a turn's text to the stream only for the final,
+		// no-tool turn. Render the intermediate assistant text from the
+		// TurnCompleted event so the reader sees the model's running narration
+		// alongside the tool activity, not just the final answer.
+		k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+			if p, ok := e.Payload.(*toroid.TurnPayload); ok && p.ToolCalls > 0 {
+				if text := assistantTextFromTurn(p); text != "" {
+					emitPlain(aGray + text + aReset + "\n")
+				}
+			}
+			return nil
+		})
 		k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 			if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
 				emitPlain(renderToolCall(p.Name, p.Args, cfg.workdir, termWidth()))

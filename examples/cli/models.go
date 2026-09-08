@@ -25,7 +25,9 @@ type modelsResponse struct {
 // runModels implements `trk models`. Model IDs are printed one per line so the
 // output remains useful both at a terminal and in shell pipelines. When the
 // gateway reports a model's context window it is shown after the id in
-// parentheses; models without a reported window print id only.
+// parentheses; models without a reported window print id only. The endpoint
+// that was called and any locally-catalogued per-token rates are rendered in
+// grey.
 func runModels(ctx context.Context, out io.Writer, args []string) error {
 	if len(args) != 0 {
 		return fmt.Errorf("takes no arguments")
@@ -45,14 +47,33 @@ func runModels(ctx context.Context, out io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/models"
+	fmt.Fprintf(out, "%sGET %s%s\n", aGray, endpoint, aReset)
 	for _, model := range models {
+		line := model.ID
 		if model.ContextLength > 0 {
-			fmt.Fprintf(out, "%s (%d)\n", model.ID, model.ContextLength)
+			line = fmt.Sprintf("%s (%d)", model.ID, model.ContextLength)
+		}
+		if rate := modelPriceSuffix(model.ID); rate != "" {
+			fmt.Fprintf(out, "%s  %s%s%s\n", line, aGray, rate, aReset)
 		} else {
-			fmt.Fprintln(out, model.ID)
+			fmt.Fprintln(out, line)
 		}
 	}
 	return nil
+}
+
+// modelPriceSuffix renders a model's locally-catalogued USD per-token rates as
+// a compact grey "in / out per MTok" string, or "" when the catalog has no
+// pricing for the id (rates are cached in code because no provider exposes
+// them via the /models API).
+func modelPriceSuffix(id string) string {
+	price := toroid.ResolveModel(id).Price
+	if price == nil {
+		return ""
+	}
+	return fmt.Sprintf("$%.2f / $%.2f per MTok", price.In*1e6, price.Out*1e6)
 }
 
 type listedModel struct {

@@ -1040,25 +1040,35 @@ func (k *Kernel) SpawnBackground(task string) string {
 // boundary (QueueInterrupt).
 func (k *Kernel) tryResume(ctx context.Context) error {
 	k.wakeMu.Lock()
-	defer k.wakeMu.Unlock()
 
 	if k.running.Load() {
+		k.wakeMu.Unlock()
 		return nil // a live loop will drain the queue itself
 	}
 	msgs := k.drainQueue()
 	if len(msgs) == 0 {
+		k.wakeMu.Unlock()
 		_ = k.Fire(ctx, string(EventMasterIdle), nil)
 		return nil
 	}
+	// Mark running while still holding the lock so a concurrent tryResume (e.g. a
+	// second finishing background goroutine) sees the loop as active and neither
+	// double-resumes nor fires a spurious MasterIdle.
+	k.running.Store(true)
+	w := k.lastWriter
+	if w == nil {
+		w = io.Discard
+	}
+	// Release the lock before resuming: streamCurrent calls tryResume again at its
+	// own tail (mutual recursion), which must not deadlock on this non-reentrant
+	// mutex. The atomic running/queue decision above is already made.
+	k.wakeMu.Unlock()
+
 	ctx = WithGatewayTrace(ctx)
 	ctx = k.withRequestChat(ctx)
 	// System prompt is Step-owned; only inject the queued user messages.
 	for _, m := range msgs {
 		k.History = append(k.History, llm.NewUserMessage(m))
-	}
-	w := k.lastWriter
-	if w == nil {
-		w = io.Discard
 	}
 	return k.streamCurrent(ctx, w, &spendBudget{turnStartUSD: k.RunningCostUSD()})
 }

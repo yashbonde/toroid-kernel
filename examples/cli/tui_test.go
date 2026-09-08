@@ -110,10 +110,9 @@ func TestTranscriptHasNoTrailingOverflowRow(t *testing.T) {
 		entries:    []transcriptEntry{{kind: transcriptAssistant, text: "12345678901234567890", done: true}},
 	}
 	m.renderTranscript()
-	// Leading gap (1) + model header (1) + blank separator (1) + content (1)
-	// + timestamp (1) + trailing gap newline (1).
-	if got := m.transcript.TotalLineCount(); got != 6 {
-		t.Fatalf("exact-width assistant entry rendered as %d rows, want 6", got)
+	// Content (1) + blank separator (1) + timestamp (1).
+	if got := m.transcript.TotalLineCount(); got != 3 {
+		t.Fatalf("exact-width assistant entry rendered as %d rows, want 3", got)
 	}
 }
 
@@ -261,5 +260,108 @@ func TestToolLifecycleShowsLiveAndCommittedRows(t *testing.T) {
 	}
 	if len(m.runningTools) != 0 {
 		t.Fatalf("runningTools not cleared after all finish: %#v", m.runningTools)
+	}
+}
+
+func TestAsyncSubagentResultIsRendered(t *testing.T) {
+	input := textarea.New()
+	transcript := viewport.New()
+	m := &tuiModel{
+		width: 80, height: 24, input: input, transcript: transcript,
+		cfg: &config{model: "test"}, kernel: &toroid.Kernel{Cfg: toroid.Config{TotalContextSize: 200000}},
+	}
+	m.resize()
+
+	m.startSubagent("bg-1", "research the API")
+	// A running subagent shows the blue animated row but no committed result yet.
+	if got := ansi.Strip(m.transcript.View()); !strings.Contains(got, "subagent research the API") {
+		t.Fatalf("started subagent row missing:\n%q", got)
+	}
+
+	m.stopSubagent("bg-1", "found 3 endpoints\n- /v1/a\n- /v1/b\n- /v1/c")
+	got := ansi.Strip(m.transcript.View())
+	if len(m.runningSubagents) != 0 {
+		t.Fatalf("runningSubagents not cleared: %#v", m.runningSubagents)
+	}
+	if !strings.Contains(got, "subagent bg-1: found 3 endpoints - /v1/a - /v1/b - /v1/c") {
+		t.Fatalf("finished subagent result not rendered:\n%q", got)
+	}
+}
+
+func TestIntermediateTextPlacedBeforeItsTurnTools(t *testing.T) {
+	input := textarea.New()
+	transcript := viewport.New()
+	m := &tuiModel{
+		width: 80, height: 24, input: input, transcript: transcript,
+		cfg: &config{model: "test-model"}, kernel: &toroid.Kernel{Cfg: toroid.Config{TotalContextSize: 200000}},
+	}
+	m.resize()
+
+	// Turn 1: tool commits first, narration arrives after it (real event order).
+	m.startTool("id1", "read  foo.go", 1)
+	m.finishTool("id1", "")
+	m.appendIntermediate("Let me check the file.")
+	// Turn 2: another tool, then its narration.
+	m.startTool("id2", "edit  bar.go", 2)
+	m.finishTool("id2", "")
+	m.appendIntermediate("Now I have what I need.")
+	// Final answer streams after the last tool.
+	m.appendStream("Done.")
+
+	// Assert the entry order, not the padded viewport, so spacing/width don't
+	// hide the interleaving.
+	var kinds, texts []string
+	for _, e := range m.entries {
+		kinds = append(kinds, []string{"user", "assistant", "activity", "tool"}[e.kind])
+		texts = append(texts, strings.TrimSpace(e.text))
+	}
+	got := strings.Join(texts, " | ")
+	if !strings.Contains(got, "Let me check the file.") || !strings.Contains(got, "Now I have what I need.") {
+		t.Fatalf("narration missing: %q", got)
+	}
+	if !strings.HasPrefix(got, "Let me check the file.") {
+		t.Fatalf("turn 1 narration not first: %q", got)
+	}
+	// Narration must precede the tool of its own turn, and the final answer
+	// streams after the last tool.
+	if want := "Let me check the file. | read  foo.go | Now I have what I need. | edit  bar.go | Done."; got != want {
+		t.Fatalf("entry order = %q, want %q\nkinds=%v", got, want, kinds)
+	}
+}
+
+func TestNarrationAndToolsReadAsContinuousBlock(t *testing.T) {
+	input := textarea.New()
+	transcript := viewport.New()
+	transcript.SoftWrap = true
+	m := &tuiModel{width: 80, height: 40, input: input, transcript: transcript,
+		cfg: &config{model: "m"}, kernel: &toroid.Kernel{Cfg: toroid.Config{TotalContextSize: 200000}}}
+	m.resize()
+	m.addEntry(transcriptUser, "run make cli")
+	m.lastNarratedToolNum = 0
+	m.startTool("id1", "bash  make cli", 1)
+	m.finishTool("id1", "")
+	m.appendIntermediate("narration one")
+	m.startTool("id2", "bash  ls", 2)
+	m.finishTool("id2", "")
+	m.startTool("id3", "bash  rm", 3)
+	m.finishTool("id3", "")
+	m.appendIntermediate("narration two")
+	m.appendStream("final")
+
+	got := ansi.Strip(m.transcript.View())
+	// Blank lines mark narration<->tool transitions, but consecutive tool rows
+	// stay flush. Trim trailing per-line padding (viewport fills to width).
+	trimmed := make([]string, 0, len(strings.Split(got, "\n")))
+	for _, ln := range strings.Split(got, "\n") {
+		trimmed = append(trimmed, strings.TrimRight(ln, " "))
+	}
+	content := strings.Join(trimmed, "\n")
+	// Blank line at narration->tool and tool->narration transitions.
+	if !strings.Contains(content, "narration one\n\n1 ⚙ bash  make cli\n\nnarration two\n\n2 ⚙ bash  ls\n3 ⚙ bash  rm\n\nfinal") {
+		t.Fatalf("blank-line placement around tools wrong:\n%q", content)
+	}
+	// Consecutive tool rows stay flush (no blank line between them).
+	if !strings.Contains(content, "2 ⚙ bash  ls\n3 ⚙ bash  rm") {
+		t.Fatalf("consecutive tool rows not flush:\n%q", content)
 	}
 }

@@ -28,6 +28,11 @@ type tuiOutputMsg string
 // whole agent loop finishes. It is rendered into the assistant entry below.
 type tuiStreamMsg string
 
+// tuiIntermediateMsg carries the assistant's written text from a tool-calling
+// turn. The kernel streams text to the writer only for the final no-tool turn,
+// so this intermediate narration is reconstructed from the TurnCompleted event.
+type tuiIntermediateMsg string
+
 // tuiToolMsg announces a tool call that has just started. id is the stable
 // tool_call_id from the LLM (links the Pre and Post events); label is the
 // single-row display text (operation + trimmed target) shown with an animated
@@ -38,10 +43,13 @@ type tuiToolMsg struct {
 	num   int
 }
 
-// tuiSubagentMsg announces a subagent start or stop.
+// tuiSubagentMsg announces a subagent start or stop. output is the subagent's
+// final text, populated on the stop event; the TUI renders it so a finished
+// background agent's result is visible rather than silently discarded.
 type tuiSubagentMsg struct {
 	id     string // session ID
 	prompt string
+	output string
 	start  bool // true = start, false = stop
 	async  bool
 }
@@ -137,6 +145,12 @@ type tuiModel struct {
 	// toolCallSeq is the monotonic counter for tool calls within the current
 	// turn, reset to 0 on each new turn.
 	toolCallSeq int
+	// lastNarratedToolNum is the highest committed tool number whose turn's
+	// narration has already been placed. A turn's narration arrives (via
+	// TurnCompleted) after its tools are committed, so it must be inserted
+	// before that turn's first tool row rather than appended at the end —
+	// this tracks how far those insertions have progressed.
+	lastNarratedToolNum int
 	// userSeq is the monotonic counter for user messages across the session,
 	// shown as "[n]" before the username in the transcript header.
 	userSeq int
@@ -297,9 +311,18 @@ func (m *tuiModel) startSubagent(id, prompt string) {
 	m.transcript.GotoBottom()
 }
 
-// stopSubagent removes the async subagent from the running set.
-func (m *tuiModel) stopSubagent(id string) {
+// stopSubagent removes the async subagent from the running set and commits its
+// result (if any) as a settled transcript row, so a finished background agent's
+// output is visible rather than silently discarded.
+func (m *tuiModel) stopSubagent(id, output string) {
 	delete(m.runningSubagents, id)
+	if trimmed := strings.TrimSpace(output); trimmed != "" {
+		m.entries = append(m.entries, transcriptEntry{
+			kind: transcriptActivity,
+			text: "⚡ subagent " + id + ": " + compactToolText(trimmed, 120),
+			ts:   time.Now(),
+		})
+	}
 	m.renderTranscript()
 	m.transcript.GotoBottom()
 }
@@ -374,6 +397,49 @@ func (m *tuiModel) appendStream(text string) {
 	m.transcript.GotoBottom()
 }
 
+// appendIntermediate places the assistant's narration from a tool-calling turn.
+// The kernel emits a turn's tools first (PreToolUse/PostToolUse) and its written
+// narration afterwards (TurnCompleted), so a narration chunk must be inserted
+// before that turn's first committed tool row — otherwise every narration chunk
+// would pile up after all the tools, out of the order it was actually said. The
+// current turn is delimited by lastNarratedToolNum: narration belongs ahead of
+// the first tool row with a higher number.
+func (m *tuiModel) appendIntermediate(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	entry := transcriptEntry{kind: transcriptAssistant, text: text, ts: time.Now()}
+	insertAt := len(m.entries)
+	for i := len(m.entries) - 1; i >= 0; i-- {
+		if m.entries[i].kind == transcriptTool && m.entries[i].num > m.lastNarratedToolNum {
+			insertAt = i
+			continue
+		}
+		break
+	}
+	m.entries = append(m.entries, transcriptEntry{})
+	copy(m.entries[insertAt+1:], m.entries[insertAt:])
+	m.entries[insertAt] = entry
+	m.lastNarratedToolNum = currentTurnToolMax(m.entries, m.lastNarratedToolNum)
+	m.renderTranscript()
+	m.transcript.GotoBottom()
+}
+
+// currentTurnToolMax returns the highest tool number currently present in the
+// transcript, clamped to be no lower than floor. Used to advance
+// lastNarratedToolNum so the next narration chunk is inserted after this turn's
+// tools.
+func currentTurnToolMax(entries []transcriptEntry, floor int) int {
+	max := floor
+	for i := range entries {
+		if entries[i].kind == transcriptTool && entries[i].num > max {
+			max = entries[i].num
+		}
+	}
+	return max
+}
+
 // timestampLabel renders the grey per-message timestamp suffix.
 func timestampLabel(ts time.Time) string {
 	return dimStyle.Render(ts.Format("[02/01 15:04]"))
@@ -400,14 +466,6 @@ func formatDuration(d time.Duration) string {
 	}
 }
 
-// modelLabel returns the display label for an assistant message header.
-func (m *tuiModel) modelLabel() string {
-	if m.cfg != nil && m.cfg.model != "" {
-		return shortModel(m.cfg.model)
-	}
-	return "model"
-}
-
 // usernameLabel returns the display label for a user message header, prefixed
 // with the monotonic "[n]" index when set (see userNum).
 func (m *tuiModel) usernameLabel(num int) string {
@@ -423,7 +481,11 @@ func (m *tuiModel) usernameLabel(num int) string {
 
 func (m *tuiModel) renderTranscript() {
 	availableWidth := max(1, m.width)
-	var rendered []string
+	type renderedRow struct {
+		kind     transcriptKind
+		rendered string
+	}
+	var rendered []renderedRow
 	for i := range m.entries {
 		entry := &m.entries[i]
 		text := strings.TrimSpace(entry.text)
@@ -431,7 +493,7 @@ func (m *tuiModel) renderTranscript() {
 			continue
 		}
 		if entry.rendered != "" && entry.renderedWidth == availableWidth {
-			rendered = append(rendered, entry.rendered)
+			rendered = append(rendered, renderedRow{kind: entry.kind, rendered: entry.rendered})
 			continue
 		}
 		switch entry.kind {
@@ -443,24 +505,21 @@ func (m *tuiModel) renderTranscript() {
 			// Do not right-pad assistant/tool lines. The viewport owns blank cells;
 			// padding to its exact width can produce a wrapped overflow cell after
 			// ANSI style resets in some terminals.
-			header := boldInkStyle.Render(m.modelLabel() + " >")
 			text = renderAssistantText(text, availableWidth)
-			var body string
-			if text == "" {
-				body = "\n" + header
-			} else {
-				body = "\n" + header + "\n\n" + text
-			}
 			// Only stamp the completion time (and time taken) once the turn has
 			// fully answered, so the suffix does not flicker mid-stream.
+			body := text
 			if entry.done {
 				stamp := timestampLabel(entry.ts)
 				if d := formatDuration(entry.elapsed); d != "" {
 					stamp += "  " + dimStyle.Render("· "+d)
 				}
-				body += "\n" + stamp
+				if body != "" {
+					body += "\n\n"
+				}
+				body += stamp
 			}
-			entry.rendered = lipgloss.NewStyle().Foreground(inkColor).Render(body) + "\n"
+			entry.rendered = lipgloss.NewStyle().Foreground(inkColor).Render(body)
 		case transcriptActivity:
 			entry.rendered = dimStyle.Render(renderAssistantText(text, availableWidth))
 		case transcriptTool:
@@ -475,7 +534,7 @@ func (m *tuiModel) renderTranscript() {
 			}
 		}
 		entry.renderedWidth = availableWidth
-		rendered = append(rendered, entry.rendered)
+		rendered = append(rendered, renderedRow{kind: entry.kind, rendered: entry.rendered})
 	}
 	// Running tool calls are drawn as live animated rows below the settled
 	// transcript — one per in-flight call, each with its dots cycling via the
@@ -486,16 +545,34 @@ func (m *tuiModel) renderTranscript() {
 		elapsed := dimStyle.Render(" · " + formatDuration(time.Since(m.runningTools[i].start)))
 		numPrefix := dimStyle.Render(fmt.Sprintf("%d ", m.runningTools[i].num))
 		toolLine := numPrefix + accentStyle.Render("⚙ ") + dimStyle.Render(m.runningTools[i].label) + " " + accentStyle.Render(dots) + elapsed
-		rendered = append(rendered, toolLine)
+		rendered = append(rendered, renderedRow{kind: transcriptTool, rendered: toolLine})
 	}
 	// Running async subagents draw as blue animated rows with elapsed time.
 	for id, start := range m.runningSubagents {
 		dots := spinnerFrames[(m.spinnerFrame+len(m.runningTools))%len(spinnerFrames)]
 		elapsed := dimStyle.Render(" · " + formatDuration(time.Since(start)))
-		toolLine := blueStyle.Render("⚡ ") + dimStyle.Render("subagent "+id[:12]+"…") + " " + blueStyle.Render(dots) + elapsed
-		rendered = append(rendered, toolLine)
+		toolLine := blueStyle.Render("⚡ ") + dimStyle.Render("subagent "+shortID(id)) + "… " + blueStyle.Render(dots) + elapsed
+		rendered = append(rendered, renderedRow{kind: transcriptTool, rendered: toolLine})
 	}
-	m.transcript.SetContent(strings.Join(rendered, "\n"))
+	// Join settled entries: a blank line separates distinct messages (after a
+	// user prompt) and marks each transition between narration and a tool box
+	// (text->tool or tool->text), while consecutive tool rows stay flush and
+	// assistant narration reads as one continuous block.
+	var sb strings.Builder
+	for i, r := range rendered {
+		if i == 0 {
+			sb.WriteString(r.rendered)
+			continue
+		}
+		prev := rendered[i-1].kind
+		sep := "\n"
+		if prev == transcriptUser || (r.kind == transcriptTool) != (prev == transcriptTool) {
+			sep = "\n\n"
+		}
+		sb.WriteString(sep)
+		sb.WriteString(r.rendered)
+	}
+	m.transcript.SetContent(sb.String())
 }
 
 // renderAssistantText is shared by the interactive viewport and --run
@@ -670,6 +747,17 @@ func (m *tuiModel) subscribeEvents() {
 		}
 		return nil
 	})
+	// Reconstruct the assistant's narration from tool-calling turns: the kernel
+	// only streams the final no-tool answer to the writer, so intermediate text
+	// arrives here via TurnCompleted instead.
+	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok && p.ToolCalls > 0 {
+			if text := assistantTextFromTurn(p); text != "" {
+				m.events <- tuiIntermediateMsg(text)
+			}
+		}
+		return nil
+	})
 	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
 			m.toolCallSeq++
@@ -698,7 +786,7 @@ func (m *tuiModel) subscribeEvents() {
 	})
 	k.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
 		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
-			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: false, async: true}
+			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, output: p.Output, start: false, async: true}
 		}
 		return nil
 	})
@@ -713,10 +801,9 @@ func (m *tuiModel) subscribeEvents() {
 func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.busy = true
 	m.toolCallSeq = 0
+	m.lastNarratedToolNum = 0
 	m.input.Reset()
 	m.addEntry(transcriptUser, prompt)
-	// Place the assistant header before any tool activity streams in.
-	m.addEntry(transcriptAssistant, "")
 	turnCtx, cancel := context.WithCancel(m.ctx)
 	m.cancelTurn = cancel
 
@@ -896,6 +983,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tuiStreamMsg:
 		m.appendStream(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
+	case tuiIntermediateMsg:
+		m.appendIntermediate(string(msg))
+		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiToolMsg:
 		m.startTool(msg.id, msg.label, msg.num)
 		cmds = append(cmds, waitTUIEvent(m.events))
@@ -906,7 +996,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.start {
 			m.startSubagent(msg.id, msg.prompt)
 		} else {
-			m.stopSubagent(msg.id)
+			m.stopSubagent(msg.id, msg.output)
 		}
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case spinnerTick:
