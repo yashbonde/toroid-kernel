@@ -40,15 +40,28 @@ type Kernel struct {
 	History            []llm.Message
 	Sessions           map[string]Usage // sessionID -> summed tokens + cost (self + subagents)
 	usageMu            sync.Mutex
-	currentTokens      int
-	runningCostUSD     float64
-	mcpClients         []io.Closer // open connections to configured MCP servers, closed in Close()
+	// reservedUSD is budget promised to subagents that are still running. Their
+	// spend does not reach runningCostUSD until they finish, so without a
+	// reservation two concurrent children each read the same headroom and the
+	// transcript cap is exceeded by however many run at once.
+	reservedUSD    float64
+	currentTokens  int
+	runningCostUSD float64
+	mcpClients     []io.Closer // open connections to configured MCP servers, closed in Close()
 
 	// message queue — callers enqueue messages that are injected at the next
 	// safe interruption point (turn boundary), causing the loop to continue
 	// with the queued messages appended to history.
 	messageQueue []string
 	queueMu      sync.Mutex
+
+	// reqSeq counts outbound LLM requests so parent_session_id is attached to
+	// the first one only (see nextRequestMetadata).
+	reqSeq atomic.Uint64
+
+	// newSubKernel builds the child kernel for a subagent run. It is a field so
+	// tests can substitute a kernel with a scripted Step; nil means NewKernel.
+	newSubKernel func(context.Context, Config) (*Kernel, error)
 
 	// run-state — supports background agents (§12.4). runMu serializes the agent
 	// loop so Stream and Wake never mutate history concurrently; running reports
@@ -101,6 +114,13 @@ type Config struct {
 	// server's tools are discovered via tools/list and registered into the
 	// kernel's registry, name-prefixed per server to avoid collisions.
 	MCPServers []tools.MCPServerConfig `json:"mcp_servers,omitempty" description:"remote MCP servers to connect and register tools from"`
+
+	// MaxSubagentDepth bounds delegation nesting (root = 0, its subagent = 1).
+	// 0 uses DefaultMaxSubagentDepth.
+	MaxSubagentDepth int `json:"max_subagent_depth,omitempty" description:"maximum subagent nesting depth; 0 = default (3)" default:"3"`
+	// Depth is this kernel's own position in that tree. Set by the kernel when
+	// it spawns a subagent; callers leave it zero.
+	Depth int `json:"depth,omitempty" description:"delegation depth of this kernel; set internally"`
 
 	// Trace/span hierarchy
 	TraceID         string `json:"trace_id,omitempty"`          // inherited from parent; root sets TraceID = SessionID
@@ -388,6 +408,53 @@ func (k *Kernel) WorkDir() string   { return k.Cfg.WorkDir }
 func (k *Kernel) SessionID() string { return k.Cfg.SessionID }
 func (k *Kernel) Model() string     { return k.Cfg.Model }
 
+// TraceID is the transcript this kernel belongs to. A root kernel's equals its
+// SessionID; a subagent inherits its parent's, so the whole delegation tree
+// shares one trace.
+func (k *Kernel) TraceID() string { return k.Cfg.TraceID }
+
+// reserveBudget claims the transcript's remaining headroom for one subagent and
+// reports how much it may spend. Checking and claiming happen under one lock, so
+// concurrent children divide the cap instead of each seeing all of it. The first
+// caller takes what is left; a second concurrent caller is refused rather than
+// allowed to double the transcript's spend.
+func (k *Kernel) reserveBudget(cap float64) (float64, bool) {
+	k.usageMu.Lock()
+	defer k.usageMu.Unlock()
+	remaining := cap - k.runningCostUSD - k.reservedUSD
+	if remaining <= 0 {
+		return 0, false
+	}
+	k.reservedUSD += remaining
+	return remaining, true
+}
+
+// releaseBudget returns an unspent reservation to the transcript. The child's
+// actual spend has by then been added to runningCostUSD, so the headroom the
+// next caller sees is correct.
+func (k *Kernel) releaseBudget(amount float64) {
+	k.usageMu.Lock()
+	k.reservedUSD -= amount
+	if k.reservedUSD < 0 {
+		k.reservedUSD = 0
+	}
+	k.usageMu.Unlock()
+}
+
+// UsageSnapshot copies this kernel's per-session accounting. It is the reliable
+// source of a run's spend: Run reports usage through EventStop, which a failed
+// run never reaches, so a caller relying on that payload alone loses the cost of
+// everything the run did before it failed.
+func (k *Kernel) UsageSnapshot() map[string]Usage {
+	k.usageMu.Lock()
+	defer k.usageMu.Unlock()
+	out := make(map[string]Usage, len(k.Sessions))
+	for sid, u := range k.Sessions {
+		out[sid] = u
+	}
+	return out
+}
+
 // RunningCostUSD returns the cumulative LLM cost so far in this session.
 func (k *Kernel) RunningCostUSD() float64 {
 	k.usageMu.Lock()
@@ -607,6 +674,23 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	for _, o := range opts {
 		o(&ro)
 	}
+
+	// A loop may already be running — a background delegation completing wakes
+	// one without any caller asking. Hand it the prompt through the queue rather
+	// than racing it for History.
+	if !k.claimLoop() {
+		k.Enqueue(prompt)
+		return nil
+	}
+	// Everything below mutates History. Release the claim on any path that does
+	// not reach streamCurrent, which owns the flag from there on.
+	entered := false
+	defer func() {
+		if !entered {
+			k.running.Store(false)
+		}
+	}()
+
 	budget := &spendBudget{
 		turnStartUSD: k.RunningCostUSD(),
 		turnMaxUSD:   ro.maxTurnSpendUSD,
@@ -654,6 +738,8 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	if ro.schema != nil {
 		loopWriter = io.Discard
 	}
+	// streamCurrent owns the running flag from here: it clears it on every exit.
+	entered = true
 	if err := k.streamCurrent(ctx, loopWriter, budget); err != nil {
 		return err
 	}
@@ -884,40 +970,185 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	return nil
 }
 
-// RunSubagent runs a subagent synchronously and returns its output.
-func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
-	return k.runSubagent(ctx, task, "")
+// DefaultMaxSubagentDepth bounds how deep delegation may nest. The root kernel
+// is depth 0, a subagent it spawns is depth 1, and so on. Without a ceiling a
+// prompt that keeps saying "delegate this" can fan out an unbounded tree of
+// kernels, each with its own budget.
+const DefaultMaxSubagentDepth = 3
+
+// SubagentOpts tunes one delegated run. The zero value is the default subagent:
+// synchronous, on the kernel's own default model.
+type SubagentOpts struct {
+	// Model overrides the model for this subagent only, in the same
+	// provider/model form as Config.Model. Empty selects the default
+	// (SmallerModel when set, else the parent's Model). A model that fails to
+	// run falls back to that default automatically.
+	Model string
+	// TaskID marks the run as asynchronous and labels it in subagent events.
+	TaskID string
 }
 
-// runSubagent is shared by the synchronous (RunSubagent) and asynchronous
-// (SpawnBackground) subagent paths. taskID is empty on the synchronous path;
-// non-empty on the async path, where it also sets SubagentPayload.Async —
+// SubagentResult is everything one subagent run produced. Callers use this
+// instead of reading the parent's Sessions map: that map accumulates every
+// child the session ever ran, so scraping it attributes earlier children's
+// spend to the latest run.
+type SubagentResult struct {
+	SessionID string `json:"session_id"`
+	// Model is what actually answered — not necessarily RequestedModel, if an
+	// override failed and the run fell back.
+	Model          string `json:"model"`
+	RequestedModel string `json:"requested_model,omitempty"`
+	FellBack       bool   `json:"fell_back,omitempty"`
+	Output         string `json:"output,omitempty"`
+	// Usage is this run's spend alone, summed across the child and any
+	// descendants it spawned. Session entries are disjoint, so the sum is exact.
+	Usage     Usage `json:"usage"`
+	Steps     int   `json:"steps"`
+	ToolCalls int   `json:"tool_calls"`
+}
+
+// RunSubagent runs a subagent synchronously and returns its output. It satisfies
+// tools.Agent; callers wanting a model override or the run's accounting should
+// use RunSubagentWith.
+func (k *Kernel) RunSubagent(ctx context.Context, task string) (string, error) {
+	res, err := k.runSubagent(ctx, task, SubagentOpts{})
+	return res.Output, err
+}
+
+// RunSubagentModel runs a synchronous subagent on a specific model, falling back
+// to the default when that model cannot run. It satisfies tools.SubagentRunner,
+// which is how the subagent tool exposes its optional model argument.
+func (k *Kernel) RunSubagentModel(ctx context.Context, task, model string) (string, error) {
+	res, err := k.runSubagent(ctx, task, SubagentOpts{Model: model})
+	return res.Output, err
+}
+
+// RunSubagentWith runs a synchronous subagent and returns its full result.
+func (k *Kernel) RunSubagentWith(ctx context.Context, task string, opts SubagentOpts) (SubagentResult, error) {
+	return k.runSubagent(ctx, task, opts)
+}
+
+// modelProvider is the provider prefix of a model id ("openai" in
+// "openai/gpt-5"), or "" when the id carries none.
+func modelProvider(model string) string {
+	if i := strings.Index(model, "/"); i > 0 {
+		return model[:i]
+	}
+	return ""
+}
+
+// maxSubagentDepth is the configured ceiling, or the default when unset.
+func (k *Kernel) maxSubagentDepth() int {
+	if k.Cfg.MaxSubagentDepth > 0 {
+		return k.Cfg.MaxSubagentDepth
+	}
+	return DefaultMaxSubagentDepth
+}
+
+// defaultSubagentModel is the model a subagent runs on when the caller names
+// none: the cheaper model when configured, else the parent's own.
+func (k *Kernel) defaultSubagentModel() string {
+	if k.Cfg.SmallerModel != "" {
+		return k.Cfg.SmallerModel
+	}
+	return k.Cfg.Model
+}
+
+// runSubagent is shared by the synchronous (RunSubagentWith) and asynchronous
+// (SpawnBackground) subagent paths. opts.TaskID is empty on the synchronous
+// path; non-empty on the async path, where it also sets SubagentPayload.Async —
 // what EventTaskCompleted used to report as a separate event kind, now just
 // a field on the same EventSubagentStop every subagent already fires.
-func (k *Kernel) runSubagent(ctx context.Context, task, taskID string) (string, error) {
-	// Inherit config from parent; pin the child to SmallerModel when set so
-	// exploratory side work does not burn the primary model.
+func (k *Kernel) runSubagent(ctx context.Context, task string, opts SubagentOpts) (SubagentResult, error) {
+	depth := k.Cfg.Depth + 1
+	if maxDepth := k.maxSubagentDepth(); depth > maxDepth {
+		return SubagentResult{}, fmt.Errorf("subagent depth limit reached (%d): do this work directly instead of delegating again", maxDepth)
+	}
+
+	fallback := k.defaultSubagentModel()
+	requested := strings.TrimSpace(opts.Model)
+	model := fallback
+	if requested != "" {
+		model = requested
+	}
+
+	res, err := k.runSubagentOn(ctx, task, model, depth, opts.TaskID)
+	// A model the caller named may not exist, may be unreachable, or may reject
+	// the request. That is a routing mistake, not a reason to lose the task, so
+	// retry once on the default.
+	//
+	// The retry is deliberately narrow: only when the requested model never
+	// completed a single turn. A child that answered and then failed later (loop
+	// guard, spend cap, a genuinely impossible task) would fail the same way on
+	// any model, and re-running it would just bill the work twice. Cancellation
+	// is the caller's decision and is never retried.
+	if err != nil && requested != "" && model != fallback && ctx.Err() == nil && res.Steps == 0 {
+		res, err = k.runSubagentOn(ctx, task, fallback, depth, opts.TaskID)
+		res.FellBack = true
+	}
+	res.RequestedModel = requested
+	return res, err
+}
+
+// runSubagentOn performs one subagent attempt on an exact model.
+func (k *Kernel) runSubagentOn(ctx context.Context, task, model string, depth int, taskID string) (SubagentResult, error) {
+	// Inherit config from parent, then pin this child's identity and model.
 	subCfg := k.Cfg
 	subCfg.SessionID = NewSessionID()
 	subCfg.TraceID = k.Cfg.TraceID
 	subCfg.ParentSpanID = k.Cfg.SessionID
+	subCfg.Depth = depth
+	subCfg.Model = model
+	// Credentials are provider-specific and Cfg.APIKey is already resolved for
+	// the parent's provider. Carrying it across a provider switch sends the
+	// gateway's key to (say) OpenAI, so the override fails and silently falls
+	// back even when the right key is in the environment. Clearing it makes
+	// NewKernel resolve the key for the provider actually being used.
+	if modelProvider(model) != modelProvider(k.Cfg.Model) {
+		subCfg.APIKey = ""
+	}
+	// A child inherits the parent's SmallerModel only as a default for its own
+	// children; its own model is already resolved above and must not be
+	// re-overridden when it in turn spawns work.
 	if subCfg.MaxTranscriptSpendUSD > 0 {
-		remaining := subCfg.MaxTranscriptSpendUSD - k.RunningCostUSD()
-		if remaining <= 0 {
-			return "", nil
+		remaining, ok := k.reserveBudget(subCfg.MaxTranscriptSpendUSD)
+		if !ok {
+			// Report this rather than returning an empty success, which a caller
+			// records as a task that ran and produced nothing.
+			return SubagentResult{Model: model}, fmt.Errorf("subagent not started: transcript spend limit of $%.4f already committed", k.Cfg.MaxTranscriptSpendUSD)
 		}
+		// Released once the child's real spend has been rolled into the parent.
+		defer k.releaseBudget(remaining)
 		subCfg.MaxTranscriptSpendUSD = remaining
 	}
-	subCfg.IncludeSubagentTools = false
-	if k.Cfg.SmallerModel != "" {
-		subCfg.Model = k.Cfg.SmallerModel
-	}
+	// A child may delegate further only while it stays under the ceiling; at the
+	// last allowed level its subagent tools are withheld, so the limit binds
+	// before a run is wasted discovering it.
+	subCfg.IncludeSubagentTools = k.Cfg.IncludeSubagentTools && depth < k.maxSubagentDepth()
+
+	res := SubagentResult{SessionID: subCfg.SessionID, Model: model}
 
 	// Create an independent Kernel instance for the subagent
-	subKernel, err := NewKernel(ctx, subCfg)
-	if err != nil {
-		return "", fmt.Errorf("failed to initialize subagent: %w", err)
+	build := k.newSubKernel
+	if build == nil {
+		build = NewKernel
 	}
+	subKernel, err := build(ctx, subCfg)
+	if err != nil {
+		return res, fmt.Errorf("failed to initialize subagent: %w", err)
+	}
+
+	// Count the child's own turns and tool calls. The usage payload carries
+	// tokens but not shape, and "how many steps and tools did this cost" is the
+	// question a delegation record exists to answer.
+	var steps, toolCalls int
+	subKernel.On(EventTurnCompleted, func(_ context.Context, e Event) error {
+		if p, ok := e.Payload.(*TurnPayload); ok {
+			steps++
+			toolCalls += p.ToolCalls
+		}
+		return nil
+	})
 
 	async := taskID != ""
 
@@ -927,39 +1158,64 @@ func (k *Kernel) runSubagent(ctx context.Context, task, taskID string) (string, 
 		Prompt:    task,
 		Async:     async,
 		TaskID:    taskID,
+		Model:     model,
 	})
 
 	// Run the subagent on the task
-	output, usage, runErr := subKernel.Run(ctx, task)
+	output, _, runErr := subKernel.Run(ctx, task)
+	res.Steps, res.ToolCalls = steps, toolCalls
+
+	// Take the child's accounting from the child itself rather than from Run's
+	// usage payload: that payload is populated by EventStop, which a run that
+	// failed part-way never fires, silently dropping everything it had already
+	// spent.
+	childUsage := subKernel.UsageSnapshot()
+
+	// Roll child spend into the parent total so RunningCostUSD is honest, and
+	// sum it into the result so the caller does not have to read k.Sessions —
+	// entries are per-session and disjoint, so this sum is the run's true cost.
+	first := true
+	for sid, childU := range childUsage {
+		k.usageMu.Lock()
+		k.Sessions[sid] = childU
+		k.runningCostUSD += childU.Cost
+		total := k.runningCostUSD
+		k.usageMu.Unlock()
+		res.Usage.Input += childU.Input
+		res.Usage.Output += childU.Output
+		res.Usage.Reasoning += childU.Reasoning
+		res.Usage.CacheRead += childU.CacheRead
+		res.Usage.CacheWrite += childU.CacheWrite
+		res.Usage.Cost += childU.Cost
+		// Unknown pricing anywhere makes the whole rollup's cost a floor, not a
+		// total — never report it as if it were priced.
+		if first {
+			res.Usage.PricingOK, first = childU.PricingOK, false
+		} else {
+			res.Usage.PricingOK = res.Usage.PricingOK && childU.PricingOK
+		}
+		if k.Store != nil {
+			_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, childU.Cost, total)
+		}
+	}
 
 	// Fire stop event for the subagent
 	_ = k.Fire(ctx, string(EventSubagentStop), &SubagentPayload{
 		SessionID:    subKernel.Cfg.SessionID,
 		Prompt:       task,
 		Output:       output,
-		UsagePayload: usage,
+		UsagePayload: UsagePayload{Tokens: childUsage},
 		Async:        async,
 		TaskID:       taskID,
+		Model:        model,
 	})
 
-	// Roll child spend into the parent total so RunningCostUSD is honest.
-	// Per-session breakdown remains in usage.Tokens / SubagentStop payload.
-	for sid, childU := range usage.Tokens {
-		k.usageMu.Lock()
-		k.Sessions[sid] = childU
-		k.runningCostUSD += childU.Cost
-		total := k.runningCostUSD
-		k.usageMu.Unlock()
-		if k.Store != nil {
-			_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, childU.Cost, total)
-		}
-	}
-
 	if runErr != nil {
-		return "", fmt.Errorf("subagent failed: %w", runErr)
+		return res, fmt.Errorf("subagent failed: %w", runErr)
 	}
 
-	return fmt.Sprintf("Subagent completed task. Output:\n%s", output), nil
+	res.Output = fmt.Sprintf("Subagent completed task. Output:\n%s", output)
+	return res, nil
 }
 
 // -- Hooks
@@ -1006,11 +1262,30 @@ func (r *HookRegistry) Fire(ctx context.Context, e Event) error {
 // task id. The call returns immediately; the result is delivered later via the
 // message queue, waking the kernel if it is idle.
 func (k *Kernel) SpawnBackground(task string) string {
-	id := fmt.Sprintf("bg-%d", k.bgSeq.Add(1))
+	return k.SpawnBackgroundWith(task, SubagentOpts{}, nil)
+}
+
+// SpawnBackgroundWith is SpawnBackground with a model override and an optional
+// completion callback. done runs on the background goroutine once the child has
+// finished, before the parent is woken, and receives the run's own accounting —
+// which is what a caller recording the task needs and cannot get from the
+// parent's cumulative Sessions map.
+func (k *Kernel) SpawnBackgroundWith(task string, opts SubagentOpts, done func(SubagentResult, error)) string {
+	// A caller that already has an id for this task (a delegation record, say)
+	// passes it in so one id labels the record, the events, and the completion
+	// message; otherwise the kernel numbers it.
+	id := strings.TrimSpace(opts.TaskID)
+	if id == "" {
+		id = fmt.Sprintf("bg-%d", k.bgSeq.Add(1))
+	}
+	opts.TaskID = id
 	go func() {
 		bctx := context.Background()
-		out, err := k.runSubagent(bctx, task, id)
-		result := out
+		res, err := k.runSubagent(bctx, task, opts)
+		if done != nil {
+			done(res, err)
+		}
+		result := res.Output
 		status := "completed"
 		if err != nil {
 			result = fmt.Sprintf("background task %s failed: %v", id, err)
@@ -1023,6 +1298,25 @@ func (k *Kernel) SpawnBackground(task string) string {
 		_ = k.tryResume(bctx)
 	}()
 	return id
+}
+
+// claimLoop reports whether this caller now owns the agent loop. It claims under
+// wakeMu — the same lock tryResume uses — so a caller preparing history and a
+// finishing background task can never both decide the loop is theirs.
+//
+// Without this, Stream's prologue (compaction, appending the user message) runs
+// unsynchronized against a background completion's append in tryResume: two
+// goroutines appending to the same History slice, which loses turns or corrupts
+// the slice outright. A caller that does not win the claim queues its prompt
+// instead, and the live loop picks it up at its next turn boundary.
+func (k *Kernel) claimLoop() bool {
+	k.wakeMu.Lock()
+	defer k.wakeMu.Unlock()
+	if k.running.Load() {
+		return false
+	}
+	k.running.Store(true)
+	return true
 }
 
 // tryResume is the single answer to "should the kernel resume?" — called both
@@ -1075,14 +1369,15 @@ func (k *Kernel) tryResume(ctx context.Context) error {
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.
 type SubagentAsyncArgs struct {
-	Task string `json:"task" jsonschema:"description=Independent background subtask with goal paths constraints and expected result,minLength=1"`
+	Task  string `json:"task" jsonschema:"description=Independent background subtask with goal paths constraints and expected result,minLength=1"`
+	Model string `json:"model,omitempty" jsonschema:"description=Model id to run this subtask on. Omit unless the user named a specific model."`
 }
 
 // newSubagentAsyncTool builds the subagent_async tool, which delegates a subtask
 // to a background agent and returns immediately.
 func newSubagentAsyncTool(k *Kernel, desc string) *tools.ToolDef {
 	h := llm.NewTool("subagent_async", desc, func(ctx context.Context, args SubagentAsyncArgs) (llm.ToolResult, error) {
-		id := k.SpawnBackground(args.Task)
+		id := k.SpawnBackgroundWith(args.Task, SubagentOpts{Model: args.Model}, nil)
 		return llm.NewTextResult(fmt.Sprintf("Started background task %s. You'll be notified when it completes — continue with other work in the meantime.", id)), nil
 	})
 	return &tools.ToolDef{

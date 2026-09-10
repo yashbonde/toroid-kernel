@@ -36,10 +36,17 @@ func (k *Kernel) nextRequestMetadata(ctx context.Context) llm.RequestMetadata {
 			chatID:       NewSessionID(),
 		}
 	}
-	return llm.RequestMetadata{
+	md := llm.RequestMetadata{
 		TranscriptID: scope.transcriptID,
 		ChatID:       scope.chatID,
 		TurnID:       NewSessionID(),
 		TraceID:      NewSessionID(),
+		SessionID:    k.Cfg.SessionID,
 	}
+	// Only the first request of a session carries the parent edge: for a
+	// subagent that is the message that establishes it belongs to its parent.
+	if k.reqSeq.Add(1) == 1 {
+		md.ParentSessionID = k.Cfg.ParentSpanID
+	}
+	return md
 }

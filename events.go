@@ -140,6 +140,9 @@ type SubagentPayload struct {
 	UsagePayload UsagePayload `json:"usage,omitempty"`
 	Async        bool         `json:"async,omitempty"`
 	TaskID       string       `json:"task_id,omitempty"`
+	// Model is the model this subagent actually ran on, which may differ from
+	// the parent's when the caller overrode it or an override fell back.
+	Model string `json:"model,omitempty"`
 }
 
 type CompactPayload struct {

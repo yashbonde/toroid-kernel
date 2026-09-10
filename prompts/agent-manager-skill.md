@@ -62,23 +62,30 @@ trk -thinking high -run 'task description'
 
 ### Claude
 ```bash
-# Start background agent
-claude --bg --model opus[1m] --effort high --cwd /path/to/project 'task description'
+# Start background agent (give it a display name; --bg prints the session id
+# on stdout, e.g. `backgrounded · 2d5ab496`, that you use to attach/log/stop)
+claude --bg --model opus[1m] --effort high -n my-task --cwd /path/to/project 'task description'
 
-# List running agents
-claude agents --json
+# Attach to / read / stop that specific session (no global agent list needed)
+claude attach 2d5ab496
+claude logs 2d5ab496
+claude stop 2d5ab496
 
-# List all (including completed)
-claude agents --json --all
+# If you must enumerate sessions, scope the query to the project (--cwd) so
+# you never tap into Claude's global agent list across unrelated work:
+claude agents --json --cwd /path/to/project
+# Include completed sessions for this project:
+claude agents --json --cwd /path/to/project --all
 ```
 
 ### Codex
 ```bash
-# Non-interactive exec
+# Non-interactive exec (prints its session id on the first line; capture it)
 codex exec -c model=gpt-5.6-sol -c model_reasoning_effort=high \
   --cd /path/to/project 'task description'
 
-# Resume last session
+# Resume a specific session by id, or the most recent one with --last
+codex exec resume <session-id>
 codex exec resume --last
 ```
 
@@ -93,10 +100,11 @@ pi -r
 
 ### Opencode
 ```bash
-# Non-interactive run
-opencode run 'task description' -m anthropic/claude-sonnet-4-20250514
+# Non-interactive run (give the session a name so you can find it later)
+opencode run -m anthropic/claude-sonnet-4-20250514 --title 'my-task' 'task description'
 
-# Continue last session
+# Continue a specific session by id, or the last one
+opencode run --session <id> 'follow up message'
 opencode run -c 'follow up message'
 ```
 
@@ -104,10 +112,11 @@ opencode run -c 'follow up message'
 
 ### trk
 ```bash
-# List all sessions
-ls ~/.toroid/sessions/
+# Sessions are per-session dirs under ~/.toroid/sessions/. Scope by the
+# session id you captured on launch, never the whole store:
+ls ~/.toroid/sessions/<session-id>/
 
-# Read session events (JSON files in per-session dirs)
+# Read session events (JSON files in the per-session dir)
 ls ~/.toroid/sessions/<session-id>/*.json 2>/dev/null | head -5
 
 # Peek at event content
@@ -120,30 +129,40 @@ if 'payload' in data:
     print('payload keys:', list(p.keys())[:5])
 " 2>/dev/null
 
-# Query SQLite for session summary
+# Query SQLite for a session summary (scoped to the session id you launched)
 sqlite3 ~/.toroid/sql.db \
   \"SELECT session_id, SUM(input_tokens), SUM(output_tokens), MAX(timestamp) FROM events WHERE session_id LIKE '<session-id>%' GROUP BY session_id;\"
 ```
 
 ### Claude
 ```bash
-# List active agents with status
-claude agents --json
+# Read a specific session's transcript by id (from the --bg output / --name)
+claude logs <session-id>
+claude attach <session-id>
 
 # Read a session transcript (JSONL in project dir)
 cat ~/.claude/projects/*/<session-id>.jsonl | head -20
 
-# Get session metadata
+# Get session metadata (status + display name)
 cat ~/.claude/sessions/<pid>.json | python3 -c \
   "import sys,json; d=json.load(sys.stdin); print(d['status'], d.get('name',''))"
+
+# Only if you need to enumerate: scope to this project's sessions, never the
+# global list
+claude agents --json --cwd /path/to/project
 ```
 
 ### Codex
 ```bash
-# Find latest session
-ls -t ~/.codex/sessions/2026/*/*/*.jsonl | head -1
+# Sessions are per-repo JSONL rollouts under ~/.codex/sessions/YYYY/MM/DD.
+# Find this repo's sessions by their recorded cwd, then read the matching rollout:
+for f in ~/.codex/sessions/*/*/*/rollout-*.jsonl; do
+  grep -l '"cwd":"/path/to/project"' "$f" 2>/dev/null
+ done
+# Resume a specific session by id:
+codex exec resume <session-id>
 
-# Read events (scoped types)
+# Read events from a session file (scoped types)
 cat <session>.jsonl | python3 -c "
 import sys,json
 for line in sys.stdin:
@@ -158,11 +177,12 @@ for line in sys.stdin:
 
 ### Pi
 ```bash
-# List sessions
-ls ~/.pi/agent/sessions/
+# Sessions are per-project dirs under ~/.pi/agent/sessions/ (recorded cwd).
+# Scope to this project rather than listing everything:
+ls ~/.pi/agent/sessions/<project-dir>/
 
 # Read session JSONL
-cat ~/.pi/agent/sessions/<dir>/*.jsonl | python3 -c "
+cat ~/.pi/agent/sessions/<project-dir>/*.jsonl | python3 -c "
 import sys,json
 for line in sys.stdin:
     d=json.loads(line.strip())
@@ -172,15 +192,15 @@ for line in sys.stdin:
 
 ### Opencode
 ```bash
-# List sessions from SQLite
+# Sessions record their directory; scope to this project rather than querying
+# every session on the machine:
 sqlite3 ~/.local/share/opencode/opencode.db \
-  "SELECT id, model, created_at FROM session ORDER BY created_at DESC LIMIT 10;"
+  "SELECT id, title, time_created FROM session \
+   WHERE directory = '/path/to/project' \
+   ORDER BY time_created DESC LIMIT 10;"
 
-# Get messages for a session
-sqlite3 ~/.local/share/opencode/opencode.db \
-  "SELECT role, substr(content,1,200) FROM session_message WHERE session_id='<id>' ORDER BY created_at;"
-
-# Export full session as JSON
+# Get a session's contents via the supported exporter (no direct SQL needed;
+# content lives in JSON blobs across message/part rows)
 opencode export <session-id>
 ```
 
@@ -188,9 +208,9 @@ opencode export <session-id>
 
 When asked to run multiple agents:
 
-1. **Start agents** in background using the commands above. Use `&` and capture PID.
+1. **Start agents** in background using the commands above. Capture the printed session id (e.g. `backgrounded · <id>` for Claude) or assign a name (`-n` for Claude, `--title` for Opencode). Never rely on a PID.
 2. **Sleep briefly** (`sleep 30`) then check status.
-3. **Monitor** by reading session files or running the list commands.
+3. **Monitor** the specific sessions you launched (by id/name via the per-harness commands above, or by reading that session's file). Avoid unscoped global listings (bare `claude agents --json`, un-filtered `codex agents`, `opencode list`, or `ls ~/.toroid/sessions/`), which surface unrelated sessions across the whole machine. Scope to this repo by recorded `cwd`/project.
 4. **Report** findings back to the user with a summary.
 
 Prefer trk or Claude for complex multi-step autonomous work (best background agent support).

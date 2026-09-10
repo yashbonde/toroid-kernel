@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"charm.land/bubbles/v2/key"
@@ -36,11 +39,12 @@ type tuiIntermediateMsg string
 // tuiToolMsg announces a tool call that has just started. id is the stable
 // tool_call_id from the LLM (links the Pre and Post events); label is the
 // single-row display text (operation + trimmed target) shown with an animated
-// "…" while it runs. num is the monotonic call number within the turn.
+// "…" while it runs. The call is numbered in Update, not here: this message is
+// built on the kernel's goroutine, and a background turn firing it concurrently
+// with a reset in submit/newSession would race on the counter.
 type tuiToolMsg struct {
 	id    string
 	label string
-	num   int
 }
 
 // tuiSubagentMsg announces a subagent start or stop. output is the subagent's
@@ -74,7 +78,6 @@ type tuiTurnDoneMsg struct {
 	grandTotal int64
 }
 
-
 // spinnerTick requests the next animation frame while the kernel is busy.
 type spinnerTick struct{}
 
@@ -93,6 +96,8 @@ const (
 	transcriptAssistant
 	transcriptActivity
 	transcriptTool
+	transcriptBash
+	transcriptBashOutput
 )
 
 type transcriptEntry struct {
@@ -160,20 +165,29 @@ type tuiModel struct {
 	// sessionTitle is the auto-generated or user-renamed title for the current
 	// session, shown in green after the username in the transcript header.
 	sessionTitle string
+	// bashMode is true while the input starts with '!', so the input area is
+	// styled in dark purple and its label reads "bash".
+	bashMode bool
+	// gen identifies the current kernel generation. /new bumps it so hooks left
+	// behind on the replaced kernel stop feeding this TUI.
+	gen atomic.Uint64
 }
 
 var (
-	canvasColor    = lipgloss.Color("#FFFFFF")
-	inputColor     = lipgloss.Color("#FFFFFF")
-	userColor      = lipgloss.Color("#ECFDF3")
-	inkColor       = lipgloss.Color("#18212F")
-	blueStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
-	accentStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
-	greenStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A"))
-	dimStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
-	errorBoldStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156")).Bold(true)
-	boldInkStyle   = lipgloss.NewStyle().Foreground(inkColor).Bold(true)
+	canvasColor     = lipgloss.Color("#FFFFFF")
+	inputColor      = lipgloss.Color("#FFFFFF")
+	userColor       = lipgloss.Color("#ECFDF3")
+	bashColor       = lipgloss.Color("#EFE9FC")
+	inkColor        = lipgloss.Color("#18212F")
+	blueStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6")).Bold(true)
+	accentStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A")).Bold(true)
+	greenStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#16834A"))
+	purpleStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("#7C3AED")).Bold(true)
+	purpleDarkStyle = lipgloss.NewStyle().Background(lipgloss.Color("#3B2A63")).Foreground(lipgloss.Color("#FFFFFF"))
+	dimStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("#667085"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156"))
+	errorBoldStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("#C24156")).Bold(true)
+	boldInkStyle    = lipgloss.NewStyle().Foreground(inkColor).Bold(true)
 )
 
 func runTUI(cfg config, apiKey string) error {
@@ -316,12 +330,18 @@ func (m *tuiModel) stopSubagent(id, output string) {
 	start, ok := m.runningSubagents[id]
 	delete(m.runningSubagents, id)
 	if ok {
-		label := blueStyle.Render("⚡ ") + boldInkStyle.Render("subagent "+id[:min(12, len(id))]+"…")
+		// Only ellipsize an id that was actually truncated.
+		name := id
+		if len(name) > 12 {
+			name = name[:12] + "…"
+		}
+		label := blueStyle.Render("⚡ ") + boldInkStyle.Render("subagent "+name)
+		if trimmed := strings.TrimSpace(output); trimmed != "" {
+			label += dimStyle.Render(": " + compactToolText(trimmed, 120))
+		}
+		// Duration trails the row, matching finished tool rows.
 		if d := formatDuration(time.Since(start)); d != "" {
 			label += dimStyle.Render(" · " + d)
-		}
-		if trimmed := strings.TrimSpace(output); trimmed != "" {
-			label += " " + dimStyle.Render(compactToolText(trimmed, 120))
 		}
 		m.entries = append(m.entries, transcriptEntry{kind: transcriptTool, text: label, ts: time.Now()})
 	}
@@ -452,7 +472,8 @@ func timestampLabel(ts time.Time) string {
 
 // formatDuration renders a compact duration string.
 func formatDuration(d time.Duration) string {
-	if d <= 0 {
+	// Sub-millisecond durations round to a meaningless "0ms"; render nothing.
+	if d < time.Millisecond {
 		return ""
 	}
 	sec := d.Seconds()
@@ -484,13 +505,9 @@ func (m *tuiModel) usernameLabel(num int) string {
 	return name
 }
 
-// usernameLine returns the full user header line including optional session title.
+// usernameLine returns the full user header line.
 func (m *tuiModel) usernameLine(num int) string {
-	line := boldInkStyle.Render(m.usernameLabel(num) + " >")
-	if m.sessionTitle != "" {
-		line += " " + greenStyle.Render(m.sessionTitle)
-	}
-	return line
+	return boldInkStyle.Render(m.usernameLabel(num) + " >")
 }
 
 func (m *tuiModel) renderTranscript() {
@@ -536,6 +553,13 @@ func (m *tuiModel) renderTranscript() {
 			entry.rendered = lipgloss.NewStyle().Foreground(inkColor).Render(body)
 		case transcriptActivity:
 			entry.rendered = dimStyle.Render(renderAssistantText(text, availableWidth))
+		case transcriptBash:
+			text = ansi.Hardwrap(text, availableWidth, false)
+			entry.rendered = lipgloss.NewStyle().Background(bashColor).Foreground(inkColor).Width(availableWidth).Render(purpleStyle.Render("bash> ") + "\n" + text + "\n" + timestampLabel(entry.ts))
+		case transcriptBashOutput:
+			// Render command output verbatim, preserving newlines/whitespace.
+			text = ansi.Hardwrap(text, availableWidth, true)
+			entry.rendered = lipgloss.NewStyle().Foreground(inkColor).Width(availableWidth).Render(text + "\n" + timestampLabel(entry.ts))
 		case transcriptTool:
 			numPrefix := ""
 			if entry.num > 0 {
@@ -588,7 +612,7 @@ func (m *tuiModel) renderTranscript() {
 		}
 		prev := rendered[i-1].kind
 		sep := "\n"
-		if prev == transcriptUser || (r.kind == transcriptTool) != (prev == transcriptTool) {
+		if prev == transcriptUser || prev == transcriptBash || prev == transcriptBashOutput || (r.kind == transcriptTool) != (prev == transcriptTool) || r.kind == transcriptUser || r.kind == transcriptBash {
 			sep = "\n\n"
 		}
 		sb.WriteString(sep)
@@ -757,11 +781,20 @@ type tuiDelegationDoneMsg struct {
 // stack duplicate hooks and multiply the tool-call counter on later turns.
 func (m *tuiModel) subscribeEvents() {
 	k := m.kernel
+	// Events from a kernel this TUI has since replaced (/new) must be dropped:
+	// its hooks still hold this channel, and a delegation outliving the session
+	// that started it would otherwise render inside the new one. The generation
+	// is atomic because hooks fire on the kernel's goroutine.
+	gen := m.gen.Load()
+	live := func() bool { return m.gen.Load() == gen }
 
 	// Session usage arrives via EventStop for the turn footer's grand-total
 	// line; Stream hands the answer to the writer instead of returning a
 	// string, so capture the totals here.
 	k.On(toroid.EventStop, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.UsagePayload); ok {
 			m.usageMu.Lock()
 			m.usage = *p
@@ -773,6 +806,9 @@ func (m *tuiModel) subscribeEvents() {
 	// only streams the final no-tool answer to the writer, so intermediate text
 	// arrives here via TurnCompleted instead.
 	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.TurnPayload); ok && p.ToolCalls > 0 {
 			if text := assistantTextFromTurn(p); text != "" {
 				m.events <- tuiIntermediateMsg(text)
@@ -781,80 +817,72 @@ func (m *tuiModel) subscribeEvents() {
 		return nil
 	})
 	k.On(toroid.EventPreToolUse, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.ToolUsePayload); ok {
-			m.toolCallSeq++
-			label := toolCallLabel(p.Name, p.Args, m.cfg.workdir)
-			m.events <- tuiToolMsg{id: p.CallID, label: label, num: m.toolCallSeq}
+			m.events <- tuiToolMsg{id: p.CallID, label: toolCallLabel(p.Name, p.Args, m.cfg.workdir)}
 		}
 		return nil
 	})
 	k.On(toroid.EventPostToolUse, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
 			m.events <- tuiToolDoneMsg{id: p.CallID}
 		}
 		return nil
 	})
 	k.On(toroid.EventPostToolUseFailure, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.ToolUseResultPayload); ok {
 			m.events <- tuiToolDoneMsg{id: p.CallID, err: p.Error}
 		}
 		return nil
 	})
 	k.On(toroid.EventSubagentStart, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
 			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, start: true, async: true}
 		}
 		return nil
 	})
 	k.On(toroid.EventSubagentStop, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.SubagentPayload); ok && p.Async {
 			m.events <- tuiSubagentMsg{id: p.SessionID, prompt: p.Prompt, output: p.Output, start: false, async: true}
 		}
 		return nil
 	})
-	k.On(toroid.EventTurnStarted, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
-			tools := strings.Join(p.Tools, ",")
-			if tools == "" {
-				tools = "—"
-			}
-			model := p.Model
-			if model == "" {
-				model = m.cfg.model
-			}
-			m.events <- tuiOutputMsg(fmt.Sprintf("→ turn %s · %s · %d msgs · tools: %s", e.TurnID[:min(8, len(e.TurnID))], shortModel(model), p.Messages, tools))
-		}
-		return nil
-	})
-	k.On(toroid.EventTurnCompleted, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
-			u := p.TurnUsage
-			tok := u.Input + u.CacheRead + u.CacheWrite + u.Output
-			if tok > 0 || p.ToolCalls > 0 {
-				m.events <- tuiOutputMsg(fmt.Sprintf("← turn %s done · %d tool_calls · %d tokens · $%.4f (total $%.4f) · %s", e.TurnID[:min(8, len(e.TurnID))], p.ToolCalls, tok, p.TurnCostUSD, p.TotalCostUSD, p.StopReason))
-			}
-		}
-		return nil
-	})
 	k.On(toroid.EventTurnFailed, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
-			m.events <- tuiOutputMsg(fmt.Sprintf("✗ turn %s failed: %s", e.TurnID[:min(8, len(e.TurnID))], p.Error))
+		if !live() {
+			return nil
 		}
-		return nil
-	})
-	k.On(toroid.EventGuardTriggered, func(_ context.Context, e toroid.Event) error {
-		if p, ok := e.Payload.(*toroid.GuardTriggeredPayload); ok {
-			m.events <- tuiOutputMsg(fmt.Sprintf("⚑ guard %s: %s", p.Name, p.Reason))
+		if p, ok := e.Payload.(*toroid.TurnPayload); ok {
+			m.events <- tuiOutputMsg(fmt.Sprintf("✗ failed: %s", p.Error))
 		}
 		return nil
 	})
 	k.On(toroid.EventPreCompact, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.CompactPayload); ok {
 			m.events <- tuiOutputMsg(fmt.Sprintf("◐ compacting · %d msgs · %d tokens", p.MessageCount, p.TokenCount))
 		}
 		return nil
 	})
 	k.On(toroid.EventPostCompact, func(_ context.Context, e toroid.Event) error {
+		if !live() {
+			return nil
+		}
 		if p, ok := e.Payload.(*toroid.CompactSummaryPayload); ok {
 			m.events <- tuiOutputMsg(fmt.Sprintf("◑ compacted %d→%d msgs · %d tokens · %s", p.MessagesBefore, p.MessagesAfter, p.TokensBefore, compactToolText(p.Summary, 120)))
 		}
@@ -904,16 +932,84 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	)
 }
 
-// delegate runs a /delegate task synchronously in the TUI and returns a done
-// message carrying the human-readable summary. It records the task under
-// TOROID_HOME like the non-interactive path.
-func (m *tuiModel) delegate(prompt string) tea.Cmd {
-	m.busy = true
-	m.addEntry(transcriptUser, "/delegate "+prompt)
-	m.addEntry(transcriptAssistant, "")
+// bashSubmit runs a '!' command locally in the shell (workdir) without sending
+// it to the model. The command and its output are recorded in the transcript
+// purely for the UI.
+func (m *tuiModel) bashSubmit(prompt string) tea.Cmd {
+	cmd := strings.TrimSpace(strings.TrimPrefix(prompt, "!"))
+	m.addEntry(transcriptBash, cmd)
 	return func() tea.Msg {
 		start := time.Now()
-		out, err := delegate(m.kernel, prompt)
+
+		ctx, cancel := context.WithTimeout(context.Background(), tuiBashTimeout)
+		defer cancel()
+
+		// Source the user's rc so aliases/functions (e.g. gst from ~/.zshrc)
+		// resolve, then `eval` the command: alias expansion happens at parse
+		// time, so the command must be parsed *after* the rc has run.
+		//
+		// Deliberately NOT `zsh -i`: an interactive shell attaches to the
+		// controlling terminal (job control, tcsetpgrp, tty modes) that the TUI
+		// holds in raw mode, and interactive rc's block on /dev/tty prompts
+		// (compinit's "Ignore insecure directories?", prompt frameworks). Both
+		// freeze the whole UI, not just the command.
+		home, _ := os.UserHomeDir()
+		inner := "[ -r " + shellQuote(home+"/.zshrc") + " ] && source " + shellQuote(home+"/.zshrc") + " >/dev/null 2>&1; eval \"$TOROID_BASH_CMD\""
+		c := exec.CommandContext(ctx, "zsh", "-c", inner)
+		c.Dir = m.cfg.workdir
+		c.Env = append(os.Environ(), "TOROID_BASH_CMD="+cmd, "PAGER=cat", "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0", "EDITOR=true", "GIT_EDITOR=true")
+
+		// No terminal, ever: empty stdin so anything reading gets EOF instead of
+		// waiting, and its own process group so a timeout kills the whole tree
+		// (and nothing it spawns can steal the tty from the TUI).
+		c.Stdin = nil
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		c.Cancel = func() error {
+			if c.Process != nil {
+				_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+			}
+			return os.ErrProcessDone
+		}
+		c.WaitDelay = 2 * time.Second
+
+		out, err := c.CombinedOutput()
+		res := strings.TrimRight(string(out), "\n")
+		switch {
+		case ctx.Err() == context.DeadlineExceeded:
+			res += fmt.Sprintf("\n(timed out after %s — killed)", tuiBashTimeout)
+		case err != nil:
+			res += fmt.Sprintf("\n(exit %v)", err)
+		}
+		return tuiBashDoneMsg{cmd: cmd, out: res, elapsed: time.Since(start)}
+	}
+}
+
+// tuiBashTimeout bounds a '!' command so a stalled one can never wedge the UI.
+const tuiBashTimeout = 120 * time.Second
+
+// tuiBashDoneMsg carries the result of a '!' bash command back to the TUI.
+type tuiBashDoneMsg struct {
+	cmd     string
+	out     string
+	elapsed time.Duration
+}
+
+// shellQuote quotes s as a single shell word so it can be embedded safely.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// delegate dispatches a /delegate task in the background and returns a done
+// message carrying the dispatch summary. The kernel runs the task as a
+// background subagent, so this returns as soon as the task is accepted and the
+// composer stays live; the result arrives later as a background completion.
+// It records the task under TOROID_HOME like the non-interactive path.
+func (m *tuiModel) delegate(args string) tea.Cmd {
+	prompt, model := parseDelegateArgs(args)
+	m.addEntry(transcriptUser, "/delegate "+args)
+	return func() tea.Msg {
+		start := time.Now()
+		out, err := delegate(m.kernel, prompt, model)
 		return tuiDelegationDoneMsg{result: out, err: err, elapsed: time.Since(start)}
 	}
 }
@@ -927,6 +1023,10 @@ func (m *tuiModel) newSession() {
 		m.cancelTurn = nil
 	}
 	_ = m.kernel.Close()
+	// Retire the old kernel's hooks before wiring the new one: background tasks
+	// it still owns may finish later, and their events belong to a session that
+	// no longer exists.
+	m.gen.Add(1)
 	emit := func(s string) { m.events <- tuiOutputMsg(s) }
 	k, err := newKernel(m.ctx, m.cfg, m.apiKey, emit)
 	if err != nil {
@@ -939,6 +1039,7 @@ func (m *tuiModel) newSession() {
 	m.transcript.SetContent("")
 	m.busy = false
 	m.runningTools = nil
+	m.runningSubagents = nil
 	m.userSeq = 0
 	m.toolCallSeq = 0
 	m.sessionTitle = ""
@@ -972,7 +1073,7 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 		m.addEntry(transcriptActivity, fmt.Sprintf("model: %s · workdir: %s · thinking: %s", m.cfg.model, displayWorkdir(m.cfg.workdir), m.cfg.thinking))
 		return nil, true
 	case "/delegate":
-		m.addEntry(transcriptActivity, "Type /delegate <task> to dispatch a task to another agent")
+		m.addEntry(transcriptActivity, "Type /delegate [--model <id>] <task> to dispatch a task to another agent (runs in the background)")
 		return nil, true
 	case "/rename":
 		rest := strings.TrimSpace(strings.TrimPrefix(line, "/rename"))
@@ -1053,6 +1154,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd, _ := m.command(prompt)
 				return m, cmd
 			}
+			if strings.HasPrefix(prompt, "!") {
+				m.input.Reset()
+				return m, m.bashSubmit(prompt)
+			}
 			return m, m.submit(prompt)
 		case "pgup", "ctrl+up":
 			m.transcript.PageUp()
@@ -1071,7 +1176,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendIntermediate(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiToolMsg:
-		m.startTool(msg.id, msg.label, msg.num)
+		m.toolCallSeq++
+		m.startTool(msg.id, msg.label, m.toolCallSeq)
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiToolDoneMsg:
 		m.finishTool(msg.id, msg.err)
@@ -1089,19 +1195,20 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.renderTranscript() // advance the live tool "…" animation too
 			cmds = append(cmds, spin())
 		}
+	case tuiBashDoneMsg:
+		if strings.TrimSpace(msg.out) != "" {
+			m.addEntry(transcriptBashOutput, msg.out)
+		}
 	case tuiDelegationDoneMsg:
-		m.busy = false
+		// Dispatch only — the task runs in the background. Two consequences: do
+		// not clear a busy flag this never set (a turn may be live underneath),
+		// and post the acknowledgment as its own entry rather than through
+		// appendAssistant, which would merge it into whatever assistant answer
+		// happens to be streaming when it lands.
 		if msg.err != nil {
 			m.addEntry(transcriptActivity, "delegation error: "+msg.err.Error())
 		} else {
-			m.appendAssistant(msg.result)
-			if n := len(m.entries); n > 0 && m.entries[n-1].kind == transcriptAssistant {
-				m.entries[n-1].done = true
-				m.entries[n-1].elapsed = msg.elapsed
-				m.entries[n-1].ts = time.Now()
-				m.renderTranscript()
-				m.transcript.GotoBottom()
-			}
+			m.addEntry(transcriptActivity, msg.result)
 		}
 	case tuiTurnDoneMsg:
 		m.busy = false
@@ -1132,6 +1239,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var inputCmd tea.Cmd
 	m.input, inputCmd = m.input.Update(msg)
 	cmds = append(cmds, inputCmd)
+	// Toggle bash mode whenever the input starts with '!' so the composer and
+	// label restyle live as the user types.
+	m.bashMode = strings.HasPrefix(strings.TrimSpace(m.input.Value()), "!")
 	// Only forward non-keypress messages to the viewport so left/right arrow
 	// keys (which the textarea needs for cursor movement) do not trigger
 	// unwanted horizontal scroll. We handle all viewport scrolling explicitly
@@ -1204,7 +1314,9 @@ func (m *tuiModel) View() tea.View {
 	headerMeta = ansi.Truncate(headerMeta, max(1, m.width), "")
 	header := accentStyle.Render("TOROID KERNEL INTERFACE") + "  " + boldInkStyle.Render(shortModel(m.cfg.model)) + "\n" + headerMeta
 	label := accentStyle.Render(m.username + " >")
-	if m.sessionTitle != "" {
+	if m.bashMode {
+		label = purpleDarkStyle.Render(" bash >")
+	} else if m.sessionTitle != "" {
 		label += " " + greenStyle.Render(m.sessionTitle)
 	}
 	usageBar := ansi.Truncate(m.renderUsageBar(), max(1, m.width), "")

@@ -42,8 +42,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yashbonde/toroid-kernel/llm"
 	toroid "github.com/yashbonde/toroid-kernel"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 // assistantTextFromTurn extracts the assistant's written text from a completed

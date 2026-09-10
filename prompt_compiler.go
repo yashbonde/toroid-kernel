@@ -197,10 +197,12 @@ Use a repository-relative path. Parent directories are created automatically. Pr
 Use the exact listed path when the user names a skill or its description matches the task.`
 	case "subagent":
 		return `Run a self-contained subtask and wait for its result.
-Include the goal, relevant paths, constraints, and expected result. Use only when isolated context materially helps; the subagent starts without this conversation.`
+Include the goal, relevant paths, constraints, and expected result. Use only when isolated context materially helps; the subagent starts without this conversation.
+Set model ONLY when the user named a specific model for this subtask; otherwise omit it and the default is used. A model that fails to run falls back to the default automatically, so never retry a failed call with a different model yourself.`
 	case "subagent_async":
 		return `Run an independent subtask in the background and return its task ID immediately.
-Include the goal, relevant paths, constraints, and expected result. Use only when useful work can continue before the result arrives.`
+Include the goal, relevant paths, constraints, and expected result. Use only when useful work can continue before the result arrives.
+Set model ONLY when the user named a specific model for this subtask; otherwise omit it and the default is used. A model that fails to run falls back to the default automatically, so never retry a failed call with a different model yourself.`
 	default:
 		return "Tool " + name
 	}

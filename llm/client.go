@@ -62,6 +62,13 @@ type RequestMetadata struct {
 	ChatID       string `json:"chat_id"`
 	TurnID       string `json:"turn_id"`
 	TraceID      string `json:"trace_id"`
+	// SessionID is the kernel session that issued this call. A subagent has its
+	// own session id, distinct from its parent's.
+	SessionID string `json:"session_id,omitempty"`
+	// ParentSessionID is attached only to a subagent's FIRST request, which is
+	// where the parent→child edge is established; later requests in the same
+	// session would just repeat it. Empty for a root kernel, which has no parent.
+	ParentSessionID string `json:"parent_session_id,omitempty"`
 }
 
 // Request is one llm-step request. System is sent as a single leading system
