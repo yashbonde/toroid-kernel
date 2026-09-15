@@ -24,7 +24,7 @@ func TestRunModels(t *testing.T) {
 			t.Errorf("authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"object":"list","data":[{"id":"model-b","context_length":200000},{"id":"model-a"},{"id":""}]}`)
+		io.WriteString(w, `{"object":"list","data":[{"id":"model-b","context_length":200000,"pricing":{"input":1400000,"output":4400000}},{"id":"model-a"},{"id":""}]}`)
 	}))
 	defer server.Close()
 
@@ -39,8 +39,25 @@ func TestRunModels(t *testing.T) {
 	if !strings.HasPrefix(got, "\x1b[90mGET "+server.URL+"/v1/models\x1b[0m\n") {
 		t.Fatalf("output = %q, want grey GET line prefix", got)
 	}
-	if want := "model-b (200000)\nmodel-a\n"; !strings.HasSuffix(got, want) {
+	if want := "model-b (200000)  \x1b[90m$1.40 / $4.40 per MTok\x1b[0m\nmodel-a\n"; !strings.HasSuffix(got, want) {
 		t.Fatalf("output = %q, want suffix %q", got, want)
+	}
+}
+
+func TestPriceSuffix(t *testing.T) {
+	cases := []struct {
+		name string
+		p    *modelPricing
+		want string
+	}{
+		{"nil", nil, ""},
+		{"zero", &modelPricing{}, "$0.00 / $0.00 per MTok"},
+		{"values", &modelPricing{Input: 220000, Output: 660000, CacheRead: 7000, CacheWrite: 0}, "$0.22 / $0.66 per MTok"},
+	}
+	for _, c := range cases {
+		if got := priceSuffix(c.p); got != c.want {
+			t.Errorf("%s: priceSuffix = %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

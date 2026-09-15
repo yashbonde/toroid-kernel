@@ -4,7 +4,7 @@ import "strings"
 
 // Model is a catalog row describing one runnable model: how to reach it
 // (provider + wire api) and its capabilities (context window, input
-// modalities, reasoning). Dollar cost is computed from Model.Price.
+// modalities, reasoning).
 type Model struct {
 	// ID is the full model id as the host uses it, e.g. "llmgateway/kimi-k2p6".
 	ID string
@@ -20,10 +20,6 @@ type Model struct {
 	// breakpoints to cache the prompt prefix (Anthropic-style opt-in caching).
 	// OpenAI-family routes auto-cache and stay false.
 	PromptCache bool
-	// Price holds fallback per-token USD rates for when the gateway does not
-	// report an authoritative cost (direct provider routes, streaming). Nil when
-	// the family is unknown — cost then stays honestly unknown.
-	Price *ModelPrice
 	// Input lists supported input modalities, e.g. ["text"] or ["text","image"].
 	Input []string
 }
@@ -53,24 +49,14 @@ const (
 	InputImage = "image"
 )
 
-// ModelPrice is USD per token for one model family. Rates are cached in code
-// because neither provider exposes pricing via API.
-type ModelPrice struct {
-	In         float64
-	Out        float64
-	CacheRead  float64
-	CacheWrite float64
-}
-
 // modelMeta carries the facts about a model that no API exposes: context
-// window, modalities, cache behaviour, and fallback token rates. Intentionally
-// small and explicit — we seed only what we can state truthfully.
+// window, modalities, and cache behaviour. Intentionally small and explicit —
+// we seed only what we can state truthfully.
 type modelMeta struct {
 	contextWindow int
 	vision        bool
 	reasoning     bool
 	promptCache   bool // needs explicit cache_control breakpoints (Anthropic-style)
-	price         *ModelPrice
 }
 
 // modelMetaTable maps a normalized (provider-stripped, dotted) model name to its
@@ -97,25 +83,16 @@ var modelMetaFamilies = []struct {
 	prefix string
 	meta   modelMeta
 }{
-	// Anthropic Claude (200K context, vision). Rates: published per-MTok prices;
-	// cache read = 0.1x input, cache write = 1.25x input.
-	{"claude-opus", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
-		price: &ModelPrice{In: 5e-06, Out: 2.5e-05, CacheRead: 5e-07, CacheWrite: 6.25e-06}}},
-	{"claude-sonnet", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
-		price: &ModelPrice{In: 3e-06, Out: 1.5e-05, CacheRead: 3e-07, CacheWrite: 3.75e-06}}},
-	{"claude-haiku", modelMeta{contextWindow: 200_000, vision: true, promptCache: true,
-		price: &ModelPrice{In: 1e-06, Out: 5e-06, CacheRead: 1e-07, CacheWrite: 1.25e-06}}},
+	// Anthropic Claude (200K context, vision).
+	{"claude-opus", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
+	{"claude-sonnet", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
+	{"claude-haiku", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
 	// OpenAI GPT-5 family (400K context, vision). Most-specific prefix first.
-	{"gpt-5.4-nano", modelMeta{contextWindow: 400_000, vision: true,
-		price: &ModelPrice{In: 2e-07, Out: 1.25e-06, CacheRead: 2e-08}}},
-	{"gpt-5.4-mini", modelMeta{contextWindow: 400_000, vision: true,
-		price: &ModelPrice{In: 7.5e-07, Out: 4.5e-06, CacheRead: 7.5e-08}}},
-	{"gpt-5.4-pro", modelMeta{contextWindow: 400_000, vision: true,
-		price: &ModelPrice{In: 3e-05, Out: 1.8e-04}}},
-	{"gpt-5.4", modelMeta{contextWindow: 400_000, vision: true,
-		price: &ModelPrice{In: 2.5e-06, Out: 1.5e-05, CacheRead: 2.5e-07}}},
-	{"gpt-5", modelMeta{contextWindow: 400_000, vision: true,
-		price: &ModelPrice{In: 1.25e-06, Out: 1e-05, CacheRead: 1.25e-07}}},
+	{"gpt-5.4-nano", modelMeta{contextWindow: 400_000, vision: true}},
+	{"gpt-5.4-mini", modelMeta{contextWindow: 400_000, vision: true}},
+	{"gpt-5.4-pro", modelMeta{contextWindow: 400_000, vision: true}},
+	{"gpt-5.4", modelMeta{contextWindow: 400_000, vision: true}},
+	{"gpt-5", modelMeta{contextWindow: 400_000, vision: true}},
 	{"gpt-4.1", modelMeta{contextWindow: 1_000_000, vision: true}},
 	{"gpt-4o", modelMeta{contextWindow: 128_000, vision: true}},
 	// OpenAI reasoning models (o-series): large context, vision, reasoning.
@@ -133,10 +110,6 @@ var modelMetaFamilies = []struct {
 	{"deepseek", modelMeta{contextWindow: 128_000, reasoning: true}},
 	{"qwen", modelMeta{contextWindow: 128_000}},
 	{"minimax", modelMeta{contextWindow: 200_000, reasoning: true}},
-	// NVIDIA Nemotron (free tier) — 128K context, text-only.
-	// The :free suffix indicates zero cost; pricing is zero so PricingOK = true.
-	{"nemotron", modelMeta{contextWindow: 128_000,
-		price: &ModelPrice{In: 0, Out: 0, CacheRead: 0, CacheWrite: 0}}},
 }
 
 // lookupModelMeta resolves metadata for a normalized name: an exact override
@@ -206,7 +179,6 @@ func ResolveModel(id string) Model {
 			m.Reasoning = true
 		}
 		m.PromptCache = meta.promptCache
-		m.Price = meta.price
 	}
 
 	return m

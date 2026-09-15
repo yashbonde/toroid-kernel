@@ -53,11 +53,11 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 // The gateway's own cost header wins when present (X-LLM-Gateway-Cost in
 // micro-USD, or the LiteLLM x-litellm-response-cost in USD): it is the
 // biller's authoritative number, already reflecting per-deployment rates,
-// discounts, and margin, none of which a client-side catalog can know. Only
-// when the gateway reports nothing do we fall back to the model's cached
-// per-token rates. With neither, cost stays honestly unknown (PricingOK false)
-// rather than silently zero.
-func usageFrom(model Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
+// discounts, and margin, none of which a client-side catalog can know. When
+// the gateway reports nothing, cost stays honestly unknown (PricingOK false)
+// rather than silently zero. There is no client-side rate table any more; the
+// gateway — or a direct provider — is the only source of cost.
+func usageFrom(_ Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
 	u := Usage{
 		Input:      wire.Input,
 		Output:     wire.Output,
@@ -67,13 +67,6 @@ func usageFrom(model Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
 	}
 	if gw.CostUSD != nil {
 		u.Cost = *gw.CostUSD
-		u.PricingOK = true
-		return u
-	}
-	if model.Price != nil {
-		p := model.Price
-		u.Cost = float64(u.Input)*p.In + float64(u.Output)*p.Out +
-			float64(u.CacheRead)*p.CacheRead + float64(u.CacheWrite)*p.CacheWrite
 		u.PricingOK = true
 	}
 	return u

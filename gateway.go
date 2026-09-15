@@ -17,8 +17,8 @@ const GatewayKeyEnv = "LLM_GATEWAY_KEY"
 
 // Direct provider routes: an "openai/<model>" id talks straight to the OpenAI
 // API (same OpenAI-compatible wire); an "anthropic/<model>" id talks to the
-// native Anthropic messages API. Cost on all routes is priced from the
-// catalog's cached rates (Model.Price).
+// native Anthropic messages API. Cost on all routes comes from the gateway's
+// cost header; with no header it stays honestly unknown.
 const (
 	OpenAIBaseURL   = "https://api.openai.com/v1"
 	OpenAIKeyEnv    = "OPENAI_API_KEY"
