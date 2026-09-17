@@ -554,7 +554,7 @@ func handleCommand(line string, k *toroid.Kernel, cfg config) (quit, reset bool)
 	case "/clear":
 		fmt.Print("\x1b[2J\x1b[H")
 	case "/cost":
-		fmt.Printf("%scost so far: $%.6f%s\n", aYellow, k.RunningCostUSD(), aReset)
+		fmt.Printf("%scost so far: ₹%.6f%s\n", aYellow, k.RunningCostUSD()*100, aReset)
 	case "/model":
 		fmt.Printf("%smodel: %s | workdir: %s | thinking: %s%s\n",
 			aYellow, cfg.model, displayWorkdir(cfg.workdir), cfg.thinking, aReset)
@@ -640,7 +640,7 @@ func printModelExtras(cfg config) {
 		parts = append(parts, fmt.Sprintf("smaller=%s", shortModel(cfg.smallerModel)))
 	}
 	if cfg.maxSpend > 0 {
-		parts = append(parts, fmt.Sprintf("max_spend=$%.6f", cfg.maxSpend))
+		parts = append(parts, fmt.Sprintf("max_spend=₹%.6f", cfg.maxSpend*100))
 	}
 	if len(parts) > 0 {
 		fmt.Printf("  %s%s%s\n", aGray, strings.Join(parts, " | "), aReset)

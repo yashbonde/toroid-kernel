@@ -1067,7 +1067,7 @@ func (m *tuiModel) command(line string) (tea.Cmd, bool) {
 		m.newSession()
 		return nil, true
 	case "/cost":
-		m.addEntry(transcriptActivity, fmt.Sprintf("cost so far: $%.6f", m.kernel.RunningCostUSD()))
+		m.addEntry(transcriptActivity, fmt.Sprintf("cost so far: ₹%.6f", m.kernel.RunningCostUSD()*100))
 		return nil, true
 	case "/model":
 		m.addEntry(transcriptActivity, fmt.Sprintf("model: %s · workdir: %s · thinking: %s", m.cfg.model, displayWorkdir(m.cfg.workdir), m.cfg.thinking))
@@ -1269,8 +1269,8 @@ func (m *tuiModel) renderUsageBar() string {
 	}
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
-	// USD with 2 decimal places.
-	costStr := fmt.Sprintf("$%.2f", cost)
+	// Rupees with 2 decimal places (USD value x100).
+	costStr := fmt.Sprintf("₹%.2f", cost*100)
 
 	// compactNum turns a raw token count into a short human label: 350, 1.2k,
 	// 47k, 1.2M, 350M. One decimal is used only in the 1.0k–9.9k and 1.0M–9.9M

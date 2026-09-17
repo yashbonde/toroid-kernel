@@ -141,7 +141,7 @@ var tplFuncs = template.FuncMap{
 		return fmt.Sprintf("%.1fs", d.Seconds())
 	},
 	"moneyFmt": func(v float64) string {
-		return fmt.Sprintf("$%.6f", v)
+		return fmt.Sprintf("₹%.6f", v*100)
 	},
 	"toolTimeFmt": func(ns int64) string {
 		if ns <= 0 {

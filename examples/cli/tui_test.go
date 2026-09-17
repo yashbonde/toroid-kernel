@@ -78,7 +78,7 @@ func TestResizeReservesComposerAndUsesVisualInputHeight(t *testing.T) {
 			}
 		}
 		lines := strings.Split(m.View().Content, "\n")
-		if last := strings.TrimSpace(ansi.Strip(lines[len(lines)-1])); !strings.HasPrefix(last, "$0.00") {
+		if last := strings.TrimSpace(ansi.Strip(lines[len(lines)-1])); !strings.HasPrefix(last, "₹0.00") {
 			t.Fatalf("final terminal row does not contain status bar: %q", last)
 		}
 	}

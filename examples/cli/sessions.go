@@ -43,8 +43,8 @@ func runSessions(ctx context.Context, out io.Writer, args []string) error {
 		if len(title) > 60 {
 			title = title[:57] + "..."
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t$%.4f\t%s\n",
-			shortID(s.ID), started, duration, s.TotalUSD, title)
+		fmt.Fprintf(w, "%s\t%s\t%s\t₹%.4f\t%s\n",
+			shortID(s.ID), started, duration, s.TotalUSD*100, title)
 	}
 	return w.Flush()
 }
