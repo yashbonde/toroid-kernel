@@ -150,6 +150,12 @@ type tuiModel struct {
 	// before that turn's first tool row rather than appended at the end —
 	// this tracks how far those insertions have progressed.
 	lastNarratedToolNum int
+	// streamedNarration accumulates the assistant text delivered live via the
+	// stream during the current turn. The kernel also replays a turn's full
+	// (accumulated) narration in every TurnCompleted payload, which would
+	// otherwise re-insert text the stream already showed; appendIntermediate
+	// strips this prefix so each narration renders once. Reset per turn.
+	streamedNarration strings.Builder
 	// userSeq is the monotonic counter for user messages across the session,
 	// shown as "[n]" before the username in the transcript header.
 	userSeq int
@@ -433,6 +439,21 @@ func (m *tuiModel) appendIntermediate(text string) {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return
+	}
+	// Drop the prefix the stream already rendered this turn: the kernel writes
+	// tool-turn narration to the writer AND replays the turn's accumulated
+	// narration in TurnCompleted, so without this the text between two tool
+	// calls would appear twice (and earlier steps' text again after that).
+	if streamed := strings.TrimSpace(m.streamedNarration.String()); streamed != "" {
+		if strings.HasPrefix(text, streamed) {
+			text = strings.TrimSpace(text[len(streamed):])
+		} else if strings.Contains(streamed, text) {
+			// This payload's narration is already fully covered by what streamed.
+			text = ""
+		}
+		if text == "" {
+			return
+		}
 	}
 	entry := transcriptEntry{kind: transcriptAssistant, text: text, ts: time.Now()}
 	insertAt := len(m.entries)
@@ -894,6 +915,7 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 	m.busy = true
 	m.toolCallSeq = 0
 	m.lastNarratedToolNum = 0
+	m.streamedNarration.Reset()
 	m.input.Reset()
 	// Generate a title from the first user prompt.
 	if m.userSeq == 0 && m.sessionTitle == "" {
@@ -1170,6 +1192,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendActivity(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiStreamMsg:
+		m.streamedNarration.WriteString(string(msg))
 		m.appendStream(string(msg))
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiIntermediateMsg:
