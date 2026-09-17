@@ -47,6 +47,83 @@ func (a ReadArgs) Validate() error {
 	return nil
 }
 
+func buildDirContent(path string, offset, limit int) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", err
+	}
+	var names []string
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() {
+			name += "/"
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	start := offset - 1
+	if start >= len(names) {
+		return fmt.Sprintf("<path>%s</path>\n<type>directory</type>\n<entries>\n(No more entries)\n</entries>", path), nil
+	}
+	end := start + limit
+	if end > len(names) {
+		end = len(names)
+	}
+	sliced := names[start:end]
+	return fmt.Sprintf("<path>%s</path>\n<type>directory</type>\n<entries>\n%s\n(%d entries)\n</entries>",
+		path, strings.Join(sliced, "\n"), len(names)), nil
+}
+
+func buildFileContent(path string, offset, limit int) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	// Simple binary check
+	isBinary, err := isBinaryFile(f)
+	if err != nil {
+		return "", err
+	}
+	if isBinary {
+		return "", fmt.Errorf("binary")
+	}
+	f.Seek(0, 0)
+
+	scanner := bufio.NewScanner(f)
+	var raw []string
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		if lineNum < offset {
+			continue
+		}
+		if len(raw) >= limit {
+			break
+		}
+		text := scanner.Text()
+		if len(text) > MaxLineLength {
+			text = text[:MaxLineLength] + "... (line truncated)"
+		}
+		raw = append(raw, fmt.Sprintf("%d: %s", lineNum, text))
+	}
+
+	content := fmt.Sprintf("<path>%s</path>\n<type>file</type>\n<content>\n%s\n", path, strings.Join(raw, "\n"))
+	if scanner.Scan() || lineNum >= offset+limit {
+		lastLine := offset + len(raw) - 1
+		if lastLine < offset {
+			lastLine = offset
+		}
+		content += fmt.Sprintf("\n(Showing lines %d-%d. Use offset=%d to continue.)", offset, lastLine, offset+len(raw))
+	} else {
+		content += fmt.Sprintf("\n(End of file - total %d lines)", lineNum)
+	}
+	content += "\n</content>"
+	return content, nil
+}
+
 func NewReadTool(a Agent, desc string) *ToolDef {
 	// errf builds an error tool result; toroid keys tool failure off the
 	// "Error:" content prefix, so every failure path funnels through here.
@@ -77,96 +154,38 @@ func NewReadTool(a Agent, desc string) *ToolDef {
 
 		var content string
 		if info.IsDir() {
-			entries, err := os.ReadDir(path)
+			c, err := buildDirContent(path, offset, limit)
 			if err != nil {
 				return errf("%v", err), nil
 			}
-			var names []string
-			for _, e := range entries {
-				name := e.Name()
-				if e.IsDir() {
-					name += "/"
-				}
-				names = append(names, name)
-			}
-			sort.Strings(names)
-
-			start := offset - 1
-			if start >= len(names) {
-				content = fmt.Sprintf("<path>%s</path>\n<type>directory</type>\n<entries>\n(No more entries)\n</entries>", path)
-			} else {
-				end := start + limit
-				if end > len(names) {
-					end = len(names)
-				}
-				sliced := names[start:end]
-				content = fmt.Sprintf("<path>%s</path>\n<type>directory</type>\n<entries>\n%s\n(%d entries)\n</entries>",
-					path, strings.Join(sliced, "\n"), len(names))
-			}
+			content = c
 		} else {
 			// File reading
-			f, err := os.Open(path)
+			c, err := buildFileContent(path, offset, limit)
 			if err != nil {
+				if err.Error() == "binary" {
+					// Images and PDFs are returned as media attachments so a
+					// vision-capable model can see them; other binaries are refused.
+					// Media above the cap is refused outright: an unbounded blob would
+					// be re-sent (and re-billed) with every subsequent llm-step.
+					if mt, ok := MediaType(path); ok {
+						if info.Size() > MaxMediaBytes {
+							return errf("media %s is %d bytes, over the %d-byte cap", path, info.Size(), MaxMediaBytes), nil
+						}
+						data, err := os.ReadFile(path)
+						if err != nil {
+							return errf("%v", err), nil
+						}
+						return llm.ToolResult{
+							Content: fmt.Sprintf("Read %s (%d bytes, %s)", path, len(data), mt),
+							Files:   []llm.FilePart{{Filename: filepath.Base(path), MediaType: mt, Data: data}},
+						}, nil
+					}
+					return errf("cannot read binary file: %s", path), nil
+				}
 				return errf("%v", err), nil
 			}
-			defer f.Close()
-
-			// Simple binary check
-			isBinary, err := isBinaryFile(f)
-			if err != nil {
-				return errf("%v", err), nil
-			}
-			if isBinary {
-				// Images and PDFs are returned as media attachments so a
-				// vision-capable model can see them; other binaries are refused.
-				// Media above the cap is refused outright: an unbounded blob would
-				// be re-sent (and re-billed) with every subsequent llm-step.
-				if mt, ok := MediaType(path); ok {
-					if info.Size() > MaxMediaBytes {
-						return errf("media %s is %d bytes, over the %d-byte cap", path, info.Size(), MaxMediaBytes), nil
-					}
-					data, err := os.ReadFile(path)
-					if err != nil {
-						return errf("%v", err), nil
-					}
-					return llm.ToolResult{
-						Content: fmt.Sprintf("Read %s (%d bytes, %s)", path, len(data), mt),
-						Files:   []llm.FilePart{{Filename: filepath.Base(path), MediaType: mt, Data: data}},
-					}, nil
-				}
-				return errf("cannot read binary file: %s", path), nil
-			}
-			f.Seek(0, 0)
-
-			scanner := bufio.NewScanner(f)
-			var raw []string
-			lineNum := 0
-			for scanner.Scan() {
-				lineNum++
-				if lineNum < offset {
-					continue
-				}
-				if len(raw) >= limit {
-					break
-				}
-				text := scanner.Text()
-				if len(text) > MaxLineLength {
-					text = text[:MaxLineLength] + "... (line truncated)"
-				}
-				raw = append(raw, fmt.Sprintf("%d: %s", lineNum, text))
-			}
-
-			content = fmt.Sprintf("<path>%s</path>\n<type>file</type>\n<content>\n%s\n", path, strings.Join(raw, "\n"))
-			if scanner.Scan() || lineNum >= offset+limit {
-				lastLine := offset + len(raw) - 1
-				if lastLine < offset {
-					lastLine = offset
-				}
-				content += fmt.Sprintf("\n(Showing lines %d-%d. Use offset=%d to continue.)", offset, lastLine, offset+len(raw))
-			} else {
-				content += fmt.Sprintf("\n(End of file - total %d lines)", lineNum)
-			}
-			content += "\n</content>"
+			content = c
 		}
 
 		return llm.NewTextResult(TruncateToolOutput(a, content)), nil

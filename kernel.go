@@ -148,59 +148,35 @@ type Config struct {
 	ShowHistory       *bool `json:"show_history" description:"print history" default:"false"`
 }
 
-// NewKernel creates and wires up a new Kernel.
-func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
-	// Provider routing: "openai/<model>" talks straight to the OpenAI API,
-	// "anthropic/<model>" to the native Anthropic messages API; everything else
-	// goes through the LiteLLM gateway.
-	baseURL := os.Getenv(GatewayBaseURLEnv)
+func resolveProviderBaseURL(cfg Config) (baseURL string, resolvedAPIKey string) {
+	baseURL = os.Getenv(GatewayBaseURLEnv)
+	resolvedAPIKey = cfg.APIKey
 	switch {
 	case strings.HasPrefix(cfg.Model, "openai/"):
 		baseURL = OpenAIBaseURL
-		if cfg.APIKey == "" {
-			cfg.APIKey = os.Getenv(OpenAIKeyEnv)
+		if resolvedAPIKey == "" {
+			resolvedAPIKey = os.Getenv(OpenAIKeyEnv)
 		}
 	case strings.HasPrefix(cfg.Model, "anthropic/"):
-		if cfg.APIKey == "" {
-			cfg.APIKey = os.Getenv(AnthropicKeyEnv)
+		if resolvedAPIKey == "" {
+			resolvedAPIKey = os.Getenv(AnthropicKeyEnv)
 		}
 	}
-	if cfg.APIKey == "" {
-		cfg.APIKey = os.Getenv(GatewayKeyEnv)
+	if resolvedAPIKey == "" {
+		resolvedAPIKey = os.Getenv(GatewayKeyEnv)
 	}
-	if cfg.SessionID == "" {
-		cfg.SessionID = NewSessionID()
-	}
-	if cfg.WorkDir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return nil, err
-		}
-		runDir, err := RunnerDir(cwd, cfg.SessionID)
-		if err != nil {
-			return nil, err
-		}
-		cfg.WorkDir = runDir
-	}
-	// Root kernel: TraceID == SessionID
-	if cfg.TraceID == "" {
-		cfg.TraceID = cfg.SessionID
-	}
+	return
+}
 
-	// Ask the gateway what this model can actually take before falling back to
-	// the compiled-in defaults: an id the static catalog has never seen would
-	// otherwise inherit a 200k window and no output ceiling, and the provider
-	// would truncate mid-answer. Best-effort — an unreachable or silent gateway
-	// leaves the configured values exactly as they are.
-	if lim, ok := fetchModelLimits(ctx, baseURL, cfg.APIKey, cfg.Model); ok {
-		applyModelLimits(&cfg, lim)
+func resolveWorkDir(sessionID string) (string, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
 	}
+	return RunnerDir(cwd, sessionID)
+}
 
-	// Apply context-window defaults. The struct-tag `default` values are NOT
-	// auto-applied, so a caller that omits these leaves them at 0 — which makes
-	// overContextThreshold treat threshold = TotalContextSize-CompactionBufferSize
-	// = 0 and fire on the very first non-empty turn, spuriously compacting and
-	// restarting the loop every turn.
+func applyConfigDefaults(cfg Config) Config {
 	if cfg.TotalContextSize <= 0 {
 		cfg.TotalContextSize = 200000
 	}
@@ -213,6 +189,36 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	if cfg.SmallerModel == "" {
 		cfg.SmallerModel = "deepseek-v4-flash"
 	}
+	return cfg
+}
+
+// NewKernel creates and wires up a new Kernel.
+func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
+	baseURL, apiKey := resolveProviderBaseURL(cfg)
+	cfg.APIKey = apiKey
+
+	if cfg.SessionID == "" {
+		cfg.SessionID = NewSessionID()
+	}
+	if cfg.WorkDir == "" {
+		wd, err := resolveWorkDir(cfg.SessionID)
+		if err != nil {
+			return nil, err
+		}
+		cfg.WorkDir = wd
+	}
+	// Root kernel: TraceID == SessionID
+	if cfg.TraceID == "" {
+		cfg.TraceID = cfg.SessionID
+	}
+
+	// Ask the gateway what this model can actually take before falling back to
+	// the compiled-in defaults.
+	if lim, ok := fetchModelLimits(ctx, baseURL, cfg.APIKey, cfg.Model); ok {
+		applyModelLimits(&cfg, lim)
+	}
+
+	cfg = applyConfigDefaults(cfg)
 
 	// Kernel object
 	k := &Kernel{

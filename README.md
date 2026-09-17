@@ -25,8 +25,8 @@ one LLM step ── LiteLLM gateway, OpenAI, or Anthropic
 - One kernel API for blocking runs, streaming, tools, structured output, and
   background agents.
 - A stable system prompt and tool list for provider prompt caches.
-- The real cost of each call from LiteLLM. Direct OpenAI and Anthropic routes
-  use fallback rates.
+- The real cost of each call from the gateway, not a preset. Direct OpenAI and
+  Anthropic routes use fallback rates.
 - Hard limits for each turn and for the full transcript.
 - Built-in file and shell tools, lazy skills, remote MCP tools, and synchronous
   or background subagents.
