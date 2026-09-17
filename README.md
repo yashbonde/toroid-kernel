@@ -298,7 +298,7 @@ Zero values are expanded by `NewKernel` where noted.
 | `Resume` | Reconstruct stored session history | `false` |
 | `TotalContextSize` | Effective context window | Gateway limit or `200000` |
 | `CompactionBufferSize` | Reserved tokens before automatic compaction | `50000` |
-| `SmallerModel` | Model for compaction and subagents | `deepseek/deepseek-v4-flash-0731` |
+| `SmallerModel` | Model for compaction and subagents | `deepseek-v4-flash` |
 | `MaxTranscriptSpendUSD` | Cumulative kernel spend limit | Disabled when non-positive |
 
 For every exported type and method, use Go's package reference:

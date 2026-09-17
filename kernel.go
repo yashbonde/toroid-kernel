@@ -211,7 +211,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		cfg.MaxIter = 100
 	}
 	if cfg.SmallerModel == "" {
-		cfg.SmallerModel = "deepseek/deepseek-v4-flash-0731"
+		cfg.SmallerModel = "deepseek-v4-flash"
 	}
 
 	// Kernel object

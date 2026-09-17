@@ -141,6 +141,9 @@ type tuiModel struct {
 	// runningSubagents tracks in-flight async subagents (sessionID -> start time)
 	// so their running indicators show elapsed time with a blue icon.
 	runningSubagents map[string]time.Time
+	// completedSubagents is a monotonically increasing session counter of
+	// subagents that have finished, shown alongside the "ready" status.
+	completedSubagents int
 	// toolCallSeq is the monotonic counter for tool calls within the current
 	// turn, reset to 0 on each new turn.
 	toolCallSeq int
@@ -174,6 +177,10 @@ type tuiModel struct {
 	// bashMode is true while the input starts with '!', so the input area is
 	// styled in dark purple and its label reads "bash".
 	bashMode bool
+	// bashRunning is true while a user-issued '!' command is executing so the
+	// status line can show "working" in purple. Unlike bashMode (input-only)
+	// and busy (model turn), this tracks the actual in-flight shell command.
+	bashRunning bool
 	// gen identifies the current kernel generation. /new bumps it so hooks left
 	// behind on the replaced kernel stop feeding this TUI.
 	gen atomic.Uint64
@@ -336,6 +343,7 @@ func (m *tuiModel) stopSubagent(id, output string) {
 	start, ok := m.runningSubagents[id]
 	delete(m.runningSubagents, id)
 	if ok {
+		m.completedSubagents++
 		// Only ellipsize an id that was actually truncated.
 		name := id
 		if len(name) > 12 {
@@ -960,6 +968,7 @@ func (m *tuiModel) submit(prompt string) tea.Cmd {
 func (m *tuiModel) bashSubmit(prompt string) tea.Cmd {
 	cmd := strings.TrimSpace(strings.TrimPrefix(prompt, "!"))
 	m.addEntry(transcriptBash, cmd)
+	m.bashRunning = true
 	return func() tea.Msg {
 		start := time.Now()
 
@@ -1062,6 +1071,7 @@ func (m *tuiModel) newSession() {
 	m.busy = false
 	m.runningTools = nil
 	m.runningSubagents = nil
+	m.completedSubagents = 0
 	m.userSeq = 0
 	m.toolCallSeq = 0
 	m.sessionTitle = ""
@@ -1207,18 +1217,27 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case tuiSubagentMsg:
 		if msg.start {
+			wasEmpty := len(m.runningSubagents) == 0
 			m.startSubagent(msg.id, msg.prompt)
+			// Kick off the animation tick the first time a subagent becomes
+			// in-flight (0 -> N transition). The self-rescheduling spinnerTick
+			// below keeps it re-firing until the running set drains, so the
+			// row keeps animating even while the main thread is idle.
+			if wasEmpty {
+				cmds = append(cmds, spin())
+			}
 		} else {
 			m.stopSubagent(msg.id, msg.output)
 		}
 		cmds = append(cmds, waitTUIEvent(m.events))
 	case spinnerTick:
-		if m.busy {
+		if m.busy || m.bashRunning || len(m.runningSubagents) > 0 {
 			m.spinnerFrame++
 			m.renderTranscript() // advance the live tool "…" animation too
 			cmds = append(cmds, spin())
 		}
 	case tuiBashDoneMsg:
+		m.bashRunning = false
 		if strings.TrimSpace(msg.out) != "" {
 			m.addEntry(transcriptBashOutput, msg.out)
 		}
@@ -1318,8 +1337,13 @@ func (m *tuiModel) renderUsageBar() string {
 	tokStr := compact(used) + "/" + compact(total)
 
 	statusText := dimStyle.Render("ready")
+	if n := len(m.runningSubagents) + m.completedSubagents; n > 0 {
+		statusText += dimStyle.Render(fmt.Sprintf("  ⚡ %d running · %d done", len(m.runningSubagents), m.completedSubagents))
+	}
 	if m.busy {
 		statusText = accentStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]+" working") + dimStyle.Render("  Esc cancel")
+	} else if m.bashRunning {
+		statusText = purpleStyle.Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]+" working") + dimStyle.Render("  Esc cancel")
 	}
 
 	// Layout: [TOROID model] [path · keys] ... [cost] [progress] [tokens] [status]
