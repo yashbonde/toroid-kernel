@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,28 +12,13 @@ import (
 	toroid "github.com/yashbonde/toroid-kernel"
 )
 
-const maxModelsResponseSize = 4 << 20
-
-// modelPricing mirrors the gateway's per-model pricing object (/models
-// response). Unit is micro-USD per million tokens. It is the authoritative
-// price the gateway bills at.
-type modelPricing struct {
-	Input      float64 `json:"input"`
-	Output     float64 `json:"output"`
-	CacheRead  float64 `json:"cache_read"`
-	CacheWrite float64 `json:"cache_write"`
-}
-
-type modelsResponse struct {
-	Data []struct {
-		ID            string        `json:"id"`
-		ContextLength int           `json:"context_length"`
-		Pricing       *modelPricing `json:"pricing"`
-	} `json:"data"`
-}
+// Keep the CLI's compact names while sharing the live gateway catalog reader
+// with the kernel prompt.
+type modelPricing = toroid.GatewayModelPricing
+type listedModel = toroid.GatewayModel
 
 // perMTok scales a micro-USD-per-million-token price to USD per 1M tokens.
-func perMTok(v float64) float64 { return v / 1e6 }
+func perMTok(v float64) float64 { return toroid.PerMTok(v) }
 
 // runModels implements `trk models`. Model IDs are printed one per line so the
 // output remains useful both at a terminal and in shell pipelines. When the
@@ -89,52 +73,6 @@ func priceSuffix(p *modelPricing) string {
 	return fmt.Sprintf("$%.2f / $%.2f per MTok", perMTok(p.Input), perMTok(p.Output))
 }
 
-type listedModel struct {
-	ID            string
-	ContextLength int
-	Pricing       *modelPricing
-}
-
 func fetchModels(ctx context.Context, client *http.Client, baseURL, apiKey string) ([]listedModel, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/models"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "trk")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request %s: %w", endpoint, err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-	if len(body) > maxModelsResponseSize {
-		return nil, fmt.Errorf("response exceeds %d bytes", maxModelsResponseSize)
-	}
-	if resp.StatusCode != http.StatusOK {
-		message := strings.TrimSpace(string(body))
-		if len(message) > 500 {
-			message = message[:500] + "..."
-		}
-		return nil, fmt.Errorf("gateway returned %s: %s", resp.Status, message)
-	}
-
-	var payload modelsResponse
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	models := make([]listedModel, 0, len(payload.Data))
-	for _, model := range payload.Data {
-		if id := strings.TrimSpace(model.ID); id != "" {
-			models = append(models, listedModel{ID: id, ContextLength: model.ContextLength, Pricing: model.Pricing})
-		}
-	}
-	return models, nil
+	return toroid.FetchGatewayModels(ctx, client, baseURL, apiKey)
 }

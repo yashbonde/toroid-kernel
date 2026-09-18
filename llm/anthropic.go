@@ -37,7 +37,7 @@ func NewAnthropicClient(apiKey string) *AnthropicClient {
 		BaseURL:   AnthropicBaseURL,
 		APIKey:    apiKey,
 		UserAgent: "toroid-kernel",
-		HTTP:      &http.Client{},
+		HTTP:      newHTTPClient(),
 	}
 }
 
@@ -301,6 +301,8 @@ func (c *AnthropicClient) Complete(ctx context.Context, req Request) (*Response,
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := withCallTimeout(ctx, c.HTTP)
+	defer cancel()
 	httpResp, err := c.do(ctx, body)
 	if err != nil {
 		return nil, err
@@ -349,12 +351,15 @@ func (c *AnthropicClient) StreamComplete(ctx context.Context, req Request) (*Str
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := withCallTimeout(ctx, c.HTTP)
 	httpResp, err := c.do(ctx, body)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if httpResp.StatusCode != http.StatusOK {
 		defer httpResp.Body.Close()
+		defer cancel()
 		data, _ := io.ReadAll(httpResp.Body)
 		return nil, fmt.Errorf("anthropic %d: %s", httpResp.StatusCode, snippet(data))
 	}
@@ -365,6 +370,7 @@ func (c *AnthropicClient) StreamComplete(ctx context.Context, req Request) (*Str
 	var finalErr error
 
 	go func() {
+		defer cancel()
 		defer close(done)
 		defer close(deltas)
 		defer httpResp.Body.Close()

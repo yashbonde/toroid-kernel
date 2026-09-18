@@ -10,7 +10,7 @@ import (
 // buildSystemPrompt assembles an invariant prefix and a run-specific suffix.
 // The wire clients cache the prefix independently so workspace and capability
 // changes do not invalidate the reusable operating instructions.
-func buildSystemPrompt(workDir string, skills []SkillMeta, hasMCP, hasSubagents bool, model, smallerModel string, totalContextSize, compactionBufferSize int) (string, string) {
+func buildSystemPrompt(workDir string, skills []SkillMeta, hasMCP, hasSubagents bool, model, smallerModel string, totalContextSize, compactionBufferSize int, gatewayModels ...[]GatewayModel) (string, string) {
 	stable := strings.TrimSpace(`You are Toroid, an autonomous software-engineering agent.
 
 Complete the requested outcome with the smallest coherent, maintainable change.
@@ -161,6 +161,7 @@ Assistant: *subagent for step 1* → waits → *subagent for step 2* → waits..
 		if smallerModel != "" {
 			fmt.Fprintf(&b, "Primary model: %s\nSubagent model: %s\n", model, smallerModel)
 		}
+		b.WriteString(gatewayModelsPrompt(gatewayModels...))
 	}
 
 	b.WriteString(fmt.Sprintf(`

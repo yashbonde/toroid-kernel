@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -35,13 +36,54 @@ type Client struct {
 	HTTP      *http.Client
 }
 
+const (
+	// ClientTimeout bounds one complete LLM call — all attempts, retry
+	// backoffs, response headers, and the full body read (including a streamed
+	// response). Without a shared call deadline, each retry gets a fresh client
+	// timeout and a broken connection can wedge the CLI for many multiples of
+	// this value. Five minutes still leaves room for a slow reasoning response.
+	ClientTimeout = 300 * time.Second
+
+	// ClientConnectTimeout fails a black-holed TCP connection promptly. It is
+	// deliberately separate from ClientTimeout: model generation may be slow,
+	// but establishing the socket should not consume the whole call budget.
+	ClientConnectTimeout = 15 * time.Second
+)
+
+// newHTTPClient gives each wire client its own connection pool and bounded
+// dial. Client.Timeout remains set as a second line of defence; Complete and
+// StreamComplete also derive one context deadline shared by every retry.
+func newHTTPClient() *http.Client {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return &http.Client{Timeout: ClientTimeout}
+	}
+	transport := base.Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   ClientConnectTimeout,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	return &http.Client{Transport: transport, Timeout: ClientTimeout}
+}
+
+// withCallTimeout creates the one deadline for an entire logical LLM call.
+// Tests and callers that inject an HTTP client may choose a shorter timeout;
+// a zero client timeout still receives the safe package default.
+func withCallTimeout(ctx context.Context, client *http.Client) (context.Context, context.CancelFunc) {
+	timeout := ClientTimeout
+	if client != nil && client.Timeout > 0 {
+		timeout = client.Timeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 // NewClient builds a gateway client. baseURL must include /v1.
 func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
 		BaseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		APIKey:    apiKey,
 		UserAgent: "toroid-kernel",
-		HTTP:      &http.Client{},
+		HTTP:      newHTTPClient(),
 	}
 }
 
@@ -169,6 +211,8 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := withCallTimeout(ctx, c.HTTP)
+	defer cancel()
 	httpResp, err := c.do(ctx, body)
 	if err != nil {
 		return nil, err
@@ -222,12 +266,15 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := withCallTimeout(ctx, c.HTTP)
 	httpResp, err := c.do(ctx, body)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if httpResp.StatusCode != http.StatusOK {
 		defer httpResp.Body.Close()
+		defer cancel()
 		data, _ := io.ReadAll(httpResp.Body)
 		return nil, fmt.Errorf("gateway %d: %s", httpResp.StatusCode, snippet(data))
 	}
@@ -238,6 +285,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 	var finalErr error
 
 	go func() {
+		defer cancel()
 		defer close(done)
 		defer close(deltas)
 		defer httpResp.Body.Close()

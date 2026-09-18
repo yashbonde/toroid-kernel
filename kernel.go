@@ -250,6 +250,14 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 
 	ApplyDefaultDataTypes(&cfg) // cfg OR default_cfg
 
+	// The gateway catalog is dynamic. Read it once when subagents are enabled so
+	// their prompt can name currently available, priced alternatives. Discovery
+	// is best-effort: an unavailable catalog must never block kernel startup.
+	var gatewayModels []GatewayModel
+	if cfg.IncludeSubagentTools && baseURL != "" && !strings.HasPrefix(cfg.Model, "openai/") && !strings.HasPrefix(cfg.Model, "anthropic/") {
+		gatewayModels, _ = FetchGatewayModels(ctx, nil, baseURL, cfg.APIKey)
+	}
+
 	// Skills: scan ~/.toroid/skills/ for metadata only (progressive
 	// disclosure). Full skill bodies are loaded lazily via the skill tool,
 	// either by the model recognizing a relevant skill or by the user naming
@@ -306,7 +314,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 
 	// Compile one stable system prefix after every startup capability is known.
 	k.SystemPromptPrefix, k.SystemPrompt = buildSystemPrompt(cfg.WorkDir, skills, len(cfg.MCPServers) > 0,
-		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel, cfg.TotalContextSize, cfg.CompactionBufferSize)
+		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel, cfg.TotalContextSize, cfg.CompactionBufferSize, gatewayModels)
 
 	// Step is the one-llm-step backend over the in-repo wire client (OpenAI
 	// chat completions, or native Anthropic messages for anthropic/ ids). Tests
