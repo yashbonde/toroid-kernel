@@ -15,7 +15,7 @@ your program
 Toroid Kernel ── tools ── files, shell, skills, MCP, subagents
     │
     ▼
-one LLM step ── LiteLLM gateway, OpenAI, or Anthropic
+one LLM step ── LiteLLM gateway or OpenAI-compatible (OpenAI direct)
     │
     └────────── events, usage, SQLite, OpenTelemetry
 ```
@@ -25,8 +25,8 @@ one LLM step ── LiteLLM gateway, OpenAI, or Anthropic
 - One kernel API for blocking runs, streaming, tools, structured output, and
   background agents.
 - A stable system prompt and tool list for provider prompt caches.
-- The real cost of each call from the gateway, not a preset. Direct OpenAI and
-  Anthropic routes use fallback rates.
+- The real cost of each call from the gateway, not a preset. Direct OpenAI
+  routes use fallback rates.
 - Hard limits for each turn and for the full transcript.
 - Built-in file and shell tools, lazy skills, remote MCP tools, and synchronous
   or background subagents.
@@ -64,10 +64,6 @@ export LLM_GATEWAY_KEY=your_gateway_key
 # OpenAI direct
 export OPENAI_API_KEY=your_openai_key
 ./trk --model openai/gpt-5.4-mini
-
-# Anthropic direct
-export ANTHROPIC_API_KEY=your_anthropic_key
-./trk --model anthropic/claude-haiku-4-5
 ```
 
 The terminal UI shows Markdown. The composer stays at the bottom. The UI shows
@@ -264,7 +260,6 @@ The prefix selects the wire and the default credential source.
 |---|---|---|---|
 | `llmgateway/<model>` | OpenAI-compatible chat completions through LiteLLM | `LLM_GATEWAY_KEY` | LiteLLM response-cost header when present |
 | `openai/<model>` | OpenAI API | `OPENAI_API_KEY` | Cached family rates |
-| `anthropic/<model>` | Native Anthropic Messages API | `ANTHROPIC_API_KEY` | Cached family rates |
 
 Set `Config.APIKey` to replace the environment credential. The gateway routes
 also need `LLM_GATEWAY_BASE_URL`, with its `/v1` part.
@@ -274,9 +269,7 @@ the selected model. If the gateway does not answer, the local model-family
 catalog gives conservative values. Unknown models stay text-only and unpriced
 until the host gives better information.
 
-The direct Anthropic route adds cache-control breakpoints to the stable system
-prefix and to the recent conversation. The OpenAI-compatible routes use the
-automatic prefix cache of their provider.
+The OpenAI-compatible routes use the automatic prefix cache of their provider.
 
 ## Configuration reference
 

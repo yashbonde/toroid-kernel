@@ -37,6 +37,18 @@ type BashArgs struct {
 	Command string `json:"command" jsonschema:"description=The bash command to execute,minLength=1"`
 	// Timeout in seconds for this command. 0 uses DefaultBashTimeout (120s).
 	Timeout int `json:"timeout,omitempty" jsonschema:"description=Timeout in seconds (default 120),minimum=1,maximum=600"`
+	// Background runs the command fire-and-forget: the call returns a task id
+	// and log path immediately; on exit the completion notice is injected into
+	// the conversation like a background-subagent result.
+	Background bool `json:"background,omitempty" jsonschema:"description=Run detached in the background; returns a task id and log path immediately, completion notice arrives later"`
+}
+
+// BackgroundNotifier is an optional capability the bash tool uses to deliver
+// background-command completion through the kernel's queue + wake-up path
+// (the same route a background subagent takes). The kernel implements it;
+// tests and other Agent implementations may not.
+type BackgroundNotifier interface {
+	EnqueueBackgroundNotice(id, notice string)
 }
 
 // rtkReadCommands are read-only command prefixes that rtk (a token-optimizing
@@ -72,6 +84,9 @@ func NewBashTool(a Agent, desc string) *ToolDef {
 	}
 
 	h := llm.NewTool("bash", desc, func(ctx context.Context, args BashArgs) (llm.ToolResult, error) {
+		if args.Background {
+			return runBackgroundCommand(a, args.Command)
+		}
 		if args.Timeout < 0 || args.Timeout > 600 {
 			return llm.NewErrorResult("Error: timeout must be between 1 and 600 seconds when set"), nil
 		}
@@ -126,4 +141,54 @@ func NewBashTool(a Agent, desc string) *ToolDef {
 		Description: desc,
 		Handler:     h,
 	}
+}
+
+// runBackgroundCommand starts command detached under bash, in the agent's work
+// directory, writing stdout+stderr to a log file. It returns the task id, log
+// path, and PID immediately; a waiter goroutine reports the exit status through
+// the kernel's background-notice queue (no LLM involvement). If the Agent does
+// not support background notifications the command still runs — the caller can
+// read the log file — but no completion notice is delivered.
+func runBackgroundCommand(a Agent, command string) (llm.ToolResult, error) {
+	if !a.BackgroundEnabled() {
+		return llm.NewErrorResult("Error: background commands are not enabled (set IncludeSubagentTools in the kernel config)"), nil
+	}
+	id := fmt.Sprintf("bgcmd-%d", time.Now().UnixNano()%1e6)
+	logPath := fmt.Sprintf("/tmp/toroid-bgcmd-%s.log", id)
+
+	// Detached run: output to the log file, own process group so it survives
+	// and can be killed as a tree later. The command is passed verbatim to
+	// bash -c so compound commands (pipes, &&) parse naturally.
+	cmd := exec.Command("bash", "-c", command)
+	cmd.Dir = a.WorkDir()
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return llm.NewErrorResult("Error: cannot create log file: " + err.Error()), nil
+	}
+	defer logFile.Close()
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Stdin = nil
+	cmd.Env = append(os.Environ(), nonInteractiveEnv...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	if err := cmd.Start(); err != nil {
+		return llm.NewErrorResult("Error: failed to start: " + err.Error()), nil
+	}
+	pid := cmd.Process.Pid
+
+	// Waiter: no model calls, only completion bookkeeping. Detached from the
+	// tool-call context on purpose — the command must survive the call.
+	go func() {
+		err := cmd.Wait()
+		status := "completed"
+		if err != nil {
+			status = fmt.Sprintf("failed (%v)", err)
+		}
+		if n, ok := a.(BackgroundNotifier); ok {
+			n.EnqueueBackgroundNotice(id, fmt.Sprintf("background command %s %s. Log: %s (last lines: run `tail -50 %s`)", id, status, logPath, logPath))
+		}
+	}()
+
+	return llm.NewTextResult(fmt.Sprintf("Started background command %s (pid %d).\nLog: %s\nRead output with: tail -n 50 %s", id, pid, logPath, logPath)), nil
 }

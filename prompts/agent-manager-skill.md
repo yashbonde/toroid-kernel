@@ -8,6 +8,8 @@ description: Run and monitor coding agents (trk, Codex, Claude, Pi, Opencode) as
 This skill lets you dispatch tasks to external coding agents and monitor
 their progress. Use background agents when you want to parallelize work across
 multiple harnesses, or when a task benefits from a specific model's strengths.
+When launching any agent via the bash tool, pass `background = True` so it runs
+as an async subagent.
 
 ## Harness table
 

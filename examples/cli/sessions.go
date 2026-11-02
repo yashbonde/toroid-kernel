@@ -22,6 +22,10 @@ func runSessions(ctx context.Context, out io.Writer, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Show only the 30 most recent sessions; the store already returns newest first.
+	if len(sessions) > 30 {
+		sessions = sessions[:30]
+	}
 	if len(sessions) == 0 {
 		fmt.Fprintln(out, "No sessions in the store.")
 		return nil

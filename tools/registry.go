@@ -17,6 +17,7 @@ type Agent interface {
 	SessionID() string
 	Fire(ctx context.Context, kind string, payload any) error
 	RunSubagent(ctx context.Context, task string) (string, error)
+	BackgroundEnabled() bool
 }
 
 type Registry struct {

@@ -12,6 +12,22 @@ All notable changes to toroid-kernel are documented here. This project follows
   over at their corresponding kernel lifecycle boundaries, including
   compaction, structured-output, wake, and subagent request paths.
 
+### Removed
+
+- **Dropped the native Anthropic provider** (`anthropic/` model ids,
+  `ANTHROPIC_API_KEY`, the `AnthropicClient` wire, and the Claude family
+  metadata rows). Toroid now speaks only OpenAI-compatible chat completions:
+  `llmgateway/*` via LiteLLM or `openai/*` direct. Model ids like
+  `llmgateway/claude-*` still route through the gateway unchanged.
+
+### Fixed
+
+- **Structured-output steps no longer disable prompt caching.** `CompleteObject`
+  hard-coded `CachePrompt = false` on every call, breaking the guarantee that a
+  one-llm-step honors the same cache policy as the rest of the loop. It now goes
+  through `buildRequest`, so `CachePrompt` is derived uniformly from the model
+  and `StepOptions` (including a caller's explicit opt-out).
+
 ## v0.5.0
 
 ### Added

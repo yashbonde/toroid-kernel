@@ -1364,7 +1364,11 @@ func (m *tuiModel) View() tea.View {
 	if m.bashMode {
 		label = purpleDarkStyle.Render(" bash >")
 	} else if m.sessionTitle != "" {
-		label += " " + greenStyle.Render(m.sessionTitle)
+		// Truncate by display width so the title always fits on a single row,
+		// even when the first-line prompt title is long. Ellipsis flags the cut.
+		maxTitle := max(0, m.width-ansi.StringWidth(m.username)-3)
+		title := ansi.Truncate(m.sessionTitle, maxTitle, "…")
+		label += " " + greenStyle.Render(title)
 	}
 	usageBar := ansi.Truncate(m.renderUsageBar(), max(1, m.width), "")
 	separator := dimStyle.Render(strings.Repeat("─", max(1, m.width)))

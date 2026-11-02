@@ -20,8 +20,7 @@ import (
 
 // Chat is one model wire: a single completion or a single stream — one call ==
 // one product llm-step. Implementations: Client (OpenAI-compatible chat
-// completions: LiteLLM gateway, OpenAI direct) and AnthropicClient (native
-// Anthropic messages API).
+// completions: LiteLLM gateway, OpenAI direct).
 type Chat interface {
 	Complete(ctx context.Context, req Request) (*Response, error)
 	StreamComplete(ctx context.Context, req Request) (*Stream, error)
@@ -127,11 +126,13 @@ type Request struct {
 	Temperature     *float64
 	ResponseFormat  *ResponseFormat // structured output (one object llm-step)
 	ReasoningEffort string          // "", "low", "medium", "high" — gateway maps to upstream thinking budgets
-	// CachePrompt requests prompt-cache breakpoints (Anthropic-style ephemeral
-	// cache_control, which LiteLLM forwards): one on the system message and one
-	// on the last user/tool message, so each turn re-reads the previous turns at
-	// cache-read price instead of full input price. Set for model families that
-	// need explicit breakpoints (Claude); OpenAI routes auto-cache and are left alone.
+	// CachePrompt requests prompt-cache breakpoints (cache_control ephemeral,
+	// which LiteLLM forwards): one on the system message and one on the last
+	// user/tool message, so each turn re-reads the previous turns at cache-read
+	// price instead of full input price. OpenAI-family routes auto-cache and
+	// ignore breakpoints, but setting the flag is harmless and keeps a uniform
+	// request shape. Set for model families that benefit from explicit
+	// breakpoints.
 	CachePrompt bool
 }
 

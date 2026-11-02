@@ -17,8 +17,8 @@ type Model struct {
 	// Reasoning reports whether the model emits (and bills) reasoning tokens.
 	Reasoning bool
 	// PromptCache reports whether the model needs explicit cache_control
-	// breakpoints to cache the prompt prefix (Anthropic-style opt-in caching).
-	// OpenAI-family routes auto-cache and stay false.
+	// breakpoints to cache the prompt prefix (opt-in caching). OpenAI-family
+	// routes auto-cache and stay false.
 	PromptCache bool
 	// Input lists supported input modalities, e.g. ["text"] or ["text","image"].
 	Input []string
@@ -36,11 +36,10 @@ var versionDotReplacer = strings.NewReplacer(
 	"-5-5", "-5.5", "-5-4", "-5.4", "-5-3", "-5.3", "-5-2", "-5.2", "-5-1", "-5.1",
 )
 
-// Wire API identifiers.
+// Wire API identifiers. Toroid speaks only OpenAI-compatible chat completions
+// (LiteLLM gateway / llmgateway, or OpenAI direct).
 const (
-	APIOpenAICompletions = "openai-completions" // LiteLLM / llmgateway (in scope)
-	APIAnthropicMessages = "anthropic-messages" // out of scope for this port
-	APIGoogle            = "google"             // out of scope for this port
+	APIOpenAICompletions = "openai-completions"
 )
 
 // Input modality identifiers.
@@ -56,7 +55,10 @@ type modelMeta struct {
 	contextWindow int
 	vision        bool
 	reasoning     bool
-	promptCache   bool // needs explicit cache_control breakpoints (Anthropic-style)
+	// promptCache marks a model family that needs explicit cache_control
+	// breakpoints to benefit from prompt caching (opt-in caching); OpenAI-family
+	// routes auto-cache and stay false.
+	promptCache bool
 }
 
 // modelMetaTable maps a normalized (provider-stripped, dotted) model name to its
@@ -71,7 +73,7 @@ var modelMetaTable = map[string]modelMeta{
 
 // modelMetaFamily matches a model name by prefix so every version of a known
 // family inherits sensible metadata without enumerating each dotted release
-// (e.g. all "claude-sonnet-*" get a 200K vision window). Ordered most-specific
+// (e.g. all "gpt-5.4-*" get a 400K vision window). Ordered most-specific
 // prefix first; the first prefix that the normalized name starts with wins.
 //
 // Context windows are the published maximums for the family and are informational
@@ -83,10 +85,6 @@ var modelMetaFamilies = []struct {
 	prefix string
 	meta   modelMeta
 }{
-	// Anthropic Claude (200K context, vision).
-	{"claude-opus", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
-	{"claude-sonnet", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
-	{"claude-haiku", modelMeta{contextWindow: 200_000, vision: true, promptCache: true}},
 	// OpenAI GPT-5 family (400K context, vision). Most-specific prefix first.
 	{"gpt-5.4-nano", modelMeta{contextWindow: 400_000, vision: true}},
 	{"gpt-5.4-mini", modelMeta{contextWindow: 400_000, vision: true}},
@@ -133,25 +131,11 @@ func normalizeModelName(id string) string {
 	n := strings.ToLower(id)
 	n = strings.TrimPrefix(n, "models/")
 	n = strings.TrimPrefix(n, "llmgateway/")
-	// Strip a remaining provider prefix (anthropic/, openai/, google/).
+	// Strip a remaining provider prefix (openai/, or a gateway provider id).
 	if i := strings.Index(n, "/"); i >= 0 {
 		n = n[i+1:]
 	}
 	return versionDotReplacer.Replace(n)
-}
-
-// apiForProvider maps a model id's provider prefix to its wire API. Only
-// llmgateway (openai-completions) is a supported target for this port.
-func apiForProvider(provider string) string {
-	switch provider {
-	case "anthropic":
-		return APIAnthropicMessages
-	case "google":
-		return APIGoogle
-	default:
-		// llmgateway, openai, and the empty prefix all speak OpenAI completions.
-		return APIOpenAICompletions
-	}
 }
 
 // ResolveModel builds a Model catalog row for a model id from the capability
@@ -166,7 +150,7 @@ func ResolveModel(id string) Model {
 	m := Model{
 		ID:       id,
 		Provider: provider,
-		API:      apiForProvider(provider),
+		API:      APIOpenAICompletions,
 		Input:    []string{InputText},
 	}
 

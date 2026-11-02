@@ -156,7 +156,7 @@ func (s *Store) SaveTraceMeta(meta TraceMeta) error {
 	_, err := s.db.Exec(
 		`INSERT INTO traces (trace_id, title, started_at, ended_at, previous_trace_id) VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(trace_id) DO UPDATE SET
-		   title             = excluded.title,
+		   title             = CASE WHEN excluded.title <> '' THEN excluded.title ELSE traces.title END,
 		   started_at        = CASE WHEN excluded.started_at > 0 THEN excluded.started_at ELSE traces.started_at END,
 		   ended_at          = CASE WHEN excluded.ended_at   > 0 THEN excluded.ended_at   ELSE traces.ended_at   END,
 		   previous_trace_id = CASE WHEN excluded.previous_trace_id <> '' THEN excluded.previous_trace_id ELSE traces.previous_trace_id END`,

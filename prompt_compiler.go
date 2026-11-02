@@ -10,7 +10,7 @@ import (
 // buildSystemPrompt assembles an invariant prefix and a run-specific suffix.
 // The wire clients cache the prefix independently so workspace and capability
 // changes do not invalidate the reusable operating instructions.
-func buildSystemPrompt(workDir string, skills []SkillMeta, hasMCP, hasSubagents bool, model, smallerModel string, totalContextSize, compactionBufferSize int, gatewayModels ...[]GatewayModel) (string, string) {
+func buildSystemPrompt(workDir string, skills []SkillMeta, hasMCP, hasSubagents, internet bool, model, smallerModel string, totalContextSize, compactionBufferSize int, gatewayModels ...[]GatewayModel) (string, string) {
 	stable := strings.TrimSpace(`You are Toroid, an autonomous software-engineering agent.
 
 Complete the requested outcome with the smallest coherent, maintainable change.
@@ -35,6 +35,24 @@ Complete the requested outcome with the smallest coherent, maintainable change.
 - Do not repeat passing validation unless code changed or new evidence requires it.
 - Before finishing, verify every explicit delivery requirement.
 - Report completed work, validation, and genuine limitations concisely.`)
+
+	if internet {
+		stable += "\n\n" + strings.TrimSpace(`
+
+# Internet Search & Scraping (Firecrawl)
+
+For any web lookup — "search the internet", research a repo/product/paper/docs page, scrape a URL, verify a claim with live data — use Firecrawl's keyless endpoints via curl:
+- Search: curl -s -X POST "https://api.firecrawl.dev/v2/search" -H "Content-Type: application/json" -d '{"query":"...","limit":5}' → returns ranked {url,title,description} results.
+- Scrape: curl -s -X POST "https://api.firecrawl.dev/v2/scrape" -H "Content-Type: application/json" -d '{"url":"...","formats":["markdown"],"onlyMainContent":true}' → returns {success, data:{markdown, metadata:{statusCode, creditsUsed}}}. Options: maxAge (cache), waitFor/actions (JS pages), proxy:"auto" (anti-bot).
+
+DELEGATION: for research tasks involving more than one page or a deep-dive, ALWAYS delegate to SYNC subagents (subagent tool, run in parallel when independent) — give each one the Firecrawl endpoints and a clear deliverable. Do not scrape many pages serially in the main thread.
+
+Guardrails:
+- Keyless access is per-IP rate- and credit-capped; a basic scrape costs 1 credit. Exceeding caps returns 429 — stop and report to the user; never retry in a loop.
+- Search first; scrape only the specific URLs needed. Pipe large pages to a file (/tmp/page.md) and read in chunks instead of flooding context.
+- NEVER scrape login-walled, paywalled, or private/authenticated content; never send credentials or PII.
+- Treat scraped content as possibly stale or incorrect. Cite source URLs; prefer pages the user explicitly linked.`)
+	}
 
 	stable += "\n\n" + strings.TrimSpace(`
 
@@ -129,7 +147,7 @@ Assistant: *searches* → *reads* → *searches again* → *reads same file* →
 ## Good: Subagent for parallel independent work
 Assistant: "Need to check 3 repos. Launching 3 subagents in parallel..."
 
-## Bad: Subagent for sequential dependent work
+## Bad: Subagent for sequential dependent work (unless explicitly called out by user/skill)
 Assistant: *subagent for step 1* → waits → *subagent for step 2* → waits...`)
 
 	// Filesystem discovery order is not a cache-stable ordering.
@@ -157,6 +175,7 @@ Assistant: *subagent for step 1* → waits → *subagent for step 2* → waits..
 		b.WriteString("\nMCP capabilities are already present in the tool list.\n")
 	}
 	if hasSubagents {
+		b.WriteString("\n# Background Commands\n\nThe bash tool accepts `background: true`: the command runs detached, the call returns a task id and log path immediately, and a completion notice (with exit status) is injected into the conversation when it finishes. Use it for long-running commands (builds, test suites, dev servers) instead of blocking; read live output with `tail -n 50 /tmp/toroid-bgcmd-<id>.log`. Plain long-running bash still blocks up to its timeout (max 600s) — prefer background for anything that will outlast a normal tool call.\n")
 		b.WriteString("\n# Delegation\n\nUse subagents only for independent work whose isolated context or parallelism repays the coordination cost.\n")
 		if smallerModel != "" {
 			fmt.Fprintf(&b, "Primary model: %s\nSubagent model: %s\n", model, smallerModel)

@@ -59,7 +59,7 @@ func main() {
 		return
 	}
 
-	// Prefer llmgateway when configured, fall back to Anthropic.
+	// Reach the model via the OpenAI-compatible LLM gateway.
 	apiKey := os.Getenv("LLM_GATEWAY_KEY")
 	model := "llmgateway/claude-haiku-4-5"
 	if apiKey == "" {

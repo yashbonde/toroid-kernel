@@ -30,12 +30,6 @@ func TestCompleteTimeoutCoversAllRetries(t *testing.T) {
 				return &Client{BaseURL: "http://llm.test/v1", HTTP: httpClient}
 			},
 		},
-		{
-			name: "anthropic",
-			chat: func(httpClient *http.Client) Chat {
-				return &AnthropicClient{BaseURL: "http://llm.test/v1", HTTP: httpClient}
-			},
-		},
 	}
 
 	for _, tt := range tests {
@@ -111,7 +105,6 @@ func TestCompleteRecoversAfterResponseBodyDisconnect(t *testing.T) {
 func TestConstructorsUseBoundedHTTPClients(t *testing.T) {
 	clients := []*http.Client{
 		NewClient("http://llm.test/v1", "").HTTP,
-		NewAnthropicClient("").HTTP,
 	}
 	for i, client := range clients {
 		if client.Timeout != ClientTimeout {

@@ -16,13 +16,11 @@ const GatewayBaseURLEnv = "LLM_GATEWAY_BASE_URL"
 const GatewayKeyEnv = "LLM_GATEWAY_KEY"
 
 // Direct provider routes: an "openai/<model>" id talks straight to the OpenAI
-// API (same OpenAI-compatible wire); an "anthropic/<model>" id talks to the
-// native Anthropic messages API. Cost on all routes comes from the gateway's
+// API (OpenAI-compatible wire). Cost on all routes comes from the gateway's
 // cost header; with no header it stays honestly unknown.
 const (
-	OpenAIBaseURL   = "https://api.openai.com/v1"
-	OpenAIKeyEnv    = "OPENAI_API_KEY"
-	AnthropicKeyEnv = "ANTHROPIC_API_KEY"
+	OpenAIBaseURL = "https://api.openai.com/v1"
+	OpenAIKeyEnv  = "OPENAI_API_KEY"
 )
 
 // WithGatewayTrace returns a context carrying a stable 16-byte (32-hex) trace id

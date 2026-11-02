@@ -72,8 +72,8 @@ func assistantTextFromTurn(p *toroid.TurnPayload) string {
 // (so --model/--thinking/--save/etc. apply) and the resolved API key.
 func runOneShot(cfg config, apiKey string) error {
 	// The key is resolved per provider prefix by NewKernel: LLM_GATEWAY_KEY for
-	// llmgateway/* (with LLM_GATEWAY_BASE_URL), OPENAI_API_KEY for openai/*,
-	// ANTHROPIC_API_KEY for anthropic/*. apiKey (TOROID_LLM_TOKEN) overrides.
+	// llmgateway/* (with LLM_GATEWAY_BASE_URL), OPENAI_API_KEY for openai/*.
+	// apiKey (TOROID_LLM_TOKEN) overrides.
 
 	ctx := context.Background()
 	k, err := toroid.NewKernel(ctx, toroid.Config{

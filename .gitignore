@@ -18,3 +18,5 @@ examples/usage-with-mcp/slack-mcp
 
 # Scratch error/output files
 *.err
+/tmp
+

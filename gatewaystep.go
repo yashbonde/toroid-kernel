@@ -12,9 +12,9 @@ import (
 
 // GatewayStep is the production Step backend: it maps one product llm-step
 // onto a single wire call via an in-repo llm client — the OpenAI-compatible
-// Client (LiteLLM gateway, OpenAI direct) or the native AnthropicClient. No
-// third-party model SDK. The kernel keeps owning tools, turns, and compaction;
-// GatewayStep performs the one call and prices it from the model's catalog rates.
+// Client (LiteLLM gateway, OpenAI direct). No third-party model SDK. The
+// kernel keeps owning tools, turns, and compaction; GatewayStep performs the
+// one call and prices it from the model's catalog rates.
 type GatewayStep struct {
 	Client llm.Chat
 }
@@ -87,15 +87,12 @@ func (s *GatewayStep) Complete(ctx context.Context, model Model, c Context, opts
 
 // CompleteObject runs one structured-output llm-step as a forced tool call:
 // the schema is sent as the request's single tool and tool_choice forces the
-// model to call it, so the object arrives as that call's arguments. This works
-// uniformly across LiteLLM upstreams (including Bedrock-backed Anthropic,
-// which rejects tool-bearing history without a tools= param).
+// model to call it, so the object arrives as that call's arguments.
 func (s *GatewayStep) CompleteObject(ctx context.Context, model Model, c Context, sch Schema, schemaName, schemaDescription string, opts StepOptions) (*ObjectResult, error) {
 	if schemaDescription == "" {
 		schemaDescription = "Record your response using this structured schema."
 	}
 	req := buildRequest(model, c, opts)
-	req.CachePrompt = false // one-shot: different tool set, prefix never re-read
 	req.Tools = []llm.Tool{{Name: schemaName, Description: schemaDescription, Parameters: sch}}
 	req.ToolChoice = schemaName
 	resp, err := s.Client.Complete(ctx, req)

@@ -102,8 +102,11 @@ type Config struct {
 	// IncludeSubagentTools opts into synchronous and background delegation.
 	// It is separate from the core file/shell tools so ordinary runs keep a
 	// smaller, more relevant tool prefix.
-	IncludeSubagentTools bool            `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"true"`
-	Tools                *tools.Registry `json:"tools,omitempty" description:"custom tools"`
+	IncludeSubagentTools bool `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"true"`
+	// Internet opts into the Firecrawl web search/scrape capability in the
+	// compiled system prompt.
+	Internet bool            `json:"internet,omitempty" description:"enable internet search and scraping via Firecrawl in the system prompt" default:"false"`
+	Tools    *tools.Registry `json:"tools,omitempty" description:"custom tools"`
 
 	// Skills: if unset or true, scan ~/.toroid/skills/*.md at startup for
 	// skill metadata (name + description only) and register the skill tool
@@ -156,10 +159,6 @@ func resolveProviderBaseURL(cfg Config) (baseURL string, resolvedAPIKey string) 
 		baseURL = OpenAIBaseURL
 		if resolvedAPIKey == "" {
 			resolvedAPIKey = os.Getenv(OpenAIKeyEnv)
-		}
-	case strings.HasPrefix(cfg.Model, "anthropic/"):
-		if resolvedAPIKey == "" {
-			resolvedAPIKey = os.Getenv(AnthropicKeyEnv)
 		}
 	}
 	if resolvedAPIKey == "" {
@@ -254,7 +253,7 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// their prompt can name currently available, priced alternatives. Discovery
 	// is best-effort: an unavailable catalog must never block kernel startup.
 	var gatewayModels []GatewayModel
-	if cfg.IncludeSubagentTools && baseURL != "" && !strings.HasPrefix(cfg.Model, "openai/") && !strings.HasPrefix(cfg.Model, "anthropic/") {
+	if cfg.IncludeSubagentTools && baseURL != "" && !strings.HasPrefix(cfg.Model, "openai/") {
 		gatewayModels, _ = FetchGatewayModels(ctx, nil, baseURL, cfg.APIKey)
 	}
 
@@ -314,16 +313,13 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 
 	// Compile one stable system prefix after every startup capability is known.
 	k.SystemPromptPrefix, k.SystemPrompt = buildSystemPrompt(cfg.WorkDir, skills, len(cfg.MCPServers) > 0,
-		cfg.IncludeSubagentTools, cfg.Model, cfg.SmallerModel, cfg.TotalContextSize, cfg.CompactionBufferSize, gatewayModels)
+		cfg.IncludeSubagentTools, cfg.Internet, cfg.Model, cfg.SmallerModel, cfg.TotalContextSize, cfg.CompactionBufferSize, gatewayModels)
 
 	// Step is the one-llm-step backend over the in-repo wire client (OpenAI
-	// chat completions, or native Anthropic messages for anthropic/ ids). Tests
-	// may replace it with a FauxStep. The kernel owns the tool loop — Step
-	// performs individual LLM calls.
+	// chat completions via LiteLLM gateway or OpenAI direct). Tests may replace
+	// it with a FauxStep. The kernel owns the tool loop — Step performs
+	// individual LLM calls.
 	var wire llm.Chat = llm.NewClient(baseURL, cfg.APIKey)
-	if strings.HasPrefix(cfg.Model, "anthropic/") {
-		wire = llm.NewAnthropicClient(cfg.APIKey)
-	}
 	k.Step = NewGatewayStep(wire)
 
 	// Default AttachLoggerHooks if nil
@@ -582,6 +578,18 @@ func (k *Kernel) Enqueue(msg string) {
 	k.queueMu.Lock()
 	k.messageQueue = append(k.messageQueue, msg)
 	k.queueMu.Unlock()
+}
+
+// BackgroundEnabled reports whether background bash commands may start. It
+// requires the same delegation opt-in as subagents: both inject completion
+// notices through the queue, so they share one capability gate.
+func (k *Kernel) BackgroundEnabled() bool { return k.Cfg.IncludeSubagentTools }
+
+// EnqueueBackgroundNotice delivers a background-command completion notice via
+// the same queue + wake-up path as a finished background subagent.
+func (k *Kernel) EnqueueBackgroundNotice(id, notice string) {
+	k.Enqueue(fmt.Sprintf("[background command %s finished]\n%s", id, notice))
+	_ = k.tryResume(context.Background())
 }
 
 // drainQueue pops all queued messages and returns them.
@@ -1305,7 +1313,14 @@ func (k *Kernel) SpawnBackgroundWith(task string, opts SubagentOpts, done func(S
 			result = fmt.Sprintf("background task %s failed: %v", id, err)
 			status = "failed"
 		}
-		k.Enqueue(fmt.Sprintf("[background task %s %s]\n%s", id, status, result))
+		// Cost + "added" marker: the parent needs the child's spend to track
+		// its own budget, and a ≤2-word verdict so it can tell at a glance
+		// whether the result was folded into the conversation.
+		cost := ""
+		if res.Usage.PricingOK {
+			cost = fmt.Sprintf(" | cost: ₹%.4f", res.Usage.Cost*100)
+		}
+		k.Enqueue(fmt.Sprintf("[background task %s %s — added%s]\n%s", id, status, cost, result))
 		// tryResume is the single decision point: if a loop is already running
 		// it will drain the queue itself at its next turn boundary and this is
 		// a no-op; otherwise it drains and resumes right here.

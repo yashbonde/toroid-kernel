@@ -12,7 +12,7 @@ This explainer walks the system as built (§1–§12): construction and wiring, 
 
 ## 1. The big picture
 
-A host program constructs a `Kernel` from a `Config` and calls `Run` (buffered) or `Stream` (incremental). The kernel wires a *provider* (Google / Anthropic / OpenAI-compatible / LLM-gateway), a *tool registry*, an *event/hook bus*, and — when `Save` is set — a single embedded *SQLite store* that holds traces, spans, costs, events and memories (the todo table lives in the same database). The agent loop is kernel-owned (steploop.go): each turn is one llm-step performed by the Step layer over the in-repo OpenAI-compatible gateway client, with the kernel executing tools between steps and managing history, cost, compaction, loop guards, and the message queue.
+A host program constructs a `Kernel` from a `Config` and calls `Run` (buffered) or `Stream` (incremental). The kernel wires a *provider* (OpenAI-compatible / LLM-gateway), a *tool registry*, an *event/hook bus*, and — when `Save` is set — a single embedded *SQLite store* that holds traces, spans, costs, events and memories (the todo table lives in the same database). The agent loop is kernel-owned (steploop.go): each turn is one llm-step performed by the Step layer over the in-repo OpenAI-compatible gateway client, with the kernel executing tools between steps and managing history, cost, compaction, loop guards, and the message queue.
 
 ```mermaid
 flowchart TB
@@ -26,7 +26,7 @@ flowchart TB
     queue["messageQueue"]
   end
   fan["Step loop (steploop.go)"]
-  prov["Provider<br/>google / anthropic / openai / llmgateway"]
+  prov["Provider<br/>openai / llmgateway"]
   llm["LLM API"]
   sqlite[("SQLite store<br/>traces · spans · costs<br/>events · memories · todos")]
   otlp["OTLP exporter<br/>(Langfuse / any OTEL backend)"]

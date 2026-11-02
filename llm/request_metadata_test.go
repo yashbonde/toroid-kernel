@@ -24,12 +24,6 @@ func TestRequestBodiesIncludeHierarchyMetadata(t *testing.T) {
 				return NewClient("https://example.com/v1", "key").buildBody(req, false)
 			},
 		},
-		{
-			name: "anthropic",
-			build: func() ([]byte, error) {
-				return NewAnthropicClient("key").buildBody(req, false)
-			},
-		},
 	}
 
 	for _, tt := range tests {
