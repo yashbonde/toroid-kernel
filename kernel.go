@@ -31,6 +31,10 @@ type Kernel struct {
 	Cfg  Config
 	Step Step // one-llm-step backend; defaults to GatewayStep over the llm client
 
+	// visionStep reaches Config.Vision's model when its wire differs from the
+	// main model's; nil means the vision delegate shares Step.
+	visionStep Step
+
 	Hooks              *HookRegistry
 	Tools              *tools.Registry
 	Store              *Store
@@ -65,12 +69,14 @@ type Kernel struct {
 
 	// run-state — supports background agents (§12.4). runMu serializes the agent
 	// loop so Stream and Wake never mutate history concurrently; running reports
-	// whether a loop is currently active; lastWriter is reused when an idle
-	// kernel is woken by a background completion; bgSeq numbers background tasks.
+	// whether a loop is currently active; lastWriter and lastTokens are reused
+	// when an idle kernel is woken by a background completion; bgSeq numbers
+	// background tasks.
 	runMu      sync.Mutex
 	wakeMu     sync.Mutex
 	running    atomic.Bool
 	lastWriter io.Writer
+	lastTokens *tokenStream
 	bgSeq      atomic.Uint64
 }
 
@@ -96,6 +102,23 @@ type Config struct {
 	MaxRepeatCalls int       `json:"max_repeat_calls" description:"stop after this many consecutive identical tool calls with identical results (loop guard); 0 disables" default:"3"`
 	Thinking       Thinking  `json:"thinking" description:"thinking budget: none | low | high" default:"none"`
 	ThinkingWriter io.Writer `json:"-"`
+
+	// ImageInputOverride, when non-nil, overrides the model-capability table's
+	// verdict on whether this model accepts image input, for the tool-result
+	// media path. A host that knows a gateway model's modalities from an
+	// authoritative source (e.g. OpenRouter's architecture.input_modalities)
+	// can set this so screenshots a tool returns are sent to a vision model the
+	// built-in table does not recognise — or stripped for a text-only one.
+	// nil keeps the built-in behaviour (Model.SupportsImage).
+	ImageInputOverride *bool `json:"-"`
+
+	// Vision, when set, sends every image a tool returns to a separate vision
+	// model and gives the main model that model's text description instead, so
+	// a text-only (or cheaper) main model can still work from screenshots. The
+	// vision call's cost is billed to the turn. It takes precedence over
+	// ImageInputOverride for tool results. nil keeps tool-result media on the
+	// main model (subject to ImageInputOverride). See VisionDelegate.
+	Vision *VisionDelegate `json:"vision,omitempty"`
 
 	// Tools
 	IncludeComputerTools bool `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
@@ -325,6 +348,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		wire = llm.NewAnthropicClient(cfg.APIKey)
 	}
 	k.Step = NewGatewayStep(wire)
+	if cfg.Vision != nil && cfg.Vision.Model != "" && routeOf(cfg.Vision.Model) != routeOf(cfg.Model) {
+		k.visionStep = newVisionStep(cfg.Vision.Model)
+	}
 
 	// Default AttachLoggerHooks if nil
 	if cfg.AttachLoggerHooks != nil && *cfg.AttachLoggerHooks {
@@ -530,6 +556,33 @@ func (k *Kernel) fireEvent(ctx context.Context, kind, chatID, turnID, llmStepID 
 func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 	k.usageMu.Lock()
 	defer k.usageMu.Unlock()
+	k.addUsageLocked(u, key)
+	// u is a single step's usage: its input-side tokens (fresh + cache-read +
+	// cache-write are disjoint slices of the prompt) are the size of the request
+	// that step sent, plus what it generated — a valid snapshot of context-window
+	// occupancy. Never feed a summed multi-step total (double-counts re-reads).
+	k.currentTokens = int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
+	return k.runningCostUSD
+}
+
+// recordSideUsage bills an llm-step that is not the main conversation's, such
+// as a vision delegate call, to this session: its cost and tokens count, but
+// it leaves the window-occupancy gauge alone, since that request never shared
+// the main model's context. Returns the running total.
+func (k *Kernel) recordSideUsage(u Usage) float64 {
+	k.usageMu.Lock()
+	k.addUsageLocked(u, "")
+	total := k.runningCostUSD
+	k.usageMu.Unlock()
+	if k.Store != nil {
+		_ = k.Store.AppendCost(k.Cfg.TraceID, k.Cfg.SessionID, u.Cost, total)
+	}
+	return total
+}
+
+// addUsageLocked accumulates u into the session's entry (key, or this
+// session) and the running cost. Callers hold usageMu.
+func (k *Kernel) addUsageLocked(u Usage, key string) {
 	id := key
 	if id == "" {
 		id = k.Cfg.SessionID
@@ -550,12 +603,6 @@ func (k *Kernel) UpdateUse(u Usage, key string) float64 {
 	}
 	k.Sessions[id] = s
 	k.runningCostUSD += u.Cost
-	// u is a single step's usage: its input-side tokens (fresh + cache-read +
-	// cache-write are disjoint slices of the prompt) are the size of the request
-	// that step sent, plus what it generated — a valid snapshot of context-window
-	// occupancy. Never feed a summed multi-step total (double-counts re-reads).
-	k.currentTokens = int(u.Input + u.CacheRead + u.CacheWrite + u.Output)
-	return k.runningCostUSD
 }
 
 // overContextThreshold reports whether context-window occupancy has reached the
@@ -632,6 +679,36 @@ type runOptions struct {
 	schemaName        string
 	schemaDescription string
 	maxTurnSpendUSD   float64
+	tokens            *tokenStream
+}
+
+// WithTokenStream makes this Run/Stream call write assistant text to the
+// writer as the model generates it, instead of once per turn. Each turn's
+// llm-step then goes through Step.Stream rather than Step.Complete.
+//
+// Cost is still recorded per step: from the gateway when it reports cost on
+// the stream (OpenRouter's usage.cost does), otherwise from the model's catalog
+// rates. A gateway that only sends a cost header on non-streamed responses is
+// priced from the catalog instead. Text from a turn that a completion guard
+// sends back for another pass has already been written by then.
+func WithTokenStream() RunOption {
+	return func(o *runOptions) {
+		if o.tokens == nil {
+			o.tokens = &tokenStream{}
+		}
+	}
+}
+
+// WithReasoningStream writes the model's reasoning/thinking text to w as it is
+// generated. It implies WithTokenStream. EventReasoning still fires once per
+// turn with the full reasoning, so persisted history is unchanged.
+func WithReasoningStream(w io.Writer) RunOption {
+	return func(o *runOptions) {
+		if o.tokens == nil {
+			o.tokens = &tokenStream{}
+		}
+		o.tokens.reasoning = w
+	}
 }
 
 // WithSchema enables structured generation for this Run/Stream call.
@@ -754,7 +831,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	}
 	// streamCurrent owns the running flag from here: it clears it on every exit.
 	entered = true
-	if err := k.streamCurrent(ctx, loopWriter, budget); err != nil {
+	if err := k.streamCurrent(ctx, loopWriter, ro.tokens, budget); err != nil {
 		return err
 	}
 
@@ -795,12 +872,13 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 // appending the user message, pruning) and then calls this; Wake calls it after
 // injecting a background completion. runMu serializes the loop so the two never
 // race on history.
-func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBudget) error {
+func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, tokens *tokenStream, budget *spendBudget) error {
 	k.runMu.Lock()
 	k.running.Store(true)
 	k.lastWriter = w
+	k.lastTokens = tokens
 
-	if err := k.streamViaStep(ctx, w, budget); err != nil {
+	if err := k.streamViaStep(ctx, w, tokens, budget); err != nil {
 		k.running.Store(false)
 		k.runMu.Unlock()
 		return err
@@ -1367,6 +1445,7 @@ func (k *Kernel) tryResume(ctx context.Context) error {
 	if w == nil {
 		w = io.Discard
 	}
+	tokens := k.lastTokens
 	// Release the lock before resuming: streamCurrent calls tryResume again at its
 	// own tail (mutual recursion), which must not deadlock on this non-reentrant
 	// mutex. The atomic running/queue decision above is already made.
@@ -1378,7 +1457,7 @@ func (k *Kernel) tryResume(ctx context.Context) error {
 	for _, m := range msgs {
 		k.History = append(k.History, llm.NewUserMessage(m))
 	}
-	return k.streamCurrent(ctx, w, &spendBudget{turnStartUSD: k.RunningCostUSD()})
+	return k.streamCurrent(ctx, w, tokens, &spendBudget{turnStartUSD: k.RunningCostUSD()})
 }
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.

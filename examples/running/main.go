@@ -5,19 +5,25 @@
 //  1. BLOCKING vs STREAMING — Run returns the full text at once (plus a
 //     UsagePayload); Stream writes it to an io.Writer as it is produced.
 //     Both drive the same tool-calling loop underneath.
+//
 //  2. EVENTS — the synchronous event bus (On) is the integration surface:
 //     tool calls, tool results, per-turn cost, subagent lifecycle.
+//
 //  3. GUARDRAILS — MaxIter (absolute step cap) and MaxRepeatCalls (a "spin"
 //     guard keyed on call + result) stop runaway loops without killing
 //     legitimate polling.
+//
 //  4. DELEGATION — synchronous subagents (the `subagent` tool / RunSubagent)
 //     and asynchronous background agents (SpawnBackground / `subagent_async`)
 //     that wake an idle kernel on completion.
+//
 //  5. OBSERVABILITY — with Save:true every span/cost/event lands in the
 //     SQLite store; OTELSpans exports the persisted trace as spec-valid
 //     OpenTelemetry spans for any OTLP backend.
+//
 //  6. MULTIMODAL — images inline in a prompt (![](path)) and via the read
 //     tool returning media bytes a vision model can see.
+//
 //  7. STRUCTURED OUTPUT — WithSchema runs the full agentic loop (tool calls
 //     included) and then coerces the result into a JSON object matching the
 //     schema. No-network mode shows the loop-guard + structured path with a
@@ -28,7 +34,7 @@
 //
 // To exercise the no-network guardrails scenarios without an API key:
 //
-//     go run ./examples/running --guardrails
+//	go run ./examples/running --guardrails
 package main
 
 import (

@@ -1,0 +1,1467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="color-scheme" content="dark">
+<title>Toroid Chat</title>
+<script>
+// The phone's shared UI theme, set before first paint: phosphor (the default,
+// and the only one in a browser), garden, crt or custom. See applyTheme below.
+var uiPalette = null; // custom's colours, role -> "#rrggbb"; null in the other themes
+// setTheme applies a theme by name and returns the one it applied. custom
+// reads the palette from ToroidApp.palette() and sets the role colours as CSS
+// variables on <html>; with no usable palette it is phosphor.
+function setTheme(name) {
+  var t = /^(garden|crt|custom)$/.test(name) ? name : "phosphor", p = null;
+  var vars = { bg: "bg", panel: "surface", line: "line", text: "text", muted: "muted", accent: "accent",
+    hot: "accent_hi", err: "bad", tint1: "tint1", tint2: "tint2", tint3: "tint3" };
+  if (t === "custom") {
+    try { p = JSON.parse(ToroidApp.palette()); } catch (e) {}
+    for (var k in vars) if (!p || !/^#[0-9a-f]{6}$/i.test(p[vars[k]])) { p = null; t = "phosphor"; break; }
+  }
+  var st = document.documentElement.style;
+  for (var v in vars) p ? st.setProperty("--" + v, p[vars[v]]) : st.removeProperty("--" + v);
+  // Text on the accent (primary buttons, the busiest calendar days): bg or
+  // text, whichever stands out more.
+  if (p) st.setProperty("--on-accent", contrast(p.bg, p.accent) >= contrast(p.text, p.accent) ? p.bg : p.text);
+  else st.removeProperty("--on-accent");
+  uiPalette = p;
+  document.documentElement.dataset.theme = t;
+  return t;
+}
+// contrast is the WCAG contrast ratio of two "#rrggbb" colours.
+function contrast(a, b) {
+  var lum = function (h) {
+    var c = [1, 3, 5].map(function (i) {
+      var v = parseInt(h.substr(i, 2), 16) / 255;
+      return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+  };
+  var x = lum(a), y = lum(b);
+  return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05);
+}
+(function () {
+  var t = "phosphor";
+  try { if (window.ToroidApp && typeof ToroidApp.theme === "function") t = ToroidApp.theme(); } catch (e) {}
+  setTheme(t);
+})();
+</script>
+<style>
+  :root {
+    --bg: #0e0f11;
+    --panel: #16181b;
+    --line: #25282d;
+    --text: #e6e6e3;
+    --muted: #8b8f96;
+    --accent: #7cc4a4;
+    --user: #1f2a25;
+    --code: #0a0b0c;
+    --err: #e58a7c;
+    --vision: #b9a3ef;
+    --busy: var(--accent);   /* the streaming caret */
+    --mono: ui-monospace, "JetBrains Mono", "Roboto Mono", "Droid Sans Mono", Menlo, monospace;
+  }
+  /* Themes. The phone names one in a global setting (Pixel Home's shade
+     writes it); the app passes it in through ToroidApp.theme() and
+     applyTheme(). phosphor is the :root above. Only colours and small
+     styling change; the layout stays the same. */
+  /* Night Garden: warmer surfaces, pastel tints; tool lines tinted by kind. */
+  :root[data-theme="garden"] {
+    --bg: #0b0d0c; --panel: #1a1c20; --line: #2a2d33; --user: #24232b; --code: #080a09;
+    --vision: #b7a9d6;
+    --tool-app: #9fb8c8; --tool-file: #d9c27a; --tool-todo: #c99a9a;
+  }
+  :root[data-theme="garden"] .tool[data-fam="app"] { color: var(--tool-app); }
+  :root[data-theme="garden"] .tool[data-fam="file"] { color: var(--tool-file); }
+  :root[data-theme="garden"] .tool[data-fam="todo"] { color: var(--tool-todo); }
+  :root[data-theme="garden"] .tool.err { color: var(--err); }
+  /* CRT Terminal: green on near-black in mono, hard corners; amber for the
+     agent: tool lines read as shell prompts, and a block cursor while busy. */
+  :root[data-theme="crt"] {
+    --bg: #070a08; --panel: #0c110e; --line: #12261d; --text: #7cc4a4; --muted: #4f9a78;
+    --accent: #7cc4a4; --user: #12261d; --code: #040605; --err: #ff6b5a;
+    --amber: #ffb347; --busy: var(--amber); --vision: var(--amber);
+  }
+  :root[data-theme="crt"] body { font-family: var(--mono); font-size: 14px; }
+  :root[data-theme="crt"] button, :root[data-theme="crt"] select, :root[data-theme="crt"] textarea,
+  :root[data-theme="crt"] input, :root[data-theme="crt"] .msg.user, :root[data-theme="crt"] .msg pre,
+  :root[data-theme="crt"] .msg code, :root[data-theme="crt"] .card, :root[data-theme="crt"] #pip,
+  :root[data-theme="crt"] #picker .sheet { border-radius: 0; }
+  :root[data-theme="crt"] .tool, :root[data-theme="crt"] .toolsum { color: rgba(255, 179, 71, .78); }
+  :root[data-theme="crt"] .tool .ic, :root[data-theme="crt"] .toolsum .ic { display: none; }
+  :root[data-theme="crt"] .tool::before, :root[data-theme="crt"] .toolsum::before { content: ">"; color: var(--amber); font-weight: 700; }
+  :root[data-theme="crt"] .tool.err { color: var(--err); }
+  :root[data-theme="crt"] .act.llm { color: var(--amber); }
+  /* Custom: a palette picked from an image (Settings.Global toroid_ui_palette).
+     setTheme sets the role colours on <html> (--bg, --panel, --line, --text,
+     --muted, --accent, --hot, --err, --tint1-3, --on-accent); the rest are
+     mixed from them here. phosphor's shapes; tool lines tinted by kind, as in
+     garden; the hot colour for the streaming caret. */
+  :root[data-theme="custom"] {
+    --user: color-mix(in srgb, var(--accent) 16%, var(--panel));
+    --code: color-mix(in srgb, var(--bg) 70%, #000);
+    --busy: var(--hot); --vision: var(--tint2);
+  }
+  :root[data-theme="custom"] .tool[data-fam="app"] { color: var(--tint1); }
+  :root[data-theme="custom"] .tool[data-fam="file"] { color: var(--tint2); }
+  :root[data-theme="custom"] .tool[data-fam="todo"] { color: var(--tint3); }
+  :root[data-theme="custom"] .tool.err { color: var(--err); }
+  :root[data-theme="custom"] button.primary { color: var(--on-accent); }
+  :root[data-theme="custom"] .cell .l1, :root[data-theme="custom"] .legend .l1 { background: color-mix(in srgb, var(--accent) 22%, transparent); }
+  :root[data-theme="custom"] .cell .l2, :root[data-theme="custom"] .legend .l2 { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+  :root[data-theme="custom"] .cell .l3, :root[data-theme="custom"] .legend .l3 { background: color-mix(in srgb, var(--accent) 72%, transparent); color: var(--on-accent); }
+  :root[data-theme="custom"] .cell .l4, :root[data-theme="custom"] .legend .l4 { color: var(--on-accent); }
+  /* A faint, static scanline overlay; it never takes a tap. */
+  :root[data-theme="crt"] body::after {
+    content: ""; position: fixed; inset: 0; z-index: 60; pointer-events: none;
+    background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0, 0, 0, .14) 2px 3px);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    -webkit-tap-highlight-color: transparent;
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  /* The orb: an 11x11 pixel sprite, drawn by drawOrb; it swirls while a reply
+     is in flight. */
+  #orb { width: 22px; height: 22px; flex: none; image-rendering: pixelated; image-rendering: crisp-edges; }
+  /* The model id, very small, with the chat's spend under it; tap for settings. */
+  #modelid {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start;
+    border: none; background: none; padding: 2px 2px; text-align: left; font: 10.5px/1.35 var(--mono); color: var(--muted);
+  }
+  #modelid:active { background: none; color: var(--text); }
+  #modelid span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #modelid #mid { color: var(--text); }
+  .mono { font-family: var(--mono); }
+  select, button, textarea, input {
+    font: inherit; color: inherit; background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px;
+  }
+  select { flex: 1; min-width: 0; padding: 7px 8px; }
+  button { padding: 7px 11px; cursor: pointer; flex: none; }
+  button:active { background: var(--line); }
+  button.primary { background: var(--accent); color: #0b1410; border-color: var(--accent); font-weight: 600; }
+  button.icon { padding: 7px 9px; color: var(--muted); }
+  /* Model picker: the settings' model button opens a bottom sheet that asks for a class
+     (Flash / Mid / Frontier) first, then lists that class's models. */
+  #modelbtn {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+    padding: 7px 8px; text-align: left;
+  }
+  #modelbtn .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #modelbtn .cls { color: var(--accent); font-size: 12px; flex: none; }
+  #modelbtn .caret { color: var(--muted); flex: none; }
+  #picker {
+    position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, 0.55);
+    display: flex; align-items: flex-end;
+  }
+  #picker[hidden] { display: none; }
+  #picker .sheet {
+    width: 100%; max-height: 78vh; overflow-y: auto; background: var(--panel);
+    border-top: 1px solid var(--line); border-radius: 14px 14px 0 0; padding: 4px 0 10px;
+  }
+  #picker .head { display: flex; align-items: center; gap: 6px; padding: 8px 10px 6px; }
+  #picker .head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  #picker .head button { padding: 3px 10px; font-size: 18px; line-height: 1; color: var(--muted); }
+  #picker .head button[hidden] { display: none; }
+  #picker .opt {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    padding: 11px 16px; border: none; border-radius: 0; background: transparent;
+  }
+  #picker .opt + .opt { border-top: 1px solid var(--line); }
+  #picker .opt .txt { flex: 1; min-width: 0; }
+  #picker .opt .sub { display: block; color: var(--muted); font-size: 12px; }
+  #picker .opt .mark { color: var(--accent); flex: none; }
+  #picker .opt.cur .main { color: var(--accent); font-weight: 600; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 12px 4px; }
+  .msg { margin: 0 0 12px; max-width: 100%; overflow-wrap: anywhere; }
+  .msg.user {
+    margin-left: 18%; background: var(--user); padding: 8px 11px;
+    border-radius: 12px 12px 3px 12px; white-space: pre-wrap;
+  }
+  .msg.bot { padding: 0 2px; }
+  .msg.bot p { margin: 0 0 8px; }
+  .msg.bot p:last-child { margin-bottom: 0; }
+  .msg.bot ul, .msg.bot ol { margin: 0 0 8px; padding-left: 22px; }
+  .msg.bot h4 { margin: 8px 0 4px; font-size: 15px; }
+  .msg code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+  .msg pre {
+    background: var(--code); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; overflow-x: auto; margin: 0 0 8px; font-size: 13px; line-height: 1.4;
+  }
+  .msg pre code { background: none; padding: 0; }
+  .think {
+    color: var(--muted); font-size: 12px; border-left: 2px solid var(--line);
+    padding-left: 8px; margin: 0 0 6px; white-space: pre-wrap; max-height: 4.5em; overflow: hidden;
+  }
+  .tag { color: var(--muted); font: 10.5px/1.4 var(--mono); margin-top: 3px; }
+  /* One muted line per tool call, above the reply text. */
+  .tools { margin: 0 0 6px; }
+  .tool { color: var(--muted); font: 11px/1.5 var(--mono); display: flex; align-items: baseline; gap: 6px; }
+  .tool.err { color: var(--err); }
+  /* Who the reply is waiting on right now: the chat model deciding, the
+     vision model looking at a screenshot, or a tool on the phone. */
+  .act { display: flex; align-items: baseline; gap: 6px; margin-top: 4px; font: 11px/1.5 var(--mono); color: var(--muted); white-space: nowrap; }
+  .act .t { overflow: hidden; text-overflow: ellipsis; }
+  .act .ic { flex: none; width: 11px; height: 11px; position: relative; top: 1px; shape-rendering: crispEdges; fill: currentColor; animation: pulse 1.2s ease-in-out infinite; }
+  .act.llm { color: var(--accent); }
+  .act.vision { color: var(--vision); }
+  /* Pixel icons for app actions: an 8x8 grid drawn with crisp rects. */
+  .tool .ic, .toolsum .ic { flex: none; width: 11px; height: 11px; position: relative; top: 1px; shape-rendering: crispEdges; fill: currentColor; }
+  .tool .ic.none { visibility: hidden; }
+  /* Long runs of tool lines fold into one summary row; tap to unfold. */
+  .toolsum { display: none; color: var(--muted); font: 11px/1.5 var(--mono); align-items: baseline; gap: 6px; cursor: pointer; user-select: none; }
+  .tools.fold .toolsum { display: flex; }
+  .toolsum .chev { margin-left: 2px; }
+  .tools.fold:not(.open) .tool { display: none; }
+  .tools.fold.live:not(.open) .tool:last-child { display: flex; opacity: .8; }
+  /* Live video of the background display: a small floating window in the
+     bottom right, above the composer (placed by placePip, so it also stays
+     above the on-screen keyboard). Tap it for a larger view. */
+  #pip {
+    position: fixed; right: 10px; bottom: 70px; z-index: 30; display: none;
+    border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    background: var(--panel); box-shadow: 0 6px 20px rgba(0, 0, 0, .5); cursor: pointer;
+  }
+  #pip.on { display: block; }
+  #pip.on.hide { display: none; }
+  #pip img { display: block; width: 100%; height: 100%; object-fit: cover; }
+  #pip .badge {
+    position: absolute; left: 6px; top: 6px; display: flex; align-items: center; gap: 4px;
+    font-size: 10px; line-height: 1; color: #fff; background: rgba(0, 0, 0, .55); padding: 3px 6px; border-radius: 8px;
+  }
+  #pip .dot { width: 6px; height: 6px; border-radius: 50%; background: #e5534b; animation: pulse 1.4s ease-in-out infinite; }
+  #pip.ended .dot { background: var(--muted); animation: none; }
+  #pip .x {
+    position: absolute; right: 5px; top: 5px; width: 20px; height: 20px; padding: 0; border: none; border-radius: 50%;
+    display: none; align-items: center; justify-content: center; font-size: 12px; line-height: 1;
+    color: #fff; background: rgba(0, 0, 0, .55);
+  }
+  #pip.on .x { display: flex; }
+  #orb.min { cursor: pointer; }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .notice { color: var(--muted); font-size: 12px; text-align: center; margin: 0 0 12px; }
+  .err { color: var(--err); font-size: 13px; }
+  /* The caret trails the last block of the reply as it streams in. */
+  .cursor .body > :last-child::after, .cursor .body:empty::after {
+    content: "▍"; color: var(--busy); animation: blink 1s steps(1) infinite;
+  }
+  :root[data-theme="crt"] .cursor .body > :last-child::after, :root[data-theme="crt"] .cursor .body:empty::after { content: "█"; }
+  .cursor .body > pre:last-child::after { content: none; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .empty { color: var(--muted); text-align: center; margin-top: 30vh; font-size: 14px; }
+  form#composer {
+    display: flex; gap: 8px; padding: 8px 10px calc(8px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line); background: var(--panel);
+  }
+  textarea { flex: 1; resize: none; padding: 8px 10px; max-height: 140px; min-height: 40px; }
+  #settings {
+    display: none; padding: 10px 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+    font-size: 13px;
+  }
+  #settings.open { display: block; }
+  #settings .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+  #settings .row:first-child { margin-top: 0; }
+  #settings .row > .muted:first-child { width: 72px; flex: none; }
+  #settings .muted { color: var(--muted); }
+  #settings .sub { color: var(--muted); font-size: 11px; margin: 3px 0 0 80px; }
+  #settings .err[hidden] { display: none; }
+  #settings select { flex: 1; min-width: 0; padding: 6px 8px; font-size: 13px; }
+  #settings select:disabled { opacity: .45; }
+  #settings input[type=checkbox] { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--accent); }
+  button.icon svg { display: block; margin: 3px 0; }
+  button.icon.on { color: var(--accent); border-color: var(--accent); }
+
+  /* History: a sticky month calendar over one scrolling list of chat days. */
+  #history { display: none; flex: 1; min-height: 0; overflow-y: auto; position: relative; overscroll-behavior: contain; }
+  body.hist #history { display: block; }
+  body.hist #settings, body.hist #log, body.hist #composer { display: none; }
+  #cal {
+    position: sticky; top: 0; z-index: 2; overflow: hidden; touch-action: pan-y;
+    background: var(--panel); border-bottom: 1px solid var(--line); padding: 4px 8px 6px;
+  }
+  .calhead { display: flex; align-items: center; justify-content: space-between; }
+  .calhead button { border: none; background: none; font-size: 22px; line-height: 1; padding: 4px 14px; color: var(--text); }
+  .calhead button:disabled { color: var(--line); }
+  #mtitle { font-weight: 600; }
+  .dow, #grid { display: grid; grid-template-columns: repeat(7, 1fr); text-align: center; }
+  .dow { color: var(--muted); font-size: 11px; margin: 0 0 2px; }
+  #grid { grid-template-rows: repeat(6, 36px); }
+  #grid.next { animation: slide-next .2s ease-out; }
+  #grid.prev { animation: slide-prev .2s ease-out; }
+  @keyframes slide-next { from { transform: translateX(40px); opacity: 0; } }
+  @keyframes slide-prev { from { transform: translateX(-40px); opacity: 0; } }
+  .cell { display: flex; align-items: center; justify-content: center; }
+  .cell button {
+    width: 30px; height: 30px; padding: 0; border: none; border-radius: 50%;
+    font-size: 13px; background: transparent; color: var(--text);
+  }
+  /* Fill = chats started that day: none, 1, 2-3, 4-6, 7+. */
+  .cell .l0 { color: var(--muted); opacity: .55; }
+  .cell .l1, .legend .l1 { background: rgba(124, 196, 164, .22); }
+  .cell .l2, .legend .l2 { background: rgba(124, 196, 164, .45); }
+  .cell .l3, .legend .l3 { background: rgba(124, 196, 164, .72); color: #0b1410; }
+  .cell .l4, .legend .l4 { background: var(--accent); color: #0b1410; font-weight: 600; }
+  .cell button.today { box-shadow: 0 0 0 1.5px var(--muted); font-weight: 700; }
+  .cell button.sel { box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--text); }
+  .legend { display: flex; justify-content: flex-end; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; padding: 2px 6px 0; }
+  .legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .legend .l0 { border: 1px solid var(--line); }
+  .dayhead { padding: 12px 14px 6px; color: var(--muted); font-size: 12px; font-weight: 600; }
+  .day.sel .dayhead { color: var(--accent); }
+  .card {
+    margin: 0 10px 8px; padding: 8px 11px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px; cursor: pointer;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  .card:active { background: var(--line); }
+  .card .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .m { color: var(--muted); font-size: 12px; margin-top: 1px; }
+  .card.confirm { display: flex; align-items: center; gap: 8px; cursor: default; }
+  .card.confirm span { flex: 1; }
+  .card.confirm button { padding: 4px 10px; font-size: 13px; }
+  button.danger { color: var(--err); border-color: var(--err); }
+  #history .empty { margin-top: 18vh; }
+  /* A short landscape screen puts the calendar beside the list, not over it. */
+  @media (orientation: landscape) and (max-height: 560px) {
+    body.hist #history { display: flex; align-items: flex-start; }
+    #cal { flex: none; width: 48%; max-width: 380px; border-bottom: none; border-right: 1px solid var(--line); }
+    #list { flex: 1; min-width: 0; }
+    #history .empty { margin-top: 12vh; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <canvas id="orb" width="11" height="11" aria-hidden="true"></canvas>
+  <button id="modelid" type="button" aria-label="Model and settings"><span id="mid">…</span><span id="hcost">₹0</span></button>
+  <input type="hidden" id="model">
+  <button id="histbtn" class="icon" type="button" title="History" aria-label="History">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="2" y="3" width="12" height="11" rx="2"/><path d="M2 6.5h12M5.5 1.5v3M10.5 1.5v3"/></svg>
+  </button>
+  <button id="new" type="button" title="New chat">New</button>
+  <button id="gear" class="icon" type="button" title="Settings">⋯</button>
+</header>
+<div id="settings">
+  <div class="row">
+    <span class="muted">Model</span>
+    <button id="modelbtn" type="button" aria-haspopup="dialog" aria-label="Choose a model">
+      <span class="name" id="modelname">…</span><span class="cls" id="modelcls"></span><span class="caret">▾</span>
+    </button>
+  </div>
+  <div class="sub mono" id="price"></div>
+  <div class="row"><span class="muted">This chat</span><span class="mono" id="cost">₹0</span></div>
+  <div class="row">
+    <span class="muted">Vision</span>
+    <input type="checkbox" id="visionon" aria-label="Let a vision model look at app screens">
+    <select id="visionmodel" aria-label="Vision model"></select>
+  </div>
+  <div class="sub">Looks at app screens and describes them; the chat model only plans.</div>
+  <div class="row err" id="visionerr" hidden></div>
+  <div class="row err" id="keymissing" hidden>No OpenRouter key yet. Add one over adb (see the app's README).</div>
+  <div class="row" id="quitrow" style="display:none">
+    <span class="muted" style="flex:1">Stops the background server and its wake locks.</span>
+    <button id="quit" type="button">Quit app</button>
+  </div>
+</div>
+<div id="picker" role="dialog" aria-modal="true" aria-label="Choose a model" hidden>
+  <div class="sheet">
+    <div class="head">
+      <button id="pickback" type="button" aria-label="Back to classes" hidden>‹</button>
+      <h2 id="picktitle">Choose a class</h2>
+    </div>
+    <div id="picklist"></div>
+  </div>
+</div>
+<main id="log"><div class="empty" id="empty">Ask anything.</div></main>
+<section id="history" aria-label="Chat history">
+  <div id="cal">
+    <div class="calhead">
+      <button id="prevm" type="button" aria-label="Previous month">‹</button>
+      <div id="mtitle"></div>
+      <button id="nextm" type="button" aria-label="Next month">›</button>
+    </div>
+    <div class="dow"><span>S</span><span>M</span><span>T</span><span>W</span><span>T</span><span>F</span><span>S</span></div>
+    <div id="grid"></div>
+    <div class="legend">Less <i class="l0"></i><i class="l1"></i><i class="l2"></i><i class="l3"></i><i class="l4"></i> More</div>
+  </div>
+  <div id="list"><div id="days"></div><div id="tail"></div></div>
+</section>
+<div id="pip" aria-label="Live view of the app the agent is using"><img alt=""><div class="badge"><span class="dot"></span><span class="lbl">live</span></div><button class="x" type="button" aria-label="Close the view">✕</button></div>
+<form id="composer">
+  <textarea id="input" rows="1" placeholder="Message" enterkeyhint="enter"></textarea>
+  <button id="send" class="primary" type="submit">Send</button>
+</form>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+let models = [];
+let session = ""; // the chat on screen; the server assigns an id on its first message
+let busy = null; // AbortController of the reply in flight
+let spendCap = 0.5;
+
+// Money is shown in rupees at a flat ₹100 to the dollar: the server and the
+// gateway count in USD, so every amount is converted here, at display time.
+const INR_PER_USD = 100;
+// fmtRate is a per-MTok price: "₹27", "₹3.5", "₹0.80".
+function fmtRate(usd) {
+  const n = usd * INR_PER_USD;
+  return "₹" + (n >= 10 ? n.toFixed(0) : n >= 1 ? n.toFixed(1).replace(/\.0$/, "") : n.toFixed(2));
+}
+// fmtINR is a spend: replies cost fractions of a rupee, so small amounts keep
+// two significant digits ("₹0.41", "₹0.013").
+function fmtINR(usd) {
+  const n = (usd || 0) * INR_PER_USD;
+  return "₹" + (n === 0 ? "0" : n >= 0.1 ? n.toFixed(2) : n.toPrecision(2));
+}
+function setCost(usd, cap) {
+  const t = fmtINR(usd) + " of " + fmtINR(cap || spendCap);
+  $("cost").textContent = t;
+  $("hcost").textContent = t;
+}
+
+function esc(s) {
+  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function inline(s) {
+  return esc(s)
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, "$1<em>$2</em>");
+}
+// Small Markdown subset: fenced code, headings, bullet/numbered lists,
+// paragraphs, inline code/bold/italic. Unclosed fences render as code so a
+// half-streamed block already looks right.
+function md(src) {
+  const out = [];
+  const lines = src.split("\n");
+  let i = 0, para = [], list = null;
+  const flushPara = () => { if (para.length) { out.push("<p>" + para.map(inline).join("<br>") + "</p>"); para = []; } };
+  const flushList = () => { if (list) { out.push("<" + list.tag + ">" + list.items.map((t) => "<li>" + inline(t) + "</li>").join("") + "</" + list.tag + ">"); list = null; } };
+  while (i < lines.length) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      flushPara(); flushList();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) body.push(lines[i++]);
+      i++;
+      out.push("<pre><code>" + esc(body.join("\n")) + "</code></pre>");
+      continue;
+    }
+    let m;
+    if ((m = line.match(/^#{1,6}\s+(.*)$/))) { flushPara(); flushList(); out.push("<h4>" + inline(m[1]) + "</h4>"); }
+    else if ((m = line.match(/^\s*[-*•]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ul") { flushList(); list = { tag: "ul", items: [] }; } list.items.push(m[1]); }
+    else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) { flushPara(); if (!list || list.tag !== "ol") { flushList(); list = { tag: "ol", items: [] }; } list.items.push(m[1]); }
+    else if (line.trim() === "") { flushPara(); flushList(); }
+    else { flushList(); para.push(line); }
+    i++;
+  }
+  flushPara(); flushList();
+  return out.join("");
+}
+
+function scrollDown() { const log = $("log"); log.scrollTop = log.scrollHeight; }
+// ---- Tool lines -------------------------------------------------------------
+// Pixel icons for the app tools, as rects on an 8x8 grid ("x,y,w,h").
+const PX = {
+  open:  "0,0,8,1 0,1,8,1 0,0,1,8 7,0,1,8 0,7,8,1 3,3,1,3 4,4,1,1 2,4,1,1",
+  look:  "2,1,4,1 1,2,1,1 6,2,1,1 0,3,1,2 7,3,1,2 3,3,2,2 1,5,1,1 6,5,1,1 2,6,4,1",
+  tap:   "3,3,2,2 2,0,4,1 2,7,4,1 0,2,1,4 7,2,1,4 1,1,1,1 6,1,1,1 1,6,1,1 6,6,1,1",
+  type:  "0,1,8,1 0,6,8,1 0,1,1,6 7,1,1,6 2,3,1,1 4,3,1,1 6,3,1,1 2,4,4,1",
+  swipe: "3,2,2,4 3,0,2,1 2,1,4,1 1,2,6,1 1,5,6,1 2,6,4,1 3,7,2,1",
+  key:   "0,3,1,2 1,2,1,4 2,1,1,6 3,3,5,2",
+  close: "0,0,2,1 6,0,2,1 1,1,2,1 5,1,2,1 2,2,4,1 3,3,2,2 2,5,4,1 1,6,2,1 5,6,2,1 0,7,2,1 6,7,2,1",
+  list:  "0,1,1,1 2,1,6,1 0,3,1,1 2,3,6,1 0,5,1,1 2,5,6,1",
+  chip:  "1,1,6,1 1,6,6,1 1,2,1,4 6,2,1,4 3,3,2,2 0,2,1,1 0,5,1,1 7,2,1,1 7,5,1,1 2,0,1,1 5,0,1,1 2,7,1,1 5,7,1,1",
+  file:  "0,0,5,1 0,1,1,6 4,1,2,1 4,2,1,1 6,2,1,1 4,3,4,1 7,4,1,3 0,7,8,1",
+  todo:  "0,2,6,1 0,7,6,1 0,3,1,4 5,3,1,4 2,4,1,1 3,5,1,1 4,4,1,1 5,3,1,1 6,2,1,1 7,1,1,1",
+};
+function pxIcon(kind) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 8 8");
+  svg.setAttribute("class", "ic" + (kind ? "" : " none"));
+  for (const r of (PX[kind] || "").split(" ").filter(Boolean)) {
+    const [x, y, w, h] = r.split(",");
+    const e = document.createElementNS(NS, "rect");
+    e.setAttribute("x", x); e.setAttribute("y", y); e.setAttribute("width", w); e.setAttribute("height", h);
+    svg.appendChild(e);
+  }
+  return svg;
+}
+// The action a tool line stands for, from its text (live lines and saved
+// chats both only have the text): "✓ tapped (412, 1290)" -> "tap".
+function toolKind(text) {
+  const t = text.replace(/^[✓✗…]\s*/, "");
+  // Files and to-dos first: "opened: notes.md" is a file, "opened Calendar" an app.
+  if (/^(listing|saving|reading|opening|deleting) a file|^listed (\d+ )?files?\b|^(saved|read|opened):|^files?_\w+ failed|^deleted: .*\.\w{1,5}$/.test(t)) return "file";
+  if (/to-dos?\b|^(added|updated|done|deleted):|^tasks?_\w+ failed/.test(t)) return "todo";
+  const by = [[/^opened|^app_open|opening an app/, "open"], [/^looked|^screen_look|looking/, "look"],
+    [/^tapped|^tap\b|tapping/, "tap"], [/^typed|^type\b|typing/, "type"], [/^swiped|^swipe\b|swiping/, "swipe"],
+    [/^pressed|^key\b|pressing/, "key"], [/^closed the app|^app_close|closing the app/, "close"],
+    [/^listed apps|^app_list|listing apps/, "list"]];
+  for (const [re, k] of by) if (re.test(t)) return k;
+  return "";
+}
+// toolFamily groups a line's kind for the garden theme's tints: an app action,
+// a file, or a to-do.
+const toolFamily = (kind) => (kind === "file" || kind === "todo" ? kind : kind ? "app" : "");
+function setLine(line, text) {
+  const kind = toolKind(text);
+  line.className = "tool" + (text.startsWith("✗") ? " err" : "");
+  line.dataset.fam = toolFamily(kind) || line.dataset.fam || "";
+  line.replaceChildren(pxIcon(kind), Object.assign(document.createElement("span"), { textContent: text }));
+}
+// refreshTools folds a box of more than FOLD_AT lines into one summary row:
+// "Calendar · 14 steps", from the first app it opened.
+const FOLD_AT = 4;
+function refreshTools(box) {
+  const lines = box.querySelectorAll(".tool");
+  if (lines.length <= FOLD_AT) return;
+  box.classList.add("fold");
+  let sum = box.querySelector(".toolsum");
+  if (!sum) {
+    sum = document.createElement("div");
+    sum.className = "toolsum";
+    sum.addEventListener("click", () => { box.classList.toggle("open"); refreshTools(box); });
+    box.prepend(sum);
+  }
+  let app = "";
+  for (const l of lines) { const m = /opened (.+?) \(in background\)/.exec(l.textContent); if (m) { app = m[1]; break; } }
+  const kind = app ? "open" : toolKind(lines[0].textContent);
+  sum.replaceChildren(pxIcon(kind), Object.assign(document.createElement("span"), {
+    textContent: (app ? app + " · " : "") + lines.length + " steps",
+  }), Object.assign(document.createElement("span"), { className: "chev", textContent: box.classList.contains("open") ? "▴" : "▾" }));
+}
+// toolLine adds one tool line to a reply's .tools box (made on first use, above
+// the reply body) and returns it.
+function toolLine(bot, body, text) {
+  let box = bot.querySelector(".tools");
+  if (!box) { box = document.createElement("div"); box.className = "tools"; bot.insertBefore(box, body); }
+  const line = document.createElement("div");
+  setLine(line, text);
+  box.appendChild(line);
+  refreshTools(box);
+  return line;
+}
+
+// ---- Live view (picture in picture) -------------------------------------------
+// While a turn drives an app on a background display, a small window in the
+// bottom right shows it at ~5 fps. Frames are fetched as blobs and only swapped
+// in once they decode, so a missing frame (a released display) never shows a
+// broken image: the last good frame stays, and with none the window stays
+// hidden. When the turn ends the window keeps its last frame, marked "ended".
+// ✕ does not close it: it folds into the header orb, which then shows a small
+// screen with a dot circling it; tapping the orb brings the window back.
+// While folded no frames are fetched. Opening another chat or a new one
+// clears it. Nothing is left in the message.
+const pip = { run: 0, url: "", aspect: 854 / 480, big: false, min: false };
+function pipMinimize(on) {
+  pip.min = on;
+  $("pip").classList.toggle("hide", on);
+  $("orb").classList.toggle("min", on);
+  $("orb").title = on ? "Show the live view" : "";
+  orbMin(on);
+  if (!on) placePip();
+}
+function placePip() {
+  const el = $("pip");
+  if (!el.classList.contains("on")) return;
+  const vh = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  const top = $("composer").getBoundingClientRect().top;      // the composer rides the keyboard
+  const headerBottom = document.querySelector("header").getBoundingClientRect().bottom;
+  const bottom = Math.max(8, vh - top + 8);
+  const room = Math.max(60, top - headerBottom - 16);           // height left above the composer
+  let w = pip.big ? Math.min(260, window.innerWidth - 20) : 150;
+  w = Math.min(w, room / pip.aspect);
+  el.style.bottom = bottom + "px";
+  el.style.width = Math.round(w) + "px";
+  el.style.height = Math.round(w * pip.aspect) + "px";
+}
+function pipStart(d) {
+  if (pip.run && pip.id === d.id) return;
+  pipStop(true); // a new display keeps the window folded if the user folded it
+  const run = ++pip.run;
+  pip.id = d.id;
+  pip.big = false;
+  pip.aspect = d.width && d.height ? d.height / d.width : 854 / 480;
+  const el = $("pip"), img = el.querySelector("img");
+  el.classList.remove("ended");
+  el.querySelector(".lbl").textContent = "live";
+  img.onerror = () => { img.removeAttribute("src"); };
+  const url = "/api/display/" + d.id + "/frame.jpg";
+  (async () => {
+    while (pip.run === run) {
+      if (pip.min && pip.url) { await new Promise((ok) => setTimeout(ok, 400)); continue; } // folded: no frames
+      try {
+        const r = await fetch(url + "?t=" + Date.now(), { cache: "no-store", credentials: "same-origin" });
+        const type = r.headers.get("content-type") || "";
+        if (r.ok && type.startsWith("image/")) {
+          const u = URL.createObjectURL(await r.blob());
+          await new Promise((ok) => {
+            const probe = new Image();
+            probe.onload = () => {
+              if (pip.run === run) {
+                if (pip.url) URL.revokeObjectURL(pip.url);
+                pip.url = u; img.src = u;
+                if (!el.classList.contains("on")) { el.classList.add("on"); el.classList.toggle("hide", pip.min); placePip(); }
+              } else URL.revokeObjectURL(u);
+              ok();
+            };
+            probe.onerror = () => { URL.revokeObjectURL(u); ok(); };
+            probe.src = u;
+          });
+        }
+      } catch (_) { /* a missed frame; try the next */ }
+      await new Promise((ok) => setTimeout(ok, 200));
+    }
+  })();
+}
+// pipEnd stops the frames at the end of a turn, keeping the last one on screen.
+function pipEnd() {
+  if (!pip.url) { pipStop(); return; }
+  pip.run++;
+  pip.id = undefined;
+  const el = $("pip");
+  el.classList.add("ended");
+  el.querySelector(".lbl").textContent = "ended";
+}
+function pipStop(keepMin) {
+  pip.run++;
+  pip.id = undefined;
+  const el = $("pip");
+  el.classList.remove("on", "ended");
+  if (!keepMin && pip.min) pipMinimize(false);
+  el.querySelector("img").removeAttribute("src");
+  if (pip.url) { URL.revokeObjectURL(pip.url); pip.url = ""; }
+}
+
+function add(cls, html) {
+  const e = $("empty"); if (e) e.remove();
+  const d = document.createElement("div");
+  d.className = cls;
+  if (html !== undefined) d.innerHTML = html;
+  $("log").appendChild(d);
+  scrollDown();
+  return d;
+}
+
+async function api(path, body) {
+  const res = await fetch(path, {
+    method: body === undefined ? "GET" : "POST",
+    headers: body === undefined ? {} : { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: "same-origin",
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function showPrice() {
+  const m = models.find((x) => x.id === $("model").value);
+  $("price").textContent = m ? fmtRate(m.in_per_mtok) + " in · " + fmtRate(m.out_per_mtok) + " out per MTok" : "";
+}
+
+// The model picker is a bottom sheet with two steps: a model class (Flash /
+// Mid / Frontier), then the models in that class. The chosen id lives in the
+// hidden #model input; the last model used in each class is remembered.
+let tiers = [], tier = "";
+const tierName = (id) => (tiers.find((t) => t.id === id) || {}).name || id;
+
+// selectModel makes id the current model. It returns false for a model no
+// longer offered, leaving the current one.
+function selectModel(id) {
+  const m = models.find((x) => x.id === id);
+  if (!m) return false;
+  tier = m.tier;
+  $("model").value = id;
+  $("modelname").textContent = m.name;
+  $("modelcls").textContent = tierName(tier);
+  $("mid").textContent = id.replace(/^llmgateway\//, "");
+  store.set("tier", tier);
+  store.set("model:" + tier, id);
+  showPrice();
+  return true;
+}
+
+// pickOption renders one row of the sheet: a ✓ on the current choice, and a ›
+// on rows that lead to another step.
+function pickOption(main, sub, current, leadsOn, onPick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "opt" + (current ? " cur" : "");
+  b.innerHTML = '<span class="txt"><span class="main"></span><span class="sub"></span></span><span class="mark">' + (current ? "✓" : leadsOn ? "›" : "") + "</span>";
+  b.querySelector(".main").textContent = main;
+  b.querySelector(".sub").textContent = sub;
+  b.addEventListener("click", onPick);
+  $("picklist").appendChild(b);
+}
+
+function showClasses() {
+  $("picktitle").textContent = "Choose a class";
+  $("pickback").hidden = true;
+  $("picklist").innerHTML = "";
+  for (const t of tiers) {
+    const inTier = models.filter((m) => m.tier === t.id);
+    const outs = inTier.map((m) => m.out_per_mtok);
+    const sub = inTier.length + " models · " + fmtRate(Math.min(...outs)) + "–" + fmtRate(Math.max(...outs)) + " out per MTok";
+    pickOption(t.name, sub, t.id === tier, true, () => showClassModels(t.id));
+  }
+}
+
+function showClassModels(id) {
+  $("picktitle").textContent = tierName(id);
+  $("pickback").hidden = false;
+  $("picklist").innerHTML = "";
+  for (const m of models.filter((x) => x.tier === id)) {
+    const sub = fmtRate(m.in_per_mtok) + " in · " + fmtRate(m.out_per_mtok) + " out per MTok";
+    pickOption(m.name, sub, m.id === $("model").value, false, () => { selectModel(m.id); leavePicker(); });
+  }
+  $("picker").querySelector(".sheet").scrollTop = 0;
+}
+
+// The sheet takes a history entry so Android's Back closes it, like History.
+const pickerOpen = () => !$("picker").hidden;
+function openPicker() {
+  if (!models.length || pickerOpen()) return;
+  showClasses();
+  $("picker").hidden = false;
+  history.pushState({ view: "picker" }, "");
+}
+function closePicker() { $("picker").hidden = true; }
+// pickerPopped marks the popstate our own history.back() causes, so it does not
+// also close a History view open underneath.
+let pickerPopped = false;
+function leavePicker() { if (pickerOpen()) { closePicker(); pickerPopped = true; history.back(); } }
+
+async function loadModels() {
+  const data = await api("/api/models");
+  models = data.models || [];
+  spendCap = data.spend_cap_usd || spendCap;
+  // Only classes that still have a model after the live catalog refresh.
+  tiers = (data.tiers || []).filter((t) => models.some((m) => m.tier === t.id));
+  const savedTier = store.get("tier");
+  selectModel(store.get("model:" + savedTier)) || selectModel(data.default) || (models[0] && selectModel(models[0].id));
+}
+
+async function loadStatus() {
+  try {
+    const s = await api("/api/status");
+    $("keymissing").hidden = s.has_key;
+    if (!s.has_key) { $("settings").classList.add("open"); }
+  } catch (e) { /* the next chat request reports a missing key too */ }
+}
+
+// Parses an SSE byte stream from fetch and calls onEvent(name, data).
+async function readSSE(res, onEvent) {
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n\n")) >= 0) {
+      const block = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      let name = "message", data = "";
+      for (const l of block.split("\n")) {
+        if (l.startsWith("event: ")) name = l.slice(7);
+        else if (l.startsWith("data: ")) data += l.slice(6);
+      }
+      if (data) onEvent(name, JSON.parse(data));
+    }
+  }
+}
+
+// ---- The orb ---------------------------------------------------------------
+// The header's circle is an 11x11 pixel sprite, scaled up with crisp pixels.
+// At rest it is a ring; while a reply is in flight it becomes a lit orb whose
+// light circles it, with swirling bands and sparks on its rim, quantized to a
+// five-step palette and dithered so it reads as pixel art. With the live view
+// folded into it, a tiny screen glows in a dim ring and a bright dot circles
+// it (over the busy orb too, while a reply runs).
+// The palette per theme: the phosphor green ramp, also garden's; crt keeps the
+// dark greens and lights up in amber; custom ramps from its bg up to its
+// accent, with the hot colour on top.
+const ORB_PALS = {
+  phosphor: [[18, 38, 29], [42, 90, 69], [79, 154, 120], [124, 196, 164], [201, 240, 221]],
+  crt: [[18, 38, 29], [42, 90, 69], [122, 78, 28], [255, 179, 71], [255, 224, 176]],
+};
+function orbPal(t) {
+  if (t !== "custom" || !uiPalette) return ORB_PALS[t] || ORB_PALS.phosphor;
+  const rgb = (h) => [1, 3, 5].map((i) => parseInt(h.substr(i, 2), 16));
+  const bg = rgb(uiPalette.bg), acc = rgb(uiPalette.accent);
+  const mix = (f) => bg.map((v, i) => Math.round(v + (acc[i] - v) * f));
+  return [mix(0.18), mix(0.4), mix(0.7), acc, rgb(uiPalette.accent_hi)];
+}
+let ORB_PAL = orbPal(document.documentElement.dataset.theme);
+const BAYER = [[0, 2], [3, 1]];
+const orb = { busy: false, min: false, timer: 0, t0: 0 };
+function drawOrb(t) {
+  const c = $("orb"), ctx = c.getContext("2d"), img = ctx.createImageData(11, 11);
+  const put = (x, y, col, a) => { const i = (y * 11 + x) * 4; img.data.set([col[0], col[1], col[2], a], i); };
+  const R = 4.3 + 0.35 * Math.sin(t * 3);
+  const lx = Math.cos(t * 2), ly = Math.sin(t * 2) * 0.6 - 0.3;
+  for (let y = 0; y < 11; y++) {
+    for (let x = 0; x < 11; x++) {
+      const dx = x - 5, dy = y - 5, r = Math.hypot(dx, dy), ang = Math.atan2(dy, dx);
+      if (!orb.busy && orb.min) { // folded live view: a small screen in a dim ring
+        const glow = 0.5 + 0.5 * Math.sin(t * 2.4);
+        if (Math.abs(dx) <= 1 && dy >= -2 && dy <= 1) put(x, y, ORB_PAL[glow > 0.5 ? 4 : 3], 255);
+        else if (r > 3.6 && r < 5.1) put(x, y, ORB_PAL[1], 255);
+        continue;
+      }
+      if (!orb.busy) { // at rest: a ring, like the old brand mark
+        if (r > 3.4 && r < 5.3) put(x, y, ORB_PAL[3], 255);
+        continue;
+      }
+      if (r <= R) {
+        const nx = dx / R, ny = dy / R, nz = Math.sqrt(Math.max(0, 1 - nx * nx - ny * ny));
+        let v = 0.3 + 0.7 * Math.max(0, nx * lx + ny * ly + nz * 0.55);
+        v += 0.16 * Math.sin(ang * 2 + t * 4 - r * 0.9);
+        v += (BAYER[y & 1][x & 1] - 1.5) * 0.07;
+        put(x, y, ORB_PAL[Math.max(0, Math.min(4, Math.round(v * 4)))], 255);
+      } else if (r <= R + 1.2 && Math.sin(ang * 3 - t * 6) > 0.6) {
+        put(x, y, ORB_PAL[4], 170); // a spark on the rim
+      }
+    }
+  }
+  if (orb.min) { // the dot circling a folded live view, with a fading tail
+    for (const [lag, a] of [[0, 255], [0.45, 130]]) {
+      const ang = t * 2.2 - lag;
+      const x = Math.round(5 + 4.6 * Math.cos(ang)), y = Math.round(5 + 4.6 * Math.sin(ang));
+      put(x, y, ORB_PAL[4], a);
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+}
+// orbAnimate runs the sprite while there is something to show: a reply in
+// flight, or a folded live view.
+function orbAnimate() {
+  clearTimeout(orb.timer);
+  if (!orb.busy && !orb.min) { drawOrb(0); return; }
+  if (!orb.t0) orb.t0 = performance.now();
+  const tick = () => {
+    if (!orb.busy && !orb.min) { orb.t0 = 0; drawOrb(0); return; }
+    drawOrb((performance.now() - orb.t0) / 1000);
+    orb.timer = setTimeout(tick, 70); // ~14 fps suits a sprite
+  };
+  tick();
+}
+function orbBusy(on) { orb.busy = on; orbAnimate(); }
+
+// applyTheme switches the page to a theme ("phosphor", "garden", "crt" or
+// "custom"; anything else is phosphor). The app calls it when the phone's
+// theme changes, or its palette does while the theme is custom.
+window.applyTheme = (name) => {
+  ORB_PAL = orbPal(setTheme(name));
+  orbAnimate(); // redraw the sprite in its new colours
+};
+function orbMin(on) { orb.min = on; orbAnimate(); }
+
+function setBusy(ctrl) {
+  busy = ctrl;
+  orbBusy(!!ctrl);
+  $("send").textContent = ctrl ? "Stop" : "Send";
+  $("send").classList.toggle("primary", !ctrl);
+}
+
+// ---- A reply ----------------------------------------------------------------
+// The server generates a reply on its own, so it carries on when this page's
+// stream drops (the app went to the background, or Back left it). A dropped
+// stream is therefore not the end: once the page is visible again the reply is
+// followed from /api/chats/{id}/live, which replays it from its first event, so
+// the message is rebuilt from scratch each time. Stop asks the server to end it.
+
+const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
+const visible = () => document.visibilityState === "visible" ? Promise.resolve() : new Promise((ok) => {
+  const f = () => { if (document.visibilityState === "visible") { document.removeEventListener("visibilitychange", f); ok(); } };
+  document.addEventListener("visibilitychange", f);
+});
+// who names a model for the activity line: the picker's name, the vision
+// list's name, else the last part of its id.
+let visionNames = {};
+function who(id) {
+  const m = models.find((x) => x.id === id);
+  return m ? m.name : visionNames[id] || (id || "").replace(/^llmgateway\//, "").split("/").pop();
+}
+
+// replyView is one assistant message being streamed into; reset() empties it
+// for a replay. ctrl aborts this page's fetch only, never the reply itself.
+function replyView(ctrl, hasUser) {
+  const v = { bot: add("msg bot cursor"), ctrl, hasUser };
+  v.reset = () => {
+    v.bot.replaceChildren();
+    v.bot.classList.add("cursor");
+    v.body = Object.assign(document.createElement("div"), { className: "body" });
+    v.bot.appendChild(v.body);
+    Object.assign(v, { think: null, act: null, reply: "", reasoning: "", pending: false, failed: false, started: false, ended: "", tools: new Map() });
+  };
+  v.render = () => {
+    v.pending = false;
+    v.body.innerHTML = md(v.reply);
+    if (v.think) v.think.textContent = v.reasoning.slice(-400);
+    scrollDown();
+  };
+  v.schedule = () => { if (!v.pending) { v.pending = true; requestAnimationFrame(v.render); } };
+  v.reset();
+  return v;
+}
+
+// showActivity says who the reply is waiting on: the chat model deciding the
+// next step, the vision model looking at a screenshot, or a tool on the phone.
+function showActivity(v, d) {
+  if (!v.act) v.act = document.createElement("div");
+  v.act.className = "act " + d.kind;
+  const [icon, text] =
+    d.kind === "llm" ? ["chip", "chat model · " + who(d.model) + " · deciding"] :
+    d.kind === "vision" ? ["look", "vision model · " + who(d.model) + " · looking at the screen"] :
+    [toolKind(d.tool || "") || "tap", "phone · " + (d.tool || "tool")];
+  v.act.replaceChildren(pxIcon(icon), Object.assign(document.createElement("span"), { className: "t", textContent: text }));
+  v.bot.insertBefore(v.act, v.body.nextSibling);
+  scrollDown();
+}
+
+function onReplyEvent(v, name, d) {
+  if (name === "session") { session = d.session; v.started = true; }
+  else if (name === "prompt") {
+    // Opened mid-reply: the message is only saved when the reply ends.
+    if (!v.hasUser) { v.hasUser = true; v.bot.insertAdjacentElement("beforebegin", Object.assign(document.createElement("div"), { className: "msg user", textContent: d.text })); }
+  }
+  else if (name === "activity") showActivity(v, d);
+  else if (name === "delta") { if (v.think) { v.think.remove(); v.think = null; } v.reply += d.text; v.schedule(); }
+  else if (name === "reasoning") {
+    if (!v.reply && !v.think) { v.think = Object.assign(document.createElement("div"), { className: "think" }); v.bot.insertBefore(v.think, v.body); }
+    v.reasoning += d.text; v.schedule();
+  }
+  else if (name === "tool") {
+    if (v.think) { v.think.remove(); v.think = null; }
+    let line = v.tools.get(d.id);
+    if (!line) { line = toolLine(v.bot, v.body, d.text); v.tools.set(d.id, line); }
+    setLine(line, d.text);
+    line.classList.toggle("err", d.state === "error");
+    const box = v.bot.querySelector(".tools");
+    box.classList.add("live");
+    refreshTools(box);
+    scrollDown();
+  }
+  else if (name === "display") pipStart(d); // an app on a background display: show it live
+  else if (name === "notice") {
+    const text = "switched to " + who(d.switched_to) + " · history kept";
+    v.bot.previousElementSibling.insertAdjacentHTML("beforebegin", '<div class="notice">' + esc(text) + "</div>");
+  }
+  else if (name === "error") { v.failed = true; v.bot.insertAdjacentHTML("beforeend", '<div class="err">' + esc(d.error) + "</div>"); }
+  else if (name === "done" || name === "stopped") {
+    v.ended = name;
+    setCost(d.session_cost_usd, d.spend_cap_usd);
+    const tag = document.createElement("div");
+    tag.className = "tag";
+    tag.textContent = who(d.model) + " · " + fmtINR(d.reply_cost_usd) +
+      (d.vision_calls ? " (vision " + fmtINR(d.vision_cost_usd) + " for " + d.vision_calls + (d.vision_calls === 1 ? " look)" : " looks)") : "") +
+      (name === "stopped" ? " · stopped" : "");
+    v.bot.appendChild(tag);
+  }
+}
+
+// follow reads one event stream into v: "done", "stopped", or "dropped" when
+// it ended early.
+async function follow(v, res) {
+  await readSSE(res, (name, d) => onReplyEvent(v, name, d));
+  return v.ended || "dropped";
+}
+
+// rejoin follows the reply again once the page is visible: "finished" when it
+// ended while we were away (the saved chat then has it).
+async function rejoin(v) {
+  for (let tries = 0; tries < 60; tries++) {
+    await visible();
+    let res;
+    try { res = await fetch("/api/chats/" + encodeURIComponent(session) + "/live", { credentials: "same-origin", signal: v.ctrl.signal }); }
+    catch (e) { if (e.name === "AbortError") return "aborted"; await sleep(1000); continue; }
+    if (res.status === 204) return "finished";
+    if (!res.ok) { await sleep(1000); continue; }
+    v.reset();
+    try { const st = await follow(v, res); if (st !== "dropped") return st; }
+    catch (e) { if (e.name === "AbortError") return "aborted"; }
+  }
+  return "lost";
+}
+
+// endView settles a reply's message once its stream is over for good.
+function endView(v, status) {
+  if (v.act) v.act.remove();
+  if (v.think) v.think.remove();
+  pipEnd(); // the live window stops with the turn and keeps its last frame
+  const tb = v.bot.querySelector(".tools");
+  if (tb) { tb.classList.remove("live"); refreshTools(tb); }
+  v.render();
+  v.bot.classList.remove("cursor");
+  if (status === "aborted" && !v.bot.querySelector(".tag")) v.bot.insertAdjacentHTML("beforeend", '<div class="tag">not following · still running</div>');
+  if (status === "lost") { v.failed = true; v.bot.insertAdjacentHTML("beforeend", '<div class="err">lost the reply; open this chat from History to see it</div>'); }
+  if (!v.reply && !v.failed && !v.tools.size && !v.bot.querySelector(".tag")) v.body.textContent = "(no reply)";
+  if (busy === v.ctrl) setBusy(null);
+  scrollDown();
+  // A reply that finished while the app was away is in the saved chat.
+  if (status === "finished" && session) openChat(session);
+}
+
+async function send(text) {
+  add("msg user").textContent = text;
+  const model = $("model").value;
+  const ctrl = new AbortController();
+  const v = replyView(ctrl, true);
+  setBusy(ctrl);
+  let status;
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session, model, message: text }),
+      signal: ctrl.signal,
+      credentials: "same-origin",
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.error || res.statusText);
+    }
+    status = await follow(v, res);
+  } catch (e) {
+    if (e.name === "AbortError") status = "aborted";
+    else if (!v.started) { status = "error"; v.failed = true; v.bot.insertAdjacentHTML("beforeend", '<div class="err">' + esc(e.message) + "</div>"); }
+    else status = "dropped";
+  }
+  if (status === "dropped") status = await rejoin(v);
+  endView(v, status);
+}
+
+// joinLive follows a reply still running in chat id, e.g. one opened from
+// History while its agent works in the background.
+async function joinLive(id) {
+  if (busy) return;
+  const ctrl = new AbortController();
+  let res;
+  try { res = await fetch("/api/chats/" + encodeURIComponent(id) + "/live", { credentials: "same-origin", signal: ctrl.signal }); }
+  catch (e) { return; }
+  if (res.status !== 200 || session !== id || busy) { ctrl.abort(); return; }
+  const v = replyView(ctrl, false);
+  setBusy(ctrl);
+  let status;
+  try { status = await follow(v, res); }
+  catch (e) { status = e.name === "AbortError" ? "aborted" : "dropped"; }
+  if (status === "dropped") status = await rejoin(v);
+  endView(v, status);
+}
+
+// stopReply is the Stop button: the server ends the reply and its stream says
+// "stopped". Without a chat id yet, dropping the request is all there is.
+async function stopReply() {
+  const ctrl = busy;
+  if (session) {
+    try { await api("/api/chats/" + encodeURIComponent(session) + "/stop", {}); return; } catch (e) { /* fall through */ }
+  }
+  if (ctrl) ctrl.abort();
+}
+
+// ---- History: saved chats under a month calendar ----------------------------
+// The calendar is sticky at the top of #history and the list of chat days
+// scrolls under it. Tapping a day scrolls the list there; scrolling the list
+// moves the calendar's selection (and month) to the day at the top.
+const DOW = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const hist = {
+  byDay: new Map(), // "YYYY-MM-DD" -> chat summaries, newest first
+  days: [],         // days with chats, newest first
+  y: 0, m: 0,       // month shown (m is 0-based)
+  sel: "",          // selected day
+  sections: [],     // [{day, el}] in list order
+  lock: false,      // a tap-driven smooth scroll is running; the scroll-spy waits
+  lockTimer: 0,
+};
+const pad = (n) => String(n).padStart(2, "0");
+const dayKey = (y, m, d) => y + "-" + pad(m + 1) + "-" + pad(d);
+const parseDay = (k) => { const [y, m, d] = k.split("-").map(Number); return new Date(y, m - 1, d); };
+const monthOf = (k) => { const d = parseDay(k); return d.getFullYear() * 12 + d.getMonth(); };
+const level = (n) => (n === 0 ? 0 : n === 1 ? 1 : n <= 3 ? 2 : n <= 6 ? 3 : 4);
+function todayKey() { const d = new Date(); return dayKey(d.getFullYear(), d.getMonth(), d.getDate()); }
+function fmtDay(k) {
+  const d = parseDay(k);
+  return DOW[d.getDay()] + ", " + d.getDate() + " " + MONTHS[d.getMonth()].slice(0, 3) + " " + d.getFullYear();
+}
+function fmtTime(iso) { const d = new Date(iso); return isNaN(d) ? "" : pad(d.getHours()) + ":" + pad(d.getMinutes()); }
+function modelName(id) {
+  const m = models.find((x) => x.id === id);
+  return m ? m.name : (id || "").split("/").pop();
+}
+
+const histOpen = () => document.body.classList.contains("hist");
+function openHistory() {
+  if (histOpen()) return;
+  document.body.classList.add("hist");
+  $("histbtn").classList.add("on");
+  // A history entry, so Android's Back (WebView goBack) closes the view.
+  history.pushState({ view: "history" }, "");
+  loadHistory(false);
+}
+function closeHistory() {
+  document.body.classList.remove("hist");
+  $("histbtn").classList.remove("on");
+}
+// leaveHistory closes the view through history.back(), so the entry pushed by
+// openHistory is consumed and the next Back leaves the app as before.
+function leaveHistory() { if (histOpen()) { closeHistory(); history.back(); } }
+window.addEventListener("popstate", () => {
+  if (pickerPopped) { pickerPopped = false; return; }
+  if (pickerOpen()) { closePicker(); return; } // the sheet's entry sits above History's
+  if (histOpen()) closeHistory();
+});
+
+async function loadHistory(keepScroll) {
+  const scroller = $("history");
+  const y = scroller.scrollTop;
+  let chats = [];
+  try { chats = (await api("/api/history")).chats || []; }
+  catch (e) { $("days").innerHTML = '<div class="empty err">' + esc("could not load history: " + e.message) + "</div>"; return; }
+  hist.byDay = new Map();
+  for (const c of chats) {
+    if (!hist.byDay.has(c.day)) hist.byDay.set(c.day, []);
+    hist.byDay.get(c.day).push(c);
+  }
+  hist.days = [...hist.byDay.keys()];
+  renderDays();
+  if (keepScroll && hist.byDay.has(hist.sel)) { scroller.scrollTop = y; }
+  else {
+    scroller.scrollTop = 0;
+    hist.sel = hist.days[0] || "";
+    const d = hist.sel ? parseDay(hist.sel) : new Date();
+    hist.y = d.getFullYear(); hist.m = d.getMonth();
+  }
+  renderCal("");
+  spy();
+}
+
+function renderDays() {
+  const out = [];
+  for (const day of hist.days) {
+    const list = hist.byDay.get(day);
+    out.push('<section class="day" data-day="' + day + '"><div class="dayhead">' + fmtDay(day) + " · " +
+      list.length + (list.length === 1 ? " chat" : " chats") + "</div>");
+    for (const c of list) {
+      const meta = [fmtTime(c.created_at), modelName(c.model), fmtINR(c.cost_usd), c.message_count + (c.message_count === 1 ? " msg" : " msgs")];
+      out.push('<div class="card" data-id="' + esc(c.id) + '"><div class="t">' + esc(c.title || "(untitled)") +
+        '</div><div class="m">' + esc(meta.filter(Boolean).join(" · ")) + "</div></div>");
+    }
+    out.push("</section>");
+  }
+  $("days").innerHTML = out.length ? out.join("") : '<div class="empty">No chats yet.</div>';
+  hist.sections = [...$("days").querySelectorAll(".day")].map((el) => ({ day: el.dataset.day, el }));
+  sizeTail();
+}
+
+// listTop is where the list area starts inside #history: under the sticky
+// calendar, or at 0 when the calendar sits beside the list.
+const listTop = () => $("list").offsetTop;
+
+// sizeTail pads the list so even the oldest day can scroll up to sit just
+// under the calendar, where tapping it puts it and the scroll-spy expects it.
+function sizeTail() {
+  const last = hist.sections[hist.sections.length - 1];
+  const room = $("history").clientHeight - listTop();
+  $("tail").style.height = last ? Math.max(0, room - last.el.offsetHeight) + "px" : "0";
+}
+
+function monthBounds() {
+  const now = new Date();
+  let lo = now.getFullYear() * 12 + now.getMonth(), hi = lo;
+  if (hist.days.length) {
+    lo = Math.min(lo, monthOf(hist.days[hist.days.length - 1]));
+    hi = Math.max(hi, monthOf(hist.days[0]));
+  }
+  return [lo, hi];
+}
+
+// renderCal draws the shown month; dir ("next" | "prev" | "") slides it in.
+function renderCal(dir) {
+  $("mtitle").textContent = MONTHS[hist.m] + " " + hist.y;
+  const first = new Date(hist.y, hist.m, 1).getDay();
+  const n = new Date(hist.y, hist.m + 1, 0).getDate();
+  const today = todayKey();
+  const cells = [];
+  for (let i = 0; i < 42; i++) {
+    const d = i - first + 1;
+    if (d < 1 || d > n) { cells.push('<div class="cell"></div>'); continue; }
+    const k = dayKey(hist.y, hist.m, d);
+    const count = (hist.byDay.get(k) || []).length;
+    const cls = "l" + level(count) + (k === today ? " today" : "") + (k === hist.sel ? " sel" : "");
+    cells.push('<div class="cell"><button type="button" class="' + cls + '" data-day="' + k + '"' +
+      (count ? ' aria-label="' + fmtDay(k) + ", " + count + (count === 1 ? " chat" : " chats") + '"' : " disabled") +
+      ">" + d + "</button></div>");
+  }
+  const grid = $("grid");
+  grid.innerHTML = cells.join("");
+  grid.classList.remove("next", "prev");
+  if (dir) { void grid.offsetWidth; grid.classList.add(dir); }
+  const [lo, hi] = monthBounds();
+  const cur = hist.y * 12 + hist.m;
+  $("prevm").disabled = cur <= lo;
+  $("nextm").disabled = cur >= hi;
+  markSel();
+}
+
+function markSel() {
+  for (const b of $("grid").querySelectorAll("button.sel")) b.classList.remove("sel");
+  const b = $("grid").querySelector('button[data-day="' + hist.sel + '"]');
+  if (b) b.classList.add("sel");
+  for (const s of hist.sections) s.el.classList.toggle("sel", s.day === hist.sel);
+}
+
+function showMonth(mi) {
+  const [lo, hi] = monthBounds();
+  mi = Math.max(lo, Math.min(hi, mi));
+  const cur = hist.y * 12 + hist.m;
+  if (mi === cur) return;
+  hist.y = Math.floor(mi / 12); hist.m = mi % 12;
+  renderCal(mi > cur ? "next" : "prev");
+}
+
+// select makes day the selected one, moving the calendar to its month.
+function select(day) {
+  if (!day || day === hist.sel) return;
+  hist.sel = day;
+  if (monthOf(day) !== hist.y * 12 + hist.m) showMonth(monthOf(day));
+  else markSel();
+}
+
+function scrollToDay(day) {
+  const s = hist.sections.find((x) => x.day === day);
+  if (!s) return;
+  select(day);
+  hist.lock = true;
+  clearTimeout(hist.lockTimer);
+  hist.lockTimer = setTimeout(() => { hist.lock = false; }, 1000); // in case no scroll event comes
+  $("history").scrollTo({ top: s.el.offsetTop - listTop(), behavior: "smooth" });
+}
+
+// spy selects the day whose header has reached the top of the list area.
+function spy() {
+  if (hist.lock || !hist.sections.length) return;
+  const top = $("history").scrollTop + listTop() + 8;
+  let day = hist.sections[0].day;
+  for (const s of hist.sections) { if (s.el.offsetTop <= top) day = s.day; else break; }
+  select(day);
+}
+
+let spyPending = false;
+$("history").addEventListener("scroll", () => {
+  if (hist.lock) {
+    // The tap's smooth scroll is still moving; let go once it settles.
+    clearTimeout(hist.lockTimer);
+    hist.lockTimer = setTimeout(() => { hist.lock = false; }, 150);
+    return;
+  }
+  if (!spyPending) { spyPending = true; requestAnimationFrame(() => { spyPending = false; spy(); }); }
+}, { passive: true });
+// A finger on the list takes over from a running tap scroll.
+$("days").addEventListener("touchstart", () => { hist.lock = false; }, { passive: true });
+window.addEventListener("resize", () => { if (histOpen()) sizeTail(); });
+
+$("grid").addEventListener("click", (ev) => {
+  const b = ev.target.closest("button[data-day]");
+  if (b && !b.disabled) scrollToDay(b.dataset.day);
+});
+$("prevm").addEventListener("click", () => showMonth(hist.y * 12 + hist.m - 1));
+$("nextm").addEventListener("click", () => showMonth(hist.y * 12 + hist.m + 1));
+// Horizontal swipe on the calendar changes month.
+let swipe = null;
+$("cal").addEventListener("touchstart", (ev) => { const t = ev.touches[0]; swipe = { x: t.clientX, y: t.clientY }; }, { passive: true });
+$("cal").addEventListener("touchend", (ev) => {
+  if (!swipe) return;
+  const t = ev.changedTouches[0], dx = t.clientX - swipe.x, dy = t.clientY - swipe.y;
+  swipe = null;
+  if (Math.abs(dx) > 50 && Math.abs(dx) > 1.5 * Math.abs(dy)) showMonth(hist.y * 12 + hist.m + (dx < 0 ? 1 : -1));
+}, { passive: true });
+
+// Cards: tap opens the chat; a long press asks to delete it.
+let press = null, pressed = false;
+$("days").addEventListener("pointerdown", (ev) => {
+  // Android's WebView sends no click after a long press, so clear the flag
+  // here rather than only in the click handler.
+  pressed = false;
+  const c = ev.target.closest(".card");
+  if (!c || c.classList.contains("confirm")) return;
+  press = { x: ev.clientX, y: ev.clientY, timer: setTimeout(() => { pressed = true; press = null; askDelete(c); }, 550) };
+});
+const endPress = () => { if (press) { clearTimeout(press.timer); press = null; } };
+$("days").addEventListener("pointerup", endPress);
+$("days").addEventListener("pointercancel", endPress);
+$("days").addEventListener("pointermove", (ev) => {
+  if (press && Math.hypot(ev.clientX - press.x, ev.clientY - press.y) > 8) endPress();
+});
+$("days").addEventListener("contextmenu", (ev) => { if (ev.target.closest(".card")) ev.preventDefault(); });
+$("days").addEventListener("click", async (ev) => {
+  const c = ev.target.closest(".card");
+  if (!c) return;
+  if (pressed) { pressed = false; return; } // the click that ends a long press
+  if (!c.classList.contains("confirm")) { openChat(c.dataset.id); return; }
+  const act = ev.target.closest("button[data-act]");
+  if (!act) return;
+  if (act.dataset.act === "cancel") { c.classList.remove("confirm"); c.innerHTML = c.dataset.html; return; }
+  const id = c.dataset.id;
+  try {
+    const res = await fetch("/api/chats/" + encodeURIComponent(id), { method: "DELETE", credentials: "same-origin" });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+  } catch (e) { c.querySelector("span").textContent = "Could not delete: " + e.message; return; }
+  if (id === session) resetChat("New chat.");
+  loadHistory(true);
+});
+function askDelete(c) {
+  c.dataset.html = c.innerHTML;
+  c.classList.add("confirm");
+  c.innerHTML = '<span>Delete this chat?</span><button type="button" data-act="cancel">Cancel</button>' +
+    '<button type="button" class="danger" data-act="del">Delete</button>';
+}
+
+// openChat shows a saved chat in the chat view; sending continues it.
+async function openChat(id) {
+  let rec;
+  try { rec = await api("/api/chats/" + encodeURIComponent(id)); }
+  catch (e) { alertInHistory("could not open chat: " + e.message); return; }
+  if (busy) { busy.abort(); setBusy(null); } // stop following; the reply itself runs on
+  leaveHistory();
+  pipStop();
+  session = rec.id;
+  selectModel(rec.model); // a model since dropped from the picker leaves the current one
+  const log = $("log");
+  log.innerHTML = "";
+  add("notice", esc("started " + fmtDay(rec.created_at.slice(0, 10)) + ", " + fmtTime(rec.created_at)));
+  for (const m of rec.messages || []) {
+    if (m.role === "user") { add("msg user").textContent = m.text; continue; }
+    const bot = add("msg bot");
+    const body = document.createElement("div");
+    body.className = "body";
+    body.innerHTML = md(m.text);
+    bot.appendChild(body);
+    for (const t of m.tools || []) toolLine(bot, body, t);
+    const tag = document.createElement("div");
+    tag.className = "tag";
+    tag.textContent = modelName(m.model) + " · " + fmtINR(m.cost_usd);
+    bot.appendChild(tag);
+  }
+  setCost(rec.cost_usd);
+  scrollDown();
+  joinLive(rec.id); // still answering in the background? follow it
+}
+function alertInHistory(text) {
+  $("days").insertAdjacentHTML("afterbegin", '<div class="notice err">' + esc(text) + "</div>");
+}
+
+$("composer").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  if (busy) { stopReply(); return; }
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  autosize();
+  send(text);
+});
+// Enter inserts a newline; the Send button sends. Ctrl/Cmd+Enter also sends,
+// for a hardware keyboard.
+$("input").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey) && !ev.isComposing) { ev.preventDefault(); $("composer").requestSubmit(); }
+});
+function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight + 2, 140) + "px"; }
+$("input").addEventListener("input", autosize);
+// The live window: tap for a larger view; keep it above the composer and the
+// keyboard as they move.
+$("pip").addEventListener("click", () => { pip.big = !pip.big; placePip(); });
+$("pip").querySelector(".x").addEventListener("click", (ev) => { ev.stopPropagation(); pipMinimize(true); });
+$("orb").addEventListener("click", () => { if (pip.min) pipMinimize(false); });
+$("input").addEventListener("input", placePip);
+window.addEventListener("resize", placePip);
+if (window.visualViewport) window.visualViewport.addEventListener("resize", placePip);
+// The keyboard shrinks the page; keep the newest message in view when the
+// reader was already at the bottom.
+let wasAtBottom = true;
+$("log").addEventListener("scroll", () => {
+  const l = $("log");
+  wasAtBottom = l.scrollHeight - l.scrollTop - l.clientHeight < 40;
+});
+window.addEventListener("resize", () => { if (wasAtBottom) scrollDown(); });
+
+$("modelbtn").addEventListener("click", openPicker);
+$("pickback").addEventListener("click", showClasses);
+// A tap on the dimmed backdrop, outside the sheet, closes it.
+$("picker").addEventListener("click", (e) => { if (e.target === $("picker")) leavePicker(); });
+function resetChat(text) {
+  pipStop();
+  $("log").innerHTML = '<div class="empty" id="empty">' + esc(text) + "</div>";
+  setCost(0);
+}
+$("new").addEventListener("click", async () => {
+  if (busy) { busy.abort(); setBusy(null); } // stop following; the reply itself runs on
+  leaveHistory();
+  try {
+    const d = await api("/api/new", { session });
+    session = d.session;
+  } catch (e) { session = ""; }
+  resetChat("New chat.");
+  $("input").focus();
+});
+$("histbtn").addEventListener("click", () => { if (histOpen()) leaveHistory(); else openHistory(); });
+// The vision delegate: a separate model (Jev by default) that looks at app
+// screenshots, so the chat model only plans. Changes apply from the next message.
+async function loadSettings() {
+  try {
+    const s = await api("/api/settings");
+    const sel = $("visionmodel");
+    sel.replaceChildren(...(s.vision_models || []).map((m) => Object.assign(document.createElement("option"), { value: m.id, textContent: m.name })));
+    sel.value = s.vision_model || s.default_vision_model;
+    $("visionon").checked = !!s.vision_enabled;
+    sel.disabled = !s.vision_enabled;
+    visionNames = Object.fromEntries((s.vision_models || []).map((m) => [m.id, m.name]));
+  } catch (e) { showVisionErr("could not load settings: " + e.message); }
+}
+function showVisionErr(text) { $("visionerr").textContent = text; $("visionerr").hidden = !text; }
+async function saveSettings(body) {
+  try { await api("/api/settings", body); showVisionErr(""); }
+  catch (e) { showVisionErr("could not save: " + e.message); }
+  loadSettings();
+}
+$("visionon").addEventListener("change", (ev) => saveSettings({ vision_enabled: ev.target.checked }));
+$("visionmodel").addEventListener("change", (ev) => saveSettings({ vision_model: ev.target.value }));
+function toggleSettings() {
+  if ($("settings").classList.toggle("open")) loadSettings();
+  loadStatus();
+}
+$("gear").addEventListener("click", toggleSettings);
+$("modelid").addEventListener("click", toggleSettings);
+if (window.ToroidApp) {
+  $("quitrow").style.display = "flex";
+  $("quit").addEventListener("click", () => window.ToroidApp.quit());
+}
+
+
+drawOrb(0);
+loadSettings();
+loadModels().catch((e) => add("notice err", esc("could not load models: " + e.message)));
+loadStatus();
+</script>
+</body>
+</html>

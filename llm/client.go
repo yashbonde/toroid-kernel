@@ -144,9 +144,10 @@ type Response struct {
 	Gateway      GatewayInfo
 }
 
-// GatewayInfo is the per-call telemetry an LLM gateway reports in response
-// headers. Populated best-effort: a gateway that omits a header simply leaves
-// the field zero / CostUSD nil.
+// GatewayInfo is the per-call telemetry an LLM gateway reports, mostly in
+// response headers (OpenRouter puts cost in the body's usage instead). Populated
+// best-effort: a gateway that omits a value simply leaves the field zero /
+// CostUSD nil.
 //
 //	X-LLM-Gateway-Request-Id  stable per-request identifier
 //	X-LLM-Gateway-Wall-Ms     gateway overhead in ms (excludes provider time)
@@ -199,6 +200,16 @@ func gatewayInfoFrom(h http.Header) GatewayInfo {
 	return gi
 }
 
+// withBodyCost fills CostUSD from the response body's usage when no cost header
+// was present. OpenRouter reports its billed cost this way (usage.cost, in USD)
+// rather than in a header, and on a stream it only arrives in the final chunk.
+func (gi GatewayInfo) withBodyCost(u wireUsage) GatewayInfo {
+	if gi.CostUSD == nil {
+		gi.CostUSD = u.costUSD()
+	}
+	return gi
+}
+
 // Text returns the assistant text of the response.
 func (r *Response) Text() string { return TextOf(r.Content) }
 
@@ -233,7 +244,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	resp := &Response{
 		Usage:   wire.Usage.toUsage(),
 		CallID:  httpResp.Header.Get("x-litellm-call-id"),
-		Gateway: gatewayInfoFrom(httpResp.Header),
+		Gateway: gatewayInfoFrom(httpResp.Header).withBodyCost(wire.Usage),
 	}
 	if len(wire.Choices) > 0 {
 		ch := wire.Choices[0]
@@ -338,10 +349,10 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 					aborted = true
 				}
 			}
-			if d.ReasoningContent != "" {
-				reasoning += d.ReasoningContent
+			if r := d.reasoningText(); r != "" {
+				reasoning += r
 				select {
-				case deltas <- Delta{Reasoning: d.ReasoningContent}:
+				case deltas <- Delta{Reasoning: r}:
 				case <-ctx.Done():
 					aborted = true
 				}
@@ -391,7 +402,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 			FinishReason: normalizeFinishReason(finish),
 			Usage:        usage.toUsage(),
 			CallID:       httpResp.Header.Get("x-litellm-call-id"),
-			Gateway:      gatewayInfoFrom(httpResp.Header),
+			Gateway:      gatewayInfoFrom(httpResp.Header).withBodyCost(usage),
 		}
 		if aborted && finalErr == nil {
 			finalErr = ctx.Err()
@@ -679,27 +690,45 @@ type chatResponse struct {
 // chatChunk is one SSE chunk of a streaming response.
 type chatChunk struct {
 	Choices []struct {
-		FinishReason string `json:"finish_reason"`
-		Delta        struct {
-			Content          string         `json:"content"`
-			ReasoningContent string         `json:"reasoning_content"`
-			ToolCalls        []wireToolCall `json:"tool_calls"`
-		} `json:"delta"`
+		FinishReason string    `json:"finish_reason"`
+		Delta        wireDelta `json:"delta"`
 	} `json:"choices"`
 	Usage *wireUsage `json:"usage"`
+}
+
+// wireDelta is the incremental message inside one streaming chunk.
+type wireDelta struct {
+	Content          string         `json:"content"`
+	ReasoningContent string         `json:"reasoning_content"`
+	Reasoning        string         `json:"reasoning"`
+	ToolCalls        []wireToolCall `json:"tool_calls"`
+}
+
+// reasoningText returns the delta's reasoning under either field name:
+// LiteLLM and DeepSeek send reasoning_content, OpenRouter sends reasoning.
+func (d wireDelta) reasoningText() string {
+	if d.ReasoningContent != "" {
+		return d.ReasoningContent
+	}
+	return d.Reasoning
 }
 
 type wireRespMsg struct {
 	Role             string         `json:"role"`
 	Content          string         `json:"content"`
 	ReasoningContent string         `json:"reasoning_content"`
+	Reasoning        string         `json:"reasoning"` // OpenRouter's name for reasoning_content
 	ToolCalls        []wireToolCall `json:"tool_calls"`
 }
 
 func (m wireRespMsg) toParts() []Part {
 	var parts []Part
-	if m.ReasoningContent != "" {
-		parts = append(parts, ReasoningPart{Text: m.ReasoningContent})
+	reasoning := m.ReasoningContent
+	if reasoning == "" {
+		reasoning = m.Reasoning
+	}
+	if reasoning != "" {
+		parts = append(parts, ReasoningPart{Text: reasoning})
 	}
 	if m.Content != "" {
 		parts = append(parts, TextPart{Text: m.Content})
@@ -720,9 +749,32 @@ type wireUsage struct {
 	PromptTokensDetails struct {
 		CachedTokens        int64 `json:"cached_tokens"`
 		CacheCreationTokens int64 `json:"cache_creation_tokens"`
+		CacheWriteTokens    int64 `json:"cache_write_tokens"` // OpenRouter's name for cache_creation_tokens
 	} `json:"prompt_tokens_details"`
 	CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+
+	// OpenRouter usage accounting: the billed cost in USD. For bring-your-own-key
+	// calls Cost is only OpenRouter's fee and the provider's charge is reported
+	// separately as cost_details.upstream_inference_cost.
+	Cost        *float64 `json:"cost"`
+	IsBYOK      bool     `json:"is_byok"`
+	CostDetails struct {
+		UpstreamInferenceCost *float64 `json:"upstream_inference_cost"`
+	} `json:"cost_details"`
+}
+
+// costUSD returns the total billed cost reported in the body, or nil when the
+// gateway sent none.
+func (u wireUsage) costUSD() *float64 {
+	if u.Cost == nil {
+		return nil
+	}
+	usd := *u.Cost
+	if u.IsBYOK && u.CostDetails.UpstreamInferenceCost != nil {
+		usd += *u.CostDetails.UpstreamInferenceCost
+	}
+	return &usd
 }
 
 // toUsage maps wire usage into llm.Usage, splitting cached tokens out of the
@@ -736,6 +788,9 @@ func (u wireUsage) toUsage() Usage {
 	cacheWrite := u.CacheCreationInputTokens
 	if cacheWrite == 0 {
 		cacheWrite = u.PromptTokensDetails.CacheCreationTokens
+	}
+	if cacheWrite == 0 {
+		cacheWrite = u.PromptTokensDetails.CacheWriteTokens
 	}
 	input := u.PromptTokens - cacheRead - cacheWrite
 	if input < 0 {

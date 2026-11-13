@@ -1,0 +1,5 @@
+build/
+*.jks
+
+# The server binary built for a quick local run
+/android-chat

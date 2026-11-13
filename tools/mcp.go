@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/yashbonde/toroid-kernel/llm"
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/yashbonde/toroid-kernel/llm"
 )
 
 // MCPServerConfig points the kernel at one remote MCP server. Its tools are

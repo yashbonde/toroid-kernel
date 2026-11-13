@@ -94,6 +94,10 @@ type StepOptions struct {
 	// from the loop's, so the prefix cannot hit the loop's cache, and stamping
 	// breakpoints would pay the cache-write premium for a prefix never re-read.
 	DisablePromptCache bool
+	// ReasoningEffort, when set, is sent as the request's reasoning_effort
+	// verbatim (e.g. "minimal"), overriding Thinking. Used by one-off calls
+	// such as the vision delegate's.
+	ReasoningEffort string
 }
 
 // StreamDelta is one incremental chunk of a streaming llm-step.

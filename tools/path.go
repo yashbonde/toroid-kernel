@@ -15,7 +15,8 @@ import (
 const MaxToolOutputChars = 12_000
 
 // TruncateToolOutput clips s to MaxToolOutputChars. When it truncates, the
-// FULL output is saved under ~/.toroid/sessions/<session>/tool-output/ and the
+// FULL output is saved under $TOROID_HOME/sessions/<session>/tool-output/
+// (TOROID_HOME defaults to ~/.toroid) and the
 // note carries the path — so the model (or a subagent) can read or grep the
 // complete result instead of losing it. a scopes the file to the session; a
 // nil agent falls back to a "shared" session directory.
@@ -30,8 +31,14 @@ func TruncateToolOutput(a Agent, s string) string {
 		}
 	}
 	note := fmt.Sprintf("\n… [truncated %d of %d bytes]", len(s)-MaxToolOutputChars, len(s))
-	if home, err := os.UserHomeDir(); err == nil {
-		dir := filepath.Join(home, ".toroid", "sessions", session, "tool-output")
+	base := os.Getenv("TOROID_HOME") // same override as toroid.ToroidHome
+	if base == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			base = filepath.Join(home, ".toroid")
+		}
+	}
+	if base != "" {
+		dir := filepath.Join(base, "sessions", session, "tool-output")
 		if os.MkdirAll(dir, 0755) == nil {
 			path := filepath.Join(dir, fmt.Sprintf("%d.txt", time.Now().UnixNano()))
 			if os.WriteFile(path, []byte(s), 0644) == nil {

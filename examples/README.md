@@ -21,6 +21,7 @@ go run ./examples/<name>
 | `cli` | Interactive, pretty-printing chat REPL — plus a `--run` flag that emits every event as NDJSON on stdout, wrappable as a subprocess from any language | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `OnAll`, `Run`, `RunningCostUSD`, JSON-encoded `Event` |
 | `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
 | `e2e-test` | Offline integration fixture: discovered skill, local MCP server, host/core/subagent tools, structured output, and a cache-stable system/tool prefix | `FauxStep`, `Config.MCPServers`, `Config.IncludeSubagentTools`, `WithSchema` |
+| `android-chat` | Tiny Android chat app: a loopback Go server inside an APK streams replies token by token over SSE to a WebView, with a two-step OpenRouter model picker (class, then model) and a calendar of past chats. See its [README](android-chat/README.md) | `Stream`, `WithReasoningStream`, `MaxTranscriptSpendUSD`, `RunningCostUSD`, `History` |
 
 `running` is the single consolidated example. Run it with an API key for the
 full live tour (blocking, streaming, events, delegation, multimodal, structured

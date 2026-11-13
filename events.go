@@ -23,6 +23,8 @@ const (
 	EventPostCompact        EventKind = "PostCompact"        // after compaction; payload contains the LLM-generated summary
 	EventSessionEnd         EventKind = "SessionEnd"         // after the session ends
 	EventQueueInterrupt     EventKind = "QueueInterrupt"     // fired when queued messages interrupt the stream at a step boundary
+	EventVisionStarted      EventKind = "VisionStarted"      // a tool result's media is being sent to the vision delegate (Config.Vision)
+	EventVisionDescribed    EventKind = "VisionDescribed"    // a vision delegate (Config.Vision) described a tool result's media; carries its cost
 )
 
 // Event is the envelope fired for every kernel occurrence. TranscriptID,
@@ -127,6 +129,21 @@ type ToolUseResultPayload struct {
 	Name   string `json:"name,omitempty"`
 	Result string `json:"result,omitempty"`
 	Error  string `json:"error,omitempty"`
+}
+
+// VisionPayload is attached to EventVisionStarted and EventVisionDescribed:
+// one vision delegate call for the tool call CallID. On EventVisionStarted only
+// CallID, Name and Model are set; it fires from the tool's goroutine, so calls
+// in one batch may report in any order. Usage and CostUSD are that call's alone; they are
+// also included in the turn's TurnUsage. Error is set when the call failed and
+// the tool result says the image could not be described.
+type VisionPayload struct {
+	CallID  string  `json:"call_id,omitempty"`
+	Name    string  `json:"name,omitempty"`
+	Model   string  `json:"model"`
+	Usage   Usage   `json:"usage"`
+	CostUSD float64 `json:"cost_usd"`
+	Error   string  `json:"error,omitempty"`
 }
 
 // SubagentPayload is attached to EventSubagentStart and EventSubagentStop.

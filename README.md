@@ -149,6 +149,21 @@ final response to an `io.Writer`.
 err := kernel.Stream(ctx, "Explain the changes as you inspect them.", os.Stdout)
 ```
 
+By default each turn's text is written once the turn ends. Opt in to live
+tokens for a chat UI; reasoning can go to a separate writer:
+
+```go
+err := kernel.Stream(ctx, prompt, w,
+	toroid.WithTokenStream(),             // text as the model generates it
+	toroid.WithReasoningStream(thinking), // optional; implies WithTokenStream
+)
+```
+
+Streamed steps are still billed: from the gateway when it reports cost on the
+stream (OpenRouter does), otherwise from cached model rates. A gateway that
+only sends a cost header on non-streamed responses is priced from the catalog
+on streamed runs.
+
 ## Observe the agent
 
 Events are the host integration interface. Hooks run in order. A hook can stop
@@ -256,18 +271,63 @@ This includes the structured-output steps and the background wake steps.
 `Usage.PricingOK` separates a known zero from unknown pricing. Toroid never
 reports an unpriced response as free.
 
+## Let a vision model look at images
+
+Set `Config.Vision` so a separate vision model looks at every image a tool
+returns, such as a screenshot, while the main model plans and acts on text.
+The main model can then be text-only and cheap:
+
+```go
+kernel, err := toroid.NewKernel(ctx, toroid.Config{
+	Model:  "llmgateway/deepseek/deepseek-v4.1-flash",
+	Vision: &toroid.VisionDelegate{Model: "llmgateway/typesafe/jev-router"},
+})
+```
+
+- **What the vision model gets.** One non-streaming call per tool result that
+  has images. It contains the images, the tool's name, arguments and text, the
+  main model's latest message (its plan), the user's latest request, and the
+  tool's `ToolResult.Question`, if it set one. `VisionDelegate.Prompt` replaces
+  the default instructions, and `MaxTokens` caps the answer (default 2048).
+- **What the main model gets.** The tool's text, then the answer after a
+  `[image described by vision model <id>; …]` line. The images are never sent
+  to it, even if it takes images; `ImageInputOverride` then has no effect on
+  tool results. If the vision call fails, the tool result says so and the turn
+  continues.
+- **Cost.** Each call's tokens and cost go into the turn's `TurnUsage` and the
+  session's running cost, so spend limits include it. `EventVisionStarted`
+  fires as each call goes out (so a UI can say the vision model is looking),
+  and `EventVisionDescribed` reports each call's model, usage and cost
+  separately. Like any gateway call,
+  the cost comes from the gateway's cost header or OpenRouter's `usage.cost`,
+  which covers variable-price routers such as Jev Router.
+- **Caching.** The stable system prefix is unchanged, so the main model's
+  prompt cache stays warm.
+
 ## Providers and model IDs
 
 The prefix selects the wire and the default credential source.
 
 | Model ID | Wire | Credential | Cost source |
 |---|---|---|---|
-| `llmgateway/<model>` | OpenAI-compatible chat completions through LiteLLM | `LLM_GATEWAY_KEY` | LiteLLM response-cost header when present |
+| `llmgateway/<model>` | OpenAI-compatible chat completions through LiteLLM or OpenRouter | `LLM_GATEWAY_KEY` | The gateway's response-cost header, or OpenRouter's `usage.cost` |
 | `openai/<model>` | OpenAI API | `OPENAI_API_KEY` | Cached family rates |
 | `anthropic/<model>` | Native Anthropic Messages API | `ANTHROPIC_API_KEY` | Cached family rates |
 
 Set `Config.APIKey` to replace the environment credential. The gateway routes
 also need `LLM_GATEWAY_BASE_URL`, with its `/v1` part.
+
+OpenRouter works as the gateway. Keep the `llmgateway/` prefix so ids such as
+`anthropic/...` are not sent to the direct Anthropic route; Toroid strips the
+prefix before the request:
+
+```bash
+export LLM_GATEWAY_BASE_URL=https://openrouter.ai/api/v1
+export LLM_GATEWAY_KEY=your_openrouter_key
+./trk --model llmgateway/deepseek/deepseek-v4-flash
+```
+
+OpenRouter's `reasoning` field is read like `reasoning_content`.
 
 At startup, Toroid asks the gateway for the context limit and the output limit of
 the selected model. If the gateway does not answer, the local model-family
@@ -302,6 +362,7 @@ automatic prefix cache of their provider.
 | `CompactionBufferSize` | Reserved tokens before the automatic compaction | `50000` |
 | `SmallerModel` | Model for the compaction and the subagents | `deepseek-v4-flash` |
 | `MaxTranscriptSpendUSD` | Limit for the full kernel spend | Disabled when not positive |
+| `Vision` | Vision model that describes the tool-result images to the main model | None: images go to the main model if it accepts them |
 
 For each exported type and method, use the Go package reference.
 
@@ -392,7 +453,34 @@ go test ./examples/e2e-test
 ```
 
 See the [examples index](examples/README.md) for the CLI, the hosted MCP, the
-Langfuse, and the observability examples.
+Langfuse, the observability and the Android chat app examples.
+
+## Run on Android
+
+Toroid builds for Android (arm64, Android 10+) with no CGO:
+
+```bash
+CGO_ENABLED=0 GOOS=android GOARCH=arm64 go build -o trk ./examples/cli
+adb push trk /data/local/tmp/
+```
+
+```bash
+adb shell -t 'cd /data/local/tmp && LLM_GATEWAY_BASE_URL=https://openrouter.ai/api/v1 LLM_GATEWAY_KEY=your_key ./trk --model llmgateway/deepseek/deepseek-v4-flash'
+```
+
+Importing the package on Android applies a few fixups for pure-Go builds:
+
+- **DNS.** Android has no `/etc/resolv.conf`, so lookups go to `TOROID_DNS`
+  (a comma-separated `host:port` list) or, by default, `1.1.1.1` then `8.8.8.8`.
+- **Time zone.** `time.Local` comes from `TZ` or the device's
+  `persist.sys.timezone`; Go itself starts in UTC on Android.
+- **Data directory.** When `~/.toroid` cannot be created (under `adb shell`,
+  `HOME` is `/`), `TOROID_HOME` defaults to `$TMPDIR/.toroid`.
+
+The bash tool runs `sh` when `bash` is not installed, as on stock Android. A
+phone suspends its CPU and may drop Wi-Fi when the screen is off. For work that
+must continue in the background, run the binary from an app that holds a wake
+lock, as [`examples/android-chat`](examples/android-chat/README.md) does.
 
 ## Development
 

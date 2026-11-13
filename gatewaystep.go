@@ -45,13 +45,17 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 	case ThinkingHigh:
 		req.ReasoningEffort = "high"
 	}
+	if opts.ReasoningEffort != "" {
+		req.ReasoningEffort = opts.ReasoningEffort
+	}
 	return req
 }
 
 // usageFrom copies the wire token counts and prices the step.
 //
-// The gateway's own cost header wins when present (X-LLM-Gateway-Cost in
-// micro-USD, or the LiteLLM x-litellm-response-cost in USD): it is the
+// The gateway's own cost wins when present (X-LLM-Gateway-Cost in micro-USD,
+// the LiteLLM x-litellm-response-cost in USD, or OpenRouter's usage.cost in
+// the response body): it is the
 // biller's authoritative number, already reflecting per-deployment rates,
 // discounts, and margin, none of which a client-side catalog can know. When
 // the gateway reports nothing, cost stays honestly unknown (PricingOK false)

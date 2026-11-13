@@ -13,6 +13,10 @@ type ToolResult struct {
 	Content string // text shown to the model
 	IsError bool   // true marks the result as an error
 	Files   []FilePart
+	// Question is what the tool wants answered about its Files when the kernel
+	// hands them to a vision delegate (toroid Config.Vision), e.g. "where is
+	// the start date field?". Ignored without Files or a delegate.
+	Question string
 }
 
 // NewTextResult builds a successful text tool result.
@@ -52,9 +56,9 @@ type funcTool[T any] struct {
 	fn     func(ctx context.Context, input T) (ToolResult, error)
 }
 
-func (t *funcTool[T]) Name() string                  { return t.name }
-func (t *funcTool[T]) Description() string            { return t.desc }
-func (t *funcTool[T]) Parameters() map[string]any     { return t.params }
+func (t *funcTool[T]) Name() string               { return t.name }
+func (t *funcTool[T]) Description() string        { return t.desc }
+func (t *funcTool[T]) Parameters() map[string]any { return t.params }
 
 func (t *funcTool[T]) Run(ctx context.Context, argumentsJSON string) (ToolResult, error) {
 	var input T
@@ -91,7 +95,7 @@ type rawTool struct {
 	run    func(ctx context.Context, argumentsJSON string) (ToolResult, error)
 }
 
-func (t *rawTool) Name() string              { return t.name }
+func (t *rawTool) Name() string               { return t.name }
 func (t *rawTool) Description() string        { return t.desc }
 func (t *rawTool) Parameters() map[string]any { return t.params }
 func (t *rawTool) Run(ctx context.Context, argumentsJSON string) (ToolResult, error) {

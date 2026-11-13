@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -37,6 +38,18 @@ func disableColor() {
 	aReset, aBold, aDim, aItalic, aUnderline, aStrikethrough = "", "", "", "", "", ""
 	aRed, aGreen, aYellow, aBlue, aMagenta, aCyan, aGray = "", "", "", "", "", "", ""
 	aHeading = ""
+	colorDisabled = true
+}
+
+// colorDisabled is set by --no-colour. Glamour has its own palette, so the
+// --plain answer checks this rather than relying on the blanked codes above.
+var colorDisabled bool
+
+// stdoutIsTerminal reports whether stdout is a character device (a TTY), as
+// opposed to a pipe, file, or captured adb output.
+func stdoutIsTerminal() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
 var (

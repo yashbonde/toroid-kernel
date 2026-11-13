@@ -142,6 +142,12 @@ func runOneShot(cfg config, apiKey string) error {
 		if err != nil {
 			return fmt.Errorf("run: %w", err)
 		}
+		// Styled Markdown only for a colour terminal: the theme's dark ink is
+		// unreadable on dark backgrounds, and ANSI codes corrupt piped output.
+		if colorDisabled || !stdoutIsTerminal() {
+			fmt.Println(strings.TrimSpace(out))
+			return nil
+		}
 		fmt.Println(renderAssistantText(out, max(1, termWidth())))
 		return nil
 	}

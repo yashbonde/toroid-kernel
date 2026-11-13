@@ -23,11 +23,13 @@ import (
 // boundaries, mid-turn compaction under context pressure, tool events, and
 // per-turn cost.
 //
-// Turns use Step.Complete (non-streaming) so every llm-step carries cost via
-// the model catalog rates: the assistant text is written after each
-// turn rather than token-by-token; reasoning content is emitted (and persisted)
-// as one EventReasoning block per turn.
-func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget) error {
+// By default turns use Step.Complete (non-streaming) so every llm-step carries
+// the gateway's cost header: the assistant text is written after each turn
+// rather than token-by-token. A run that opts in with WithTokenStream uses
+// Step.Stream instead and writes text as it arrives (see stepTurn). Either way
+// reasoning content is emitted (and persisted) as one EventReasoning block per
+// turn.
+func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, tokens *tokenStream, budget *spendBudget) error {
 	model := ResolveModel(k.Cfg.Model)
 	wireTools := k.wireTools()
 
@@ -59,7 +61,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			Metadata:     metadata,
 		}
 		k.fireTurnStarted(ctx, metadata, model.ID, stepCtx, "")
-		res, err := k.Step.Complete(ctx, model, stepCtx, k.stepOpts())
+		res, textSent, err := k.stepTurn(ctx, model, stepCtx, w, tokens)
 		if err != nil {
 			k.fireTurnFailed(ctx, metadata, err)
 			return err
@@ -99,9 +101,11 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 				completionGuardSent = true
 				continue
 			}
-			if _, err := io.WriteString(w, llm.TextOf(res.Content)); err != nil {
-				k.fireTurnFailed(ctx, metadata, err)
-				return err
+			if !textSent {
+				if _, err := io.WriteString(w, llm.TextOf(res.Content)); err != nil {
+					k.fireTurnFailed(ctx, metadata, err)
+					return err
+				}
 			}
 			k.fireTurnCompleted(ctx, metadata, res.StopReason, 0, marshalMessages(persist), res.Usage, totalCostUSD)
 			return nil // end of chat
@@ -109,7 +113,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 
 		// Write assistant text before executing tools so the front-end (TUI, --run)
 		// shows the model's reasoning or explanation alongside tool calls.
-		if text := llm.TextOf(res.Content); text != "" {
+		if text := llm.TextOf(res.Content); text != "" && !textSent {
 			if _, err := io.WriteString(w, text); err != nil {
 				k.fireTurnFailed(ctx, metadata, err)
 				return err
@@ -117,9 +121,16 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 		}
 
 		// Execute tools locally (not an llm-step) and append their results.
-		toolMsg, sig := k.runToolCalls(ctx, model, toolCalls)
+		toolMsg, sig, visionUsage := k.runToolCalls(ctx, model, metadata, toolCalls, latestIntent(res.Content, k.History[:len(k.History)-1]))
 		persist = append(persist, k.appendStepMessages(ctx, []llm.Message{toolMsg})...)
-		k.fireTurnCompleted(ctx, metadata, res.StopReason, len(toolCalls), marshalMessages(persist), res.Usage, totalCostUSD)
+		turnUsage := res.Usage
+		if visionUsage != nil {
+			// A vision delegate's calls belong to this turn: bill them to the
+			// session and report them in the turn's usage and cost.
+			totalCostUSD = k.recordSideUsage(*visionUsage)
+			turnUsage = addUsage(turnUsage, *visionUsage)
+		}
+		k.fireTurnCompleted(ctx, metadata, res.StopReason, len(toolCalls), marshalMessages(persist), turnUsage, totalCostUSD)
 
 		// GLM can remain in repository-archeology mode long after it has enough
 		// evidence to act. After a bounded inspection phase, inject one neutral
@@ -196,6 +207,49 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			}
 		}
 	}
+}
+
+// tokenStream is a run's opt-in to live tokens (WithTokenStream,
+// WithReasoningStream). A nil *tokenStream means the default: one Step.Complete
+// per turn, with the turn's text written once it ends.
+type tokenStream struct {
+	reasoning io.Writer // optional; receives reasoning deltas as they arrive
+}
+
+// stepTurn runs one turn's llm-step. Without a token stream it is a plain
+// Step.Complete. With one it uses Step.Stream, writing text deltas to w (and
+// reasoning deltas to tokens.reasoning) as they arrive. textSent reports whether
+// any of the turn's text already reached w, so the caller does not write it
+// again.
+func (k *Kernel) stepTurn(ctx context.Context, model Model, c Context, w io.Writer, tokens *tokenStream) (res *AssistantMessage, textSent bool, err error) {
+	if tokens == nil {
+		res, err = k.Step.Complete(ctx, model, c, k.stepOpts())
+		return res, false, err
+	}
+	stream, err := k.Step.Stream(ctx, model, c, k.stepOpts())
+	if err != nil {
+		return nil, false, err
+	}
+	var writeErr error
+	for d := range stream.Deltas {
+		// Keep draining after a failed write: the producer blocks until each
+		// delta is read or ctx ends, so abandoning the channel would leak it.
+		if writeErr != nil {
+			continue
+		}
+		if d.Text != "" {
+			textSent = true
+			_, writeErr = io.WriteString(w, d.Text)
+		}
+		if d.Reasoning != "" && tokens.reasoning != nil && writeErr == nil {
+			_, writeErr = io.WriteString(tokens.reasoning, d.Reasoning)
+		}
+	}
+	res, err = stream.Final()
+	if err == nil {
+		err = writeErr
+	}
+	return res, textSent, err
 }
 
 func toolCallsMutateFiles(calls []llm.ToolCallPart) bool {
@@ -290,6 +344,16 @@ func (k *Kernel) wireTools() []llm.Tool {
 	return out
 }
 
+// modelAcceptsImages reports whether tool-result media may be sent to the
+// current model: Config.ImageInputOverride when the host set it, else the
+// model-capability table.
+func (k *Kernel) modelAcceptsImages(model Model) bool {
+	if k.Cfg.ImageInputOverride != nil {
+		return *k.Cfg.ImageInputOverride
+	}
+	return model.SupportsImage()
+}
+
 // appendStepMessages appends a turn's messages to history and fires
 // EventAssistantTurn so history can be reconstructed from events alone. Media
 // bytes are stripped from the persisted payload — an image the model saw would
@@ -367,7 +431,14 @@ func marshalMessages(msgs []llm.Message) json.RawMessage {
 //   - Results are reassembled in the caller's original order and each call's
 //     completion event fires, so the tool-role message and the loop-guard
 //     signature stay deterministic no matter the interleaving.
-func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.ToolCallPart) (llm.Message, string) {
+//
+// With a vision delegate (Config.Vision), a call whose result carries media has
+// that media described by the vision model inside its own goroutine, so
+// several screenshots in one batch are described in parallel; intent is the
+// main model's latest assistant text, passed along so the vision model knows
+// what to look for. visionUsage is the sum of those calls' usage, or nil when
+// none ran; each one also fires EventVisionDescribed, in call order.
+func (k *Kernel) runToolCalls(ctx context.Context, model Model, metadata llm.RequestMetadata, calls []llm.ToolCallPart, intent string) (llm.Message, string, *Usage) {
 	// Announce every call before any of them start, in input order, so
 	// consumers see the full batch begin as a unit.
 	for _, call := range calls {
@@ -378,12 +449,18 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 
 	type result struct {
 		resultText string
+		sigText    string // the tool's own text, before any vision description
 		files      []llm.FilePart
+		vision     *visionOutcome
 	}
 	results := make([]result, len(calls))
+	request := ""
+	if k.visionEnabled() {
+		request = latestUserRequest(k.History)
+	}
 
 	execute := func(i int, call llm.ToolCallPart) {
-		var resultText string
+		var resultText, question string
 		var files []llm.FilePart
 		tool, ok := k.Tools.Lookup(call.Name)
 		if !ok || tool.Handler == nil {
@@ -397,15 +474,31 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 			} else {
 				resultText = res.Content
 				files = res.Files
+				question = res.Question
 			}
 		}
-		if len(files) > 0 && !model.SupportsImage() {
+		sigText := resultText
+		if len(files) > 0 && k.visionEnabled() {
+			// The main model never sees the media: the vision delegate describes
+			// it, and its answer (or why it failed) joins the tool's text.
+			_ = k.FireInTurn(ctx, string(EventVisionStarted), metadata, &VisionPayload{
+				CallID: call.ID, Name: call.Name, Model: k.Cfg.Vision.Model,
+			})
+			desc, outcome := k.describeMedia(ctx, metadata, visionRequest{
+				tool: call.Name, args: call.Arguments, toolText: resultText,
+				question: question, intent: intent, request: request, files: files,
+			})
+			resultText = withVisionText(resultText, outcome.model, desc, outcome.err)
+			results[i] = result{resultText: resultText, sigText: sigText, vision: &outcome}
+			return
+		}
+		if len(files) > 0 && !k.modelAcceptsImages(model) {
 			// Never ship media to a text-only model: it would either error or be
 			// silently dropped upstream while still being paid for on the wire.
 			files = nil
 			resultText += " [media omitted: model does not accept image input]"
 		}
-		results[i] = result{resultText: resultText, files: files}
+		results[i] = result{resultText: resultText, sigText: sigText, files: files}
 	}
 
 	// Separate mutating calls so they run first and strictly sequentially —
@@ -436,9 +529,26 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 	// completion event.
 	var parts []llm.Part
 	var sig string
+	var visionUsage *Usage
 	for i, call := range calls {
 		resultText := results[i].resultText
 		files := results[i].files
+
+		if v := results[i].vision; v != nil {
+			if visionUsage == nil {
+				visionUsage = &Usage{PricingOK: true}
+			}
+			// A call that failed before any response bills nothing; skipping it
+			// keeps the turn's known cost from turning into "unknown".
+			if v.err == nil || v.usage != (Usage{}) {
+				*visionUsage = addUsage(*visionUsage, v.usage)
+			}
+			payload := &VisionPayload{CallID: call.ID, Name: call.Name, Model: v.model, Usage: v.usage, CostUSD: v.usage.Cost}
+			if v.err != nil {
+				payload.Error = v.err.Error()
+			}
+			_ = k.FireInTurn(ctx, string(EventVisionDescribed), metadata, payload)
+		}
 
 		parts = append(parts, llm.ToolResultPart{
 			ToolCallID: call.ID,
@@ -460,10 +570,12 @@ func (k *Kernel) runToolCalls(ctx context.Context, model Model, calls []llm.Tool
 		h.Write([]byte{0})
 		h.Write([]byte(call.Arguments))
 		h.Write([]byte{0})
-		h.Write([]byte(resultText))
+		// The loop guard hashes the tool's own text: a vision model's wording
+		// varies from call to call and would hide a genuine spin.
+		h.Write([]byte(results[i].sigText))
 		sig += strconv.FormatUint(h.Sum64(), 16) + "\n"
 	}
-	return llm.Message{Role: llm.RoleTool, Parts: parts}, sig
+	return llm.Message{Role: llm.RoleTool, Parts: parts}, sig, visionUsage
 }
 
 // mutatingTool reports whether a tool name mutates shared filesystem state.

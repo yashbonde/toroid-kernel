@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +33,16 @@ var nonInteractiveEnv = []string{
 	"PAGER=cat",
 	"DEBIAN_FRONTEND=noninteractive",
 }
+
+// shellPath is the shell the bash tool runs commands with: bash when it is on
+// PATH, otherwise sh. Stock Android has no bash, only /system/bin/sh (mksh);
+// most one-liners a model writes run unchanged under it.
+var shellPath = sync.OnceValue(func() string {
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+	return "sh"
+})
 
 type BashArgs struct {
 	Command string `json:"command" jsonschema:"description=The bash command to execute,minLength=1"`
@@ -88,7 +99,7 @@ func NewBashTool(a Agent, desc string) *ToolDef {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		cmd := exec.CommandContext(ctx, "bash", "-c", command)
+		cmd := exec.CommandContext(ctx, shellPath(), "-c", command)
 		cmd.Dir = a.WorkDir()
 
 		// Non-interactive environment: an editor/pager/prompt can never block.

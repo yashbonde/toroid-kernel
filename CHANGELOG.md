@@ -11,6 +11,43 @@ All notable changes to toroid-kernel are documented here. This project follows
   `transcript_id`, `chat_id`, `turn_id`, and a per-request `trace_id`. IDs roll
   over at their corresponding kernel lifecycle boundaries, including
   compaction, structured-output, wake, and subagent request paths.
+- **Live token streaming.** `WithTokenStream()` makes `Stream` write assistant
+  text as the model generates it, and `WithReasoningStream(w)` sends reasoning
+  to a separate writer. Each turn then runs through `Step.Stream`, and its cost
+  is still recorded. Without the options, runs behave as before.
+- **OpenRouter as a gateway.** The OpenAI-compatible wire reads OpenRouter's
+  `reasoning` field (alongside `reasoning_content`), its `usage.cost` as the
+  step's billed cost when no cost header is sent (BYOK calls add
+  `upstream_inference_cost`), and `cache_write_tokens`.
+- **Android support.** Pure-Go `GOOS=android` builds now set a working DNS
+  resolver (`TOROID_DNS`, default `1.1.1.1` then `8.8.8.8`), take the time zone
+  from `TZ` or `persist.sys.timezone`, and fall back to `$TMPDIR/.toroid` when
+  `~/.toroid` is not writable.
+- **Vision delegate.** `Config.Vision` (`VisionDelegate{Model, Prompt,
+  MaxTokens}`) sends every image a tool returns to a separate vision model, in
+  one non-streaming call with the tool call, the main model's latest message
+  and the tool's new `ToolResult.Question`. The main model gets the marked
+  text answer instead, never the image, so a text-only model can work from
+  screenshots. The call's cost and tokens join the turn's usage and the
+  session's spend; `EventVisionStarted` fires as each call goes out and
+  `EventVisionDescribed` reports each one. A failed call is
+  reported in the tool result and the turn continues.
+- **`examples/android-chat`.** A tiny Android chat app built on the kernel, with
+  streamed replies, a Flash / Mid / Frontier model picker, saved chats with a
+  calendar history view, and no Gradle.
+- **Agent setups in `examples/android-chat`.** A model id that starts with
+  `@` names an agent setup stored in SQLite (system prompt, Flash / Mid /
+  Frontier models, image models, tools, spend cap); other apps on the phone
+  call it like any model. The built-in `@image-gen-agent` draws images through
+  OpenRouter's images endpoint (with a picked model and shape), recolours them,
+  looks at attached images through the vision delegate, and picks dark and
+  light UI palettes from an image under fixed contrast and background rules.
+
+### Changed
+
+- The bash tool runs commands with `sh` when `bash` is not on `PATH`.
+- Truncated tool output is saved under `TOROID_HOME` when it is set, matching
+  `ToroidHome()`.
 
 ## v0.5.0
 
