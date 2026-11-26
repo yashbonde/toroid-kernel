@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -19,10 +20,21 @@ const (
 // GatewayModelPricing is the gateway-reported price in micro-USD per million
 // tokens. It is the same pricing the gateway bills against.
 type GatewayModelPricing struct {
+	Unit       string  `json:"unit"`
 	Input      float64 `json:"input"`
 	Output     float64 `json:"output"`
 	CacheRead  float64 `json:"cache_read"`
 	CacheWrite float64 `json:"cache_write"`
+}
+
+// EstimateUSD prices observed token usage at catalog rates, rounded per request.
+func (p *GatewayModelPricing) EstimateUSD(u Usage) (float64, bool) {
+	if p == nil || p.Unit != "micro_usd_per_million_tokens" || p.Input < 0 || p.Output < 0 || p.CacheRead < 0 || p.CacheWrite < 0 ||
+		u.Input+u.Output+u.CacheRead+u.CacheWrite == 0 {
+		return 0, false
+	}
+	micro := math.Ceil((float64(u.Input)*p.Input + float64(u.Output)*p.Output + float64(u.CacheRead)*p.CacheRead + float64(u.CacheWrite)*p.CacheWrite) / 1e6)
+	return micro / 1e6, true
 }
 
 // GatewayModel is one entry returned by an OpenAI-compatible gateway's
@@ -31,6 +43,17 @@ type GatewayModel struct {
 	ID            string
 	ContextLength int
 	Pricing       *GatewayModelPricing
+}
+
+// FindGatewayModel matches a routed kernel model to its catalog entry.
+func FindGatewayModel(models []GatewayModel, id string) GatewayModel {
+	id = strings.TrimPrefix(id, "llmgateway/")
+	for _, model := range models {
+		if model.ID == id {
+			return model
+		}
+	}
+	return GatewayModel{}
 }
 
 // PerMTok converts the gateway's micro-USD-per-million-token price to USD per
@@ -85,9 +108,10 @@ func FetchGatewayModels(ctx context.Context, client *http.Client, baseURL, apiKe
 
 	var payload struct {
 		Data []struct {
-			ID            string               `json:"id"`
-			ContextLength int                  `json:"context_length"`
-			Pricing       *GatewayModelPricing `json:"pricing"`
+			ID             string               `json:"id"`
+			ContextLength  int                  `json:"context_length"`
+			MaxInputTokens int                  `json:"max_input_tokens"`
+			Pricing        *GatewayModelPricing `json:"pricing"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -97,6 +121,9 @@ func FetchGatewayModels(ctx context.Context, client *http.Client, baseURL, apiKe
 	models := make([]GatewayModel, 0, len(payload.Data))
 	for _, model := range payload.Data {
 		if id := strings.TrimSpace(model.ID); id != "" {
+			if model.MaxInputTokens > 0 {
+				model.ContextLength = model.MaxInputTokens
+			}
 			models = append(models, GatewayModel{
 				ID:            id,
 				ContextLength: model.ContextLength,

@@ -22,7 +22,7 @@ func TestFetchGatewayModels(t *testing.T) {
 			t.Errorf("authorization = %q", got)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"model-b","context_length":200000,"pricing":{"input":1400000,"output":4400000}},{"id":" model-a "},{"id":""}]}`)
+		_, _ = io.WriteString(w, `{"object":"list","data":[{"id":"model-b","context_length":200000,"pricing":{"input":1400000,"output":4400000}},{"id":" model-a ","max_input_tokens":1048576,"context_length":200000},{"id":""}]}`)
 	}))
 	defer server.Close()
 
@@ -36,7 +36,7 @@ func TestFetchGatewayModels(t *testing.T) {
 	if got := models[0]; got.ID != "model-b" || got.ContextLength != 200000 || got.Pricing == nil || got.Pricing.Input != 1400000 || got.Pricing.Output != 4400000 {
 		t.Fatalf("first model = %#v, want model-b with pricing", got)
 	}
-	if got := models[1]; got.ID != "model-a" || got.Pricing != nil {
+	if got := models[1]; got.ID != "model-a" || got.ContextLength != 1048576 || got.Pricing != nil {
 		t.Fatalf("second model = %#v, want trimmed unpriced model-a", got)
 	}
 }

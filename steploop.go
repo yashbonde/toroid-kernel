@@ -23,11 +23,9 @@ import (
 // boundaries, mid-turn compaction under context pressure, tool events, and
 // per-turn cost.
 //
-// Turns use Step.Complete (non-streaming) so every llm-step carries cost via
-// the model catalog rates: the assistant text is written after each
-// turn rather than token-by-token; reasoning content is emitted (and persisted)
-// as one EventReasoning block per turn.
-func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget) error {
+// A caller can opt into live model text while retaining normal turn billing,
+// tools, persistence, and final writer semantics.
+func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBudget, onDelta func(string, string) error) error {
 	model := ResolveModel(k.Cfg.Model)
 	wireTools := k.wireTools()
 
@@ -59,7 +57,7 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			Metadata:     metadata,
 		}
 		k.fireTurnStarted(ctx, metadata, model.ID, stepCtx, "")
-		res, err := k.Step.Complete(ctx, model, stepCtx, k.stepOpts())
+		res, err := k.completeTurn(ctx, model, stepCtx, onDelta)
 		if err != nil {
 			k.fireTurnFailed(ctx, metadata, err)
 			return err
@@ -196,6 +194,26 @@ func (k *Kernel) streamViaStep(ctx context.Context, w io.Writer, budget *spendBu
 			}
 		}
 	}
+}
+
+func (k *Kernel) completeTurn(ctx context.Context, model Model, input Context, onDelta func(string, string) error) (*AssistantMessage, error) {
+	if onDelta == nil {
+		return k.Step.Complete(ctx, model, input, k.stepOpts())
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stream, err := k.Step.Stream(ctx, model, input, k.stepOpts())
+	if err != nil {
+		return nil, err
+	}
+	for delta := range stream.Deltas {
+		if delta.Text != "" {
+			if err := onDelta(input.Metadata.TurnID, delta.Text); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return stream.Final()
 }
 
 func toolCallsMutateFiles(calls []llm.ToolCallPart) bool {

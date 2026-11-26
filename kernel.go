@@ -15,6 +15,12 @@ import (
 	"github.com/yashbonde/toroid-kernel/tools"
 )
 
+// DefaultModel is the gateway route used when the caller omits a primary model.
+const DefaultModel = "llmgateway/deepseek/deepseek-v4p1-flash"
+
+// DefaultContextSize is the kernel window when the gateway supplies no limit.
+const DefaultContextSize = 200_000
+
 // Thinking controls the model's thinking budget.
 type Thinking string
 
@@ -79,7 +85,10 @@ type Config struct {
 	// Model is the primary agent model (provider/model form). All models are
 	// reached through the LiteLLM gateway ("llmgateway/<name>"); ids with other
 	// prefixes are passed to the gateway verbatim for it to route.
-	Model string `json:"model" description:"primary llm model name" default:"lfm-2.5-2.6b:free"`
+	Model string `json:"model" description:"primary llm model name" default:"llmgateway/deepseek/deepseek-v4p1-flash"`
+	// ModelMetadataWait bounds the combined wait for optional gateway limits
+	// and catalog discovery. Zero waits for the probes' normal deadlines.
+	ModelMetadataWait time.Duration `json:"-"`
 	// SmallerModel is an optional cheaper model for cost-sensitive work:
 	// conversation compaction and subagents (sync + async). Empty means those
 	// paths use Model.
@@ -98,11 +107,14 @@ type Config struct {
 	ThinkingWriter io.Writer `json:"-"`
 
 	// Tools
-	IncludeComputerTools bool `json:"include_computer_tools" description:"if true, include the computer tools" default:"true"`
+	IncludeComputerTools bool `json:"include_computer_tools" description:"if true, include the computer tools"`
 	// IncludeSubagentTools opts into synchronous and background delegation.
 	// It is separate from the core file/shell tools so ordinary runs keep a
 	// smaller, more relevant tool prefix.
-	IncludeSubagentTools bool `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools" default:"true"`
+	IncludeSubagentTools bool `json:"include_subagent_tools,omitempty" description:"register subagent and subagent_async tools"`
+	// DisableBackground restricts delegation and shell tools to work that
+	// finishes within the caller's lifetime (e.g. an HTTP request).
+	DisableBackground bool `json:"disable_background,omitempty"`
 	// Internet opts into the Firecrawl web search/scrape capability in the
 	// compiled system prompt.
 	Internet bool            `json:"internet,omitempty" description:"enable internet search and scraping via Firecrawl in the system prompt" default:"false"`
@@ -177,7 +189,7 @@ func resolveWorkDir(sessionID string) (string, error) {
 
 func applyConfigDefaults(cfg Config) Config {
 	if cfg.TotalContextSize <= 0 {
-		cfg.TotalContextSize = 200000
+		cfg.TotalContextSize = DefaultContextSize
 	}
 	if cfg.CompactionBufferSize <= 0 {
 		cfg.CompactionBufferSize = 50000
@@ -193,6 +205,9 @@ func applyConfigDefaults(cfg Config) Config {
 
 // NewKernel creates and wires up a new Kernel.
 func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
+	if cfg.Model == "" {
+		cfg.Model = DefaultModel
+	}
 	baseURL, apiKey := resolveProviderBaseURL(cfg)
 	cfg.APIKey = apiKey
 
@@ -211,10 +226,21 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		cfg.TraceID = cfg.SessionID
 	}
 
-	// Ask the gateway what this model can actually take before falling back to
-	// the compiled-in defaults.
-	if lim, ok := fetchModelLimits(ctx, baseURL, cfg.APIKey, cfg.Model); ok {
-		applyModelLimits(&cfg, lim)
+	limits, catalog := startKernelMetadata(ctx, cfg, baseURL, apiKey)
+	probeCtx := ctx
+	if cfg.ModelMetadataWait > 0 {
+		var cancel context.CancelFunc
+		probeCtx, cancel = context.WithTimeout(ctx, cfg.ModelMetadataWait)
+		defer cancel()
+	}
+	lim := limits.wait(probeCtx)
+	gatewayModels := catalog.wait(probeCtx)
+	if lim.inputContext() == 0 {
+		lim.MaxInputTokens = FindGatewayModel(gatewayModels, cfg.Model).ContextLength
+	}
+	applyModelLimits(&cfg, lim)
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	cfg = applyConfigDefaults(cfg)
@@ -238,7 +264,9 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 	if cfg.IncludeSubagentTools {
 		k.Tools.Register(tools.NewSubagentTool(k, toolDescription("subagent")))
-		k.Tools.Register(newSubagentAsyncTool(k, toolDescription("subagent_async")))
+		if !cfg.DisableBackground {
+			k.Tools.Register(newSubagentAsyncTool(k, toolDescription("subagent_async")))
+		}
 	}
 
 	if cfg.Tools != nil {
@@ -248,14 +276,6 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	}
 
 	ApplyDefaultDataTypes(&cfg) // cfg OR default_cfg
-
-	// The gateway catalog is dynamic. Read it once when subagents are enabled so
-	// their prompt can name currently available, priced alternatives. Discovery
-	// is best-effort: an unavailable catalog must never block kernel startup.
-	var gatewayModels []GatewayModel
-	if cfg.IncludeSubagentTools && baseURL != "" && !strings.HasPrefix(cfg.Model, "openai/") {
-		gatewayModels, _ = FetchGatewayModels(ctx, nil, baseURL, cfg.APIKey)
-	}
 
 	// Skills: scan ~/.toroid/skills/ for metadata only (progressive
 	// disclosure). Full skill bodies are loaded lazily via the skill tool,
@@ -287,20 +307,30 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 		}
 		k.Store = store
 
+		startedAt := time.Now().UnixNano()
+		if cfg.Resume {
+			existing, err := k.restoreSpan(store, cfg)
+			if err != nil {
+				return nil, err
+			}
+			if existing {
+				startedAt = 0
+			}
+		}
 		_ = store.SaveSpanMeta(SpanMeta{
 			SpanID:       cfg.SessionID,
 			TraceID:      cfg.TraceID,
 			ParentSpanID: cfg.ParentSpanID,
 			Model:        cfg.Model,
-			StartedAt:    time.Now().UnixNano(),
+			StartedAt:    startedAt,
 		})
 		if cfg.TraceID == cfg.SessionID {
 			_ = store.SaveTraceMeta(TraceMeta{
 				TraceID:         cfg.TraceID,
 				PreviousTraceID: cfg.PreviousTraceID,
-				StartedAt:       time.Now().UnixNano(),
+				StartedAt:       startedAt,
 			})
-		} else {
+		} else if !cfg.Resume {
 			// Restore conversation history by replaying stored events (post-last-compaction only).
 			if msgs, err2 := ReconstructHistory(cfg.TraceID, cfg.SessionID, "", cfg.WorkDir, cfg.Model); err2 == nil && len(msgs) > 0 {
 				k.History = msgs
@@ -320,7 +350,11 @@ func NewKernel(ctx context.Context, cfg Config) (*Kernel, error) {
 	// it with a FauxStep. The kernel owns the tool loop — Step performs
 	// individual LLM calls.
 	var wire llm.Chat = llm.NewClient(baseURL, cfg.APIKey)
-	k.Step = NewGatewayStep(wire)
+	step := NewGatewayStep(wire)
+	step.pricing = func(ctx context.Context, id string) *GatewayModelPricing {
+		return FindGatewayModel(CachedGatewayModels(ctx, baseURL, apiKey), id).Pricing
+	}
+	k.Step = step
 
 	// Default AttachLoggerHooks if nil
 	if cfg.AttachLoggerHooks != nil && *cfg.AttachLoggerHooks {
@@ -358,10 +392,11 @@ func (k *Kernel) fireTurnStarted(ctx context.Context, metadata llm.RequestMetada
 		names = append(names, t.Name)
 	}
 	payload := TurnPayload{
-		Model:    model,
-		Messages: len(c.Messages),
-		Tools:    names,
-		Schema:   schema,
+		Model:         model,
+		ContextWindow: k.Cfg.TotalContextSize,
+		Messages:      len(c.Messages),
+		Tools:         names,
+		Schema:        schema,
 	}
 	_ = k.FireInTurn(ctx, string(EventTurnStarted), metadata, &payload)
 }
@@ -518,7 +553,9 @@ func (k *Kernel) fireEvent(ctx context.Context, kind, chatID, turnID, llmStepID 
 		Payload:      payload,
 	}
 	if k.Store != nil {
-		_ = k.Store.AppendEvent(k.Cfg.TraceID, k.Cfg.SessionID, event)
+		if err := k.Store.appendLiveEvent(&event); err != nil {
+			return err
+		}
 	}
 	return k.Hooks.Fire(ctx, event)
 }
@@ -583,7 +620,9 @@ func (k *Kernel) Enqueue(msg string) {
 // BackgroundEnabled reports whether background bash commands may start. It
 // requires the same delegation opt-in as subagents: both inject completion
 // notices through the queue, so they share one capability gate.
-func (k *Kernel) BackgroundEnabled() bool { return k.Cfg.IncludeSubagentTools }
+func (k *Kernel) BackgroundEnabled() bool {
+	return k.Cfg.IncludeSubagentTools && !k.Cfg.DisableBackground
+}
 
 // EnqueueBackgroundNotice delivers a background-command completion notice via
 // the same queue + wake-up path as a finished background subagent.
@@ -640,6 +679,13 @@ type runOptions struct {
 	schemaName        string
 	schemaDescription string
 	maxTurnSpendUSD   float64
+	onTextDelta       func(turnID, text string) error
+	attachments       []Attachment
+}
+
+// WithAttachments adds local paths to this user turn and embeds selected images.
+func WithAttachments(items []Attachment) RunOption {
+	return func(o *runOptions) { o.attachments = append([]Attachment(nil), items...) }
 }
 
 // WithSchema enables structured generation for this Run/Stream call.
@@ -651,6 +697,13 @@ func WithSchema(schema Schema, name, description string) RunOption {
 		o.schemaName = name
 		o.schemaDescription = description
 	}
+}
+
+// WithTextDeltas streams each main-loop model step and delivers its text as
+// it arrives. The normal writer still receives assembled turn text. Compaction
+// and child kernels do not send their internal output to this callback.
+func WithTextDeltas(fn func(turnID, text string) error) RunOption {
+	return func(o *runOptions) { o.onTextDelta = fn }
 }
 
 // WithMaxTurnSpendUSD caps LLM spend for one Run or Stream call. A
@@ -701,6 +754,9 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// one without any caller asking. Hand it the prompt through the queue rather
 	// than racing it for History.
 	if !k.claimLoop() {
+		if len(ro.attachments) > 0 {
+			return fmt.Errorf("cannot queue attachments while a turn is running")
+		}
 		k.Enqueue(prompt)
 		return nil
 	}
@@ -736,8 +792,11 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	// parseUserMessage inlines any markdown image refs as file parts and returns
 	// the portable (~-rooted) prompt to persist for cross-process resume.
 	userMsg, storedPrompt, mediaWarnings := parseUserMessage(prompt, k.Cfg.WorkDir, ResolveModel(k.Cfg.Model))
+	if err := appendAttachments(&userMsg, ro.attachments, k.Cfg.WorkDir, ResolveModel(k.Cfg.Model)); err != nil {
+		return err
+	}
 	k.History = append(k.History, userMsg)
-	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt})
+	_ = k.Fire(ctx, string(EventUserPromptSubmit), &UserPromptPayload{Prompt: storedPrompt, Attachments: ro.attachments})
 	// Surface any media that could not be inlined (unsupported model, oversized)
 	// so a dropped image is visible rather than silently missing (M8).
 	for _, w := range mediaWarnings {
@@ -762,7 +821,7 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 	}
 	// streamCurrent owns the running flag from here: it clears it on every exit.
 	entered = true
-	if err := k.streamCurrent(ctx, loopWriter, budget); err != nil {
+	if err := k.streamCurrent(ctx, loopWriter, budget, ro.onTextDelta); err != nil {
 		return err
 	}
 
@@ -803,12 +862,12 @@ func (k *Kernel) Stream(ctx context.Context, prompt string, w io.Writer, opts ..
 // appending the user message, pruning) and then calls this; Wake calls it after
 // injecting a background completion. runMu serializes the loop so the two never
 // race on history.
-func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBudget) error {
+func (k *Kernel) streamCurrent(ctx context.Context, w io.Writer, budget *spendBudget, onDelta func(string, string) error) error {
 	k.runMu.Lock()
 	k.running.Store(true)
 	k.lastWriter = w
 
-	if err := k.streamViaStep(ctx, w, budget); err != nil {
+	if err := k.streamViaStep(ctx, w, budget, onDelta); err != nil {
 		k.running.Store(false)
 		k.runMu.Unlock()
 		return err
@@ -977,16 +1036,19 @@ func (k *Kernel) Compact(ctx context.Context) error {
 	// usage lands). ~4 chars/token is a coarse estimate of the summary's size; the
 	// next stream replaces it with the real measured value.
 	k.usageMu.Lock()
-	k.currentTokens = (len(k.SystemPromptPrefix) + len(k.SystemPrompt) + len(summary)) / 4
+	tokensAfter := (len(k.SystemPromptPrefix) + len(k.SystemPrompt) + len(summary)) / 4
+	k.currentTokens = tokensAfter
 	k.usageMu.Unlock()
 
 	// Fire post-compact event so history can be reconstructed from events alone.
 	// It carries the before/after diff (messages and tokens collapsed).
 	_ = k.Fire(ctx, string(EventPostCompact), &CompactSummaryPayload{
+		TurnUsage: &res.Usage, Model: compactModel.ID,
 		Summary:        summary,
 		MessagesBefore: messagesBefore,
 		MessagesAfter:  len(k.History),
 		TokensBefore:   tokensBefore,
+		TokensAfter:    tokensAfter,
 	})
 
 	return nil
@@ -1116,6 +1178,7 @@ func (k *Kernel) runSubagent(ctx context.Context, task string, opts SubagentOpts
 func (k *Kernel) runSubagentOn(ctx context.Context, task, model string, depth int, taskID string) (SubagentResult, error) {
 	// Inherit config from parent, then pin this child's identity and model.
 	subCfg := k.Cfg
+	subCfg.Resume = false
 	subCfg.SessionID = NewSessionID()
 	subCfg.TraceID = k.Cfg.TraceID
 	subCfg.ParentSpanID = k.Cfg.SessionID
@@ -1393,7 +1456,7 @@ func (k *Kernel) tryResume(ctx context.Context) error {
 	for _, m := range msgs {
 		k.History = append(k.History, llm.NewUserMessage(m))
 	}
-	return k.streamCurrent(ctx, w, &spendBudget{turnStartUSD: k.RunningCostUSD()})
+	return k.streamCurrent(ctx, w, &spendBudget{turnStartUSD: k.RunningCostUSD()}, nil)
 }
 
 // SubagentAsyncArgs is the argument schema for the subagent_async tool.

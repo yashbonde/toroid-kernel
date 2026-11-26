@@ -12,7 +12,7 @@
 //
 // Configuration:
 //
-//	env  TOROID_MODEL      provider/model id      (default llmgateway/claude-haiku-4-5)
+//	env  TOROID_MODEL      provider/model id      (default llmgateway/deepseek/deepseek-v4p1-flash)
 //	env  TOROID_LLM_TOKEN  API key override       (NewKernel resolves per-provider env otherwise)
 //	env  TOROID_MAX_ITER   max tool iterations    (overridden by --max-iter)
 //	flag --model           provider/model id
@@ -104,7 +104,7 @@ func loadConfig() (config, string) {
 	}
 
 	c := config{
-		model:          envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5"),
+		model:          envOr("TOROID_MODEL", toroid.DefaultModel),
 		workdir:        wd,
 		thinking:       toroid.Thinking(*thinking),
 		save:           *save && !*noSave,

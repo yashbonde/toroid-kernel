@@ -223,6 +223,24 @@ func (s *Store) AppendEvent(traceID, spanID string, event Event) error {
 	return err
 }
 
+// appendLiveEvent allocates the sequence in the same SQLite statement as the
+// insert. A CLI and web process can both hold the same root span. A counter
+// from either process alone could collide and silently discard the other's
+// prompt or answer. Explicit event imports keep AppendEvent's idempotence.
+func (s *Store) appendLiveEvent(event *Event) error {
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	return s.db.QueryRow(`
+		INSERT INTO events (trace_id, span_id, ts, seq, kind, data)
+		SELECT ?, ?, ?, n, ?, json_set(?, '$.seq', n) FROM (
+			SELECT MAX(?, COALESCE(MAX(seq), 0) + 1) AS n FROM events
+			WHERE trace_id = ? AND span_id = ?
+		) RETURNING seq`, event.TraceID, event.SpanID, event.EmitTS, event.Kind,
+		string(data), event.Seq, event.TraceID, event.SpanID).Scan(&event.Seq)
+}
+
 // LoadTraceTotal returns the sum of the last total_usd across all spans for a trace.
 func (s *Store) LoadTraceTotal(traceID string) float64 {
 	var total float64

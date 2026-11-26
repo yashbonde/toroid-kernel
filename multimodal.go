@@ -2,6 +2,7 @@ package toroid
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -11,12 +12,39 @@ import (
 	"github.com/yashbonde/toroid-kernel/tools"
 )
 
-// maxInlineMediaBytes is the hard cap on a single inlined image/PDF part (M8).
+// MaxInlineMediaBytes is the hard cap on a single inlined image/PDF part (M8).
 // Oversized media is dropped (kept as literal text) with a warning rather than
 // silently embedded — an unbounded base64 blob bloats every subsequent request
 // and can blow the context window. 5 MiB comfortably covers screenshots and
 // document pages while bounding worst-case request size.
-const maxInlineMediaBytes = 5 << 20 // 5 MiB
+const MaxInlineMediaBytes = 5 << 20 // 5 MiB
+
+func appendAttachments(msg *llm.Message, items []Attachment, workDir string, model Model) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(msg.Parts) == 1 {
+		if text, ok := msg.Parts[0].(llm.TextPart); ok && text.Text == "" {
+			msg.Parts = nil
+		}
+	}
+	var firstErr error
+	for _, item := range items {
+		path := item.Path
+		if len(msg.Parts) > 0 {
+			path = "\n\n" + path
+		}
+		msg.Parts = append(msg.Parts, llm.TextPart{Text: path})
+		if item.Kind == "image" {
+			if part, _, ok, _ := loadFilePart(item.Path, workDir, model); ok {
+				msg.Parts = append(msg.Parts, part)
+			} else if firstErr == nil {
+				firstErr = fmt.Errorf("could not attach image %q for model %q", item.Path, model.ID)
+			}
+		}
+	}
+	return firstErr
+}
 
 // imageRefRe matches markdown image syntax — ![alt](path) — used to inline
 // local images into a user turn.
@@ -100,11 +128,19 @@ func loadFilePart(ref, workDir string, model Model) (part llm.FilePart, tildePat
 		return llm.FilePart{}, "", false,
 			fmt.Sprintf("could not read media %s: %v", ref, err)
 	}
-	if info.Size() > maxInlineMediaBytes {
+	if !info.Mode().IsRegular() || info.Size() > MaxInlineMediaBytes {
 		return llm.FilePart{}, "", false,
-			fmt.Sprintf("media %s is %d bytes, over the %d-byte inline cap; left as text", ref, info.Size(), maxInlineMediaBytes)
+			fmt.Sprintf("media %s is %d bytes, over the %d-byte inline cap; left as text", ref, info.Size(), MaxInlineMediaBytes)
 	}
-	data, err := os.ReadFile(abs)
+	f, err := os.Open(abs)
+	if err != nil {
+		return llm.FilePart{}, "", false, fmt.Sprintf("could not open media %s: %v", ref, err)
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, MaxInlineMediaBytes+1))
+	if len(data) > MaxInlineMediaBytes {
+		return llm.FilePart{}, "", false, fmt.Sprintf("media %s exceeds the inline cap", ref)
+	}
 	if err != nil {
 		return llm.FilePart{}, "", false,
 			fmt.Sprintf("could not read media %s: %v", ref, err)

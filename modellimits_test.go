@@ -89,6 +89,8 @@ func TestFetchModelLimits(t *testing.T) {
 			w.Write([]byte(`{"id":"deepseek-v4-flash-abl","max_input_tokens":262144,"max_output_tokens":8192}`))
 		case "/v1/models/openrouter-only":
 			w.Write([]byte(`{"id":"openrouter-only","context_length":200000}`))
+		case "/v1/models":
+			w.Write([]byte(`{"data":[{"id":"other/deepseek/deepseek-v4p1-flash","context_length":2048},{"id":"deepseek/deepseek-v4p1-flash","context_length":262144}]}`))
 		case "/v1/models/no-limits":
 			w.Write([]byte(`{"id":"no-limits","owned_by":"butter"}`))
 		default:
@@ -115,6 +117,10 @@ func TestFetchModelLimits(t *testing.T) {
 		t.Fatalf("got %+v ok=%v, want context_length 200000 applied", orLim, ok)
 	}
 
+	defaultLimits, ok := fetchModelLimits(context.Background(), base, "sk-test", DefaultModel)
+	if !ok || defaultLimits.inputContext() != 262144 {
+		t.Fatalf("expected exact catalog match for default model: %+v", defaultLimits)
+	}
 	if _, ok := fetchModelLimits(context.Background(), base, "sk-test", "nope"); ok {
 		t.Error("a 404 must report failure so the caller keeps its defaults")
 	}

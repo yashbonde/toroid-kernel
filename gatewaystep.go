@@ -16,7 +16,8 @@ import (
 // kernel keeps owning tools, turns, and compaction; GatewayStep performs the
 // one call and prices it from the model's catalog rates.
 type GatewayStep struct {
-	Client llm.Chat
+	Client  llm.Chat
+	pricing func(context.Context, string) *GatewayModelPricing
 }
 
 var _ Step = (*GatewayStep)(nil)
@@ -48,15 +49,7 @@ func buildRequest(model Model, c Context, opts StepOptions) llm.Request {
 	return req
 }
 
-// usageFrom copies the wire token counts and prices the step.
-//
-// The gateway's own cost header wins when present (X-LLM-Gateway-Cost in
-// micro-USD, or the LiteLLM x-litellm-response-cost in USD): it is the
-// biller's authoritative number, already reflecting per-deployment rates,
-// discounts, and margin, none of which a client-side catalog can know. When
-// the gateway reports nothing, cost stays honestly unknown (PricingOK false)
-// rather than silently zero. There is no client-side rate table any more; the
-// gateway — or a direct provider — is the only source of cost.
+// usageFrom copies observed tokens and any provider-reported final price.
 func usageFrom(_ Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
 	u := Usage{
 		Input:      wire.Input,
@@ -68,6 +61,7 @@ func usageFrom(_ Model, wire llm.Usage, gw llm.GatewayInfo) Usage {
 	if gw.CostUSD != nil {
 		u.Cost = *gw.CostUSD
 		u.PricingOK = true
+		u.CostSource = "gateway"
 	}
 	return u
 }
@@ -160,6 +154,11 @@ func (s *GatewayStep) Stream(ctx context.Context, model Model, c Context, opts S
 		reason := StopReasonOther
 		if resp != nil {
 			u = usageFrom(model, resp.Usage, resp.Gateway)
+			if !u.PricingOK && resp.Gateway.Reserved && s.pricing != nil {
+				if cost, ok := s.pricing(ctx, model.ID).EstimateUSD(u); ok {
+					u.Cost, u.PricingOK, u.CostSource = cost, true, "catalog"
+				}
+			}
 			reason = stopReasonFromFinish(resp.FinishReason)
 		}
 		if errors.Is(err, context.Canceled) || (err == nil && ctx.Err() != nil) {

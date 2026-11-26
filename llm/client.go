@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -49,21 +50,20 @@ const (
 	ClientConnectTimeout = 15 * time.Second
 )
 
-// newHTTPClient gives each wire client its own connection pool and bounded
-// dial. Client.Timeout remains set as a second line of defence; Complete and
-// StreamComplete also derive one context deadline shared by every retry.
-func newHTTPClient() *http.Client {
+// Reuse idle connections across kernel creations. Credentials and request
+// deadlines live on individual requests, independently of the transport.
+var gatewayTransport = sync.OnceValue(func() http.RoundTripper {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
-		return &http.Client{Timeout: ClientTimeout}
+		return http.DefaultTransport
 	}
 	transport := base.Clone()
 	transport.DialContext = (&net.Dialer{
 		Timeout:   ClientConnectTimeout,
 		KeepAlive: 30 * time.Second,
 	}).DialContext
-	return &http.Client{Transport: transport, Timeout: ClientTimeout}
-}
+	return transport
+})
 
 // withCallTimeout creates the one deadline for an entire logical LLM call.
 // Tests and callers that inject an HTTP client may choose a shorter timeout;
@@ -82,7 +82,7 @@ func NewClient(baseURL, apiKey string) *Client {
 		BaseURL:   strings.TrimRight(strings.TrimSpace(baseURL), "/"),
 		APIKey:    apiKey,
 		UserAgent: "toroid-kernel",
-		HTTP:      newHTTPClient(),
+		HTTP:      &http.Client{Transport: gatewayTransport(), Timeout: ClientTimeout},
 	}
 }
 
@@ -159,6 +159,8 @@ type GatewayInfo struct {
 	// micro-USD to USD. nil when the gateway reported no cost header — distinct
 	// from a real zero, so pricing can honestly fall back to the catalog.
 	CostUSD *float64
+	// Reserved reports a native streaming cost header, sent before usage is known.
+	Reserved bool
 }
 
 // microUSDHeader parses a micro-USD integer cost header into USD. Returns nil
@@ -169,21 +171,25 @@ func microUSDHeader(h http.Header, name string) *float64 {
 	if v == "" {
 		return nil
 	}
-	micro, err := strconv.ParseFloat(v, 64)
-	if err != nil {
+	micro, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || micro < 0 {
 		return nil
 	}
-	usd := micro / 1e6
+	usd := float64(micro) / 1e6
 	return &usd
 }
 
 // gatewayInfoFrom reads the X-LLM-Gateway-* telemetry headers. Header lookup is
 // case-insensitive (net/http canonicalizes), so the documented capitalization
 // and the wire form both resolve.
-func gatewayInfoFrom(h http.Header) GatewayInfo {
+func gatewayInfoFrom(h http.Header, streaming bool) GatewayInfo {
 	gi := GatewayInfo{
 		RequestID: h.Get("X-LLM-Gateway-Request-Id"),
 		CostUSD:   microUSDHeader(h, "X-LLM-Gateway-Cost"),
+	}
+	if streaming && gi.CostUSD != nil {
+		gi.CostUSD = nil
+		gi.Reserved = true
 	}
 	if ms, err := strconv.ParseInt(strings.TrimSpace(h.Get("X-LLM-Gateway-Wall-Ms")), 10, 64); err == nil {
 		gi.WallMs = ms
@@ -214,7 +220,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	}
 	ctx, cancel := withCallTimeout(ctx, c.HTTP)
 	defer cancel()
-	httpResp, err := c.do(ctx, body)
+	httpResp, err := c.do(ctx, body, false)
 	if err != nil {
 		return nil, err
 	}
@@ -234,7 +240,7 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 	resp := &Response{
 		Usage:   wire.Usage.toUsage(),
 		CallID:  httpResp.Header.Get("x-litellm-call-id"),
-		Gateway: gatewayInfoFrom(httpResp.Header),
+		Gateway: gatewayInfoFrom(httpResp.Header, false),
 	}
 	// Requests never set n>1, so every choice belongs to the one assistant turn.
 	// Some gateways split it — text in choice 0, tool calls in choice 1, no
@@ -278,7 +284,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 		return nil, err
 	}
 	ctx, cancel := withCallTimeout(ctx, c.HTTP)
-	httpResp, err := c.do(ctx, body)
+	httpResp, err := c.do(ctx, body, true)
 	if err != nil {
 		cancel()
 		return nil, err
@@ -301,7 +307,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 		defer close(deltas)
 		defer httpResp.Body.Close()
 
-		var text, reasoning string
+		var text, reasoning strings.Builder
 		toolCalls := map[int]*wireToolCall{} // accumulated by index
 		finish := ""
 		var usage wireUsage
@@ -342,7 +348,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 			}
 			d := ch.Delta
 			if d.Content != "" {
-				text += d.Content
+				text.WriteString(d.Content)
 				select {
 				case deltas <- Delta{Text: d.Content}:
 				case <-ctx.Done():
@@ -350,7 +356,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 				}
 			}
 			if d.ReasoningContent != "" {
-				reasoning += d.ReasoningContent
+				reasoning.WriteString(d.ReasoningContent)
 				select {
 				case deltas <- Delta{Reasoning: d.ReasoningContent}:
 				case <-ctx.Done():
@@ -381,11 +387,11 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 		}
 
 		var parts []Part
-		if reasoning != "" {
-			parts = append(parts, ReasoningPart{Text: reasoning})
+		if reasoning.Len() != 0 {
+			parts = append(parts, ReasoningPart{Text: reasoning.String()})
 		}
-		if text != "" {
-			parts = append(parts, TextPart{Text: text})
+		if text.Len() != 0 {
+			parts = append(parts, TextPart{Text: text.String()})
 		}
 		idxs := make([]int, 0, len(toolCalls))
 		for i := range toolCalls {
@@ -402,7 +408,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 			FinishReason: normalizeFinishReason(finish),
 			Usage:        usage.toUsage(),
 			CallID:       httpResp.Header.Get("x-litellm-call-id"),
-			Gateway:      gatewayInfoFrom(httpResp.Header),
+			Gateway:      gatewayInfoFrom(httpResp.Header, true),
 		}
 		if aborted && finalErr == nil {
 			finalErr = ctx.Err()
@@ -419,7 +425,7 @@ func (c *Client) StreamComplete(ctx context.Context, req Request) (*Stream, erro
 }
 
 // do issues the POST with auth, user-agent, and gateway trace/session headers.
-func (c *Client) do(ctx context.Context, body []byte) (*http.Response, error) {
+func (c *Client) do(ctx context.Context, body []byte, stream bool) (*http.Response, error) {
 	return doWithRetry(ctx, c.HTTP, func() (*http.Request, error) {
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(body))
 		if err != nil {
@@ -427,6 +433,11 @@ func (c *Client) do(ctx context.Context, body []byte) (*http.Response, error) {
 		}
 		httpReq.Header.Set("Authorization", "Bearer "+c.APIKey)
 		httpReq.Header.Set("Content-Type", "application/json")
+		if stream {
+			httpReq.Header.Set("Accept", "text/event-stream")
+			// Compressed event streams can coalesce many small deltas.
+			httpReq.Header.Set("Accept-Encoding", "identity")
+		}
 		if c.UserAgent != "" {
 			httpReq.Header.Set("User-Agent", c.UserAgent)
 		}
@@ -520,8 +531,12 @@ func (c *Client) buildBody(req Request, stream bool) ([]byte, error) {
 		}
 	}
 
-	model := strings.TrimPrefix(req.Model, "llmgateway/")
-	model = strings.TrimPrefix(model, "openai/")
+	// Strip exactly one transport prefix. Gateway catalog IDs may themselves
+	// be namespaced, for example "llmgateway/openai/gpt-4o".
+	model, viaGateway := strings.CutPrefix(req.Model, "llmgateway/")
+	if !viaGateway {
+		model = strings.TrimPrefix(model, "openai/")
+	}
 	body := map[string]any{
 		"model":    model,
 		"messages": msgs,

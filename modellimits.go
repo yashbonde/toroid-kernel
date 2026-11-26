@@ -153,12 +153,19 @@ func fetchModelLimitsViaList(ctx context.Context, base, apiKey, id string) (mode
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil || len(raw.Data) == 0 {
 		return modelLimits{}, false
 	}
+	var suffixMatch modelLimits
 	for _, m := range raw.Data {
-		if strings.HasSuffix(m.ID, "/"+id) && m.inputContext() > 0 {
+		if m.inputContext() <= 0 {
+			continue
+		}
+		if m.ID == id {
 			return m.modelLimits, true
 		}
+		if suffixMatch.inputContext() == 0 && strings.HasSuffix(m.ID, "/"+id) {
+			suffixMatch = m.modelLimits
+		}
 	}
-	return modelLimits{}, false
+	return suffixMatch, suffixMatch.inputContext() > 0
 }
 
 // fetchModelLimitsViaEndpoints reads limits from the first endpoint of

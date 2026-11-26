@@ -9,7 +9,7 @@ Run any example from the repo root:
 
 ```bash
 export LLM_GATEWAY_BASE_URL=https://my-gateway.example.com/v1
-export LLM_GATEWAY_KEY=sk-...           # default model is llmgateway/claude-haiku-4-5
+export LLM_GATEWAY_KEY=sk-...           # default model is llmgateway/deepseek/deepseek-v4p1-flash
 go run ./examples/<name>
 ```
 
@@ -19,6 +19,7 @@ go run ./examples/<name>
 |--------------|-------------------------------------------|----------|
 | `running`    | The one example to read first: blocking run + streaming run, lifecycle events, loop guards, synchronous + background delegation, multimodal input, structured output (after tools and single-turn), and OTEL span export | `NewKernel`, `Run`, `Stream`, `On(EventPreToolUse/PostToolUse/TurnCost/SubagentStart/TaskCompleted/MasterIdle)`, `WithSchema`, `GenerateSchema`, `MaxIter`, `MaxRepeatCalls`, `RunSubagent`, `SpawnBackground`, `Save`, `OTELSpans`, `ListSessions`, `RunningCostUSD`, `Close` |
 | `cli` | Interactive, pretty-printing chat REPL — plus a `--run` flag that emits every event as NDJSON on stdout, wrappable as a subprocess from any language | `NewKernel`, `On(EventPreToolUse/PostToolUse/Reasoning)`, `OnAll`, `Run`, `RunningCostUSD`, JSON-encoded `Event` |
+| [`webui`](webui/) | Local streaming chat, inline comments, pinned history, and an agent builder | `NewStore`, `WithTextDeltas`, `Config.Resume` |
 | `usage-with-mcp` | Connect to a remote MCP server (Slack's hosted server) and let the model call its tools alongside the built-ins | `Config.MCPServers`, `tools.MCPServerConfig`, `tools.ConnectMCPServer` |
 | `e2e-test` | Offline integration fixture: discovered skill, local MCP server, host/core/subagent tools, structured output, and a cache-stable system/tool prefix | `FauxStep`, `Config.MCPServers`, `Config.IncludeSubagentTools`, `WithSchema` |
 
@@ -60,7 +61,7 @@ TOROID_MODEL=llmgateway/claude-haiku-4-5 go run ./examples/cli --thinking high -
 
 | Env var | Meaning | Default |
 |---------|---------|---------|
-| `TOROID_MODEL` | model id | `llmgateway/claude-haiku-4-5` |
+| `TOROID_MODEL` | model id | `llmgateway/deepseek/deepseek-v4p1-flash` |
 | `TOROID_LLM_TOKEN` | API key for the provider | _(required)_ |
 | `TOROID_MAX_ITER` | max tool iterations | kernel default (100) |
 | `TOROID_TRIM` | max chars per tool arg/result line | 120 |

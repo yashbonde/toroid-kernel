@@ -85,6 +85,11 @@ var modelMetaFamilies = []struct {
 	prefix string
 	meta   modelMeta
 }{
+	// Claude 3 and 4 generation families accept image input via the gateway.
+	{"claude-3", modelMeta{vision: true}},
+	{"claude-sonnet-4", modelMeta{vision: true}},
+	{"claude-opus-4", modelMeta{vision: true}},
+	{"claude-haiku-4", modelMeta{vision: true}},
 	// OpenAI GPT-5 family (400K context, vision). Most-specific prefix first.
 	{"gpt-5.4-nano", modelMeta{contextWindow: 400_000, vision: true}},
 	{"gpt-5.4-mini", modelMeta{contextWindow: 400_000, vision: true}},

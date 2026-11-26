@@ -11,7 +11,7 @@
 // Configuration is split between environment variables (the "what to talk to"
 // knobs) and command-line flags (the per-run toggles):
 //
-//	env  TOROID_MODEL      provider/model id      (default llmgateway/claude-haiku-4-5)
+//	env  TOROID_MODEL      provider/model id      (default llmgateway/deepseek/deepseek-v4p1-flash)
 //	env  TOROID_LLM_TOKEN  API key for the provider (required)
 //	env  TOROID_MAX_ITER   max tool iterations    (default kernel default, 100)
 //	env  TOROID_TRIM       max chars per tool arg/result line (default 120)
@@ -138,7 +138,7 @@ func loadConfig() (config, string) {
 
 	// Flag --model overrides env TOROID_MODEL; a bare positional model id
 	// (peeled off above) overrides the env default but loses to the flag.
-	modelStr := envOr("TOROID_MODEL", "llmgateway/claude-haiku-4-5")
+	modelStr := envOr("TOROID_MODEL", toroid.DefaultModel)
 	if positionalModel != "" {
 		modelStr = positionalModel
 	}

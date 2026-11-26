@@ -79,7 +79,15 @@ func (e Event) OTEL() OTELEvent {
 // Payload types
 
 type UserPromptPayload struct {
-	Prompt string `json:"prompt"`
+	Prompt      string       `json:"prompt"`
+	Attachments []Attachment `json:"attachments,omitempty"`
+}
+
+// Attachment records a local selection by path. Image bytes are loaded when
+// building model input and never copied into the transcript.
+type Attachment struct {
+	Path string `json:"path"`
+	Kind string `json:"kind"` // file, folder, or image
 }
 
 type ReasoningPayload struct {
@@ -104,10 +112,11 @@ type TurnPayload struct {
 	Error      string `json:"error,omitempty"`
 
 	// TurnStarted fields
-	Model    string   `json:"model,omitempty"`
-	Messages int      `json:"messages,omitempty"` // outbound message count (system excluded)
-	Tools    []string `json:"tools,omitempty"`
-	Schema   string   `json:"schema,omitempty"`
+	Model         string   `json:"model,omitempty"`
+	ContextWindow int      `json:"context_window,omitempty"`
+	Messages      int      `json:"messages,omitempty"` // outbound message count (system excluded)
+	Tools         []string `json:"tools,omitempty"`
+	Schema        string   `json:"schema,omitempty"`
 
 	// TurnCompleted fields
 	Content      json.RawMessage `json:"content,omitempty"` // []llm.Message, full structured content for the turn
@@ -154,10 +163,13 @@ type CompactPayload struct {
 // LLM-generated summary plus the before/after shape of the history, so consumers
 // can see exactly what compaction collapsed (messages and tokens removed).
 type CompactSummaryPayload struct {
+	TurnUsage      *Usage `json:"turn_usage,omitempty"`
+	Model          string `json:"model,omitempty"`
 	Summary        string `json:"summary"`
 	MessagesBefore int    `json:"messages_before,omitempty"`
 	MessagesAfter  int    `json:"messages_after,omitempty"`
 	TokensBefore   int    `json:"tokens_before,omitempty"`
+	TokensAfter    int    `json:"tokens_after,omitempty"`
 }
 
 type StopPayload struct {
