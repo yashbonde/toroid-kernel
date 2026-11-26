@@ -236,11 +236,21 @@ func (c *Client) Complete(ctx context.Context, req Request) (*Response, error) {
 		CallID:  httpResp.Header.Get("x-litellm-call-id"),
 		Gateway: gatewayInfoFrom(httpResp.Header),
 	}
-	if len(wire.Choices) > 0 {
-		ch := wire.Choices[0]
-		resp.Content = ch.Message.toParts()
-		resp.FinishReason = normalizeFinishReason(ch.FinishReason)
+	// Requests never set n>1, so every choice belongs to the one assistant turn.
+	// Some gateways split it — text in choice 0, tool calls in choice 1, no
+	// finish_reason — and reading only choice 0 dropped the tool calls, which
+	// ended the agent loop on a text-only "I'll do X" turn.
+	finish := ""
+	for _, ch := range wire.Choices {
+		resp.Content = append(resp.Content, ch.Message.toParts()...)
+		if finish == "" {
+			finish = ch.FinishReason
+		}
 	}
+	if finish == "" && len(resp.ToolCalls()) > 0 {
+		finish = "tool_calls"
+	}
+	resp.FinishReason = normalizeFinishReason(finish)
 	return resp, nil
 }
 
